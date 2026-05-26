@@ -190,6 +190,7 @@ class v60_Placer:
         cd_polish_top_k: int = 8,                 # full-eval the top-K WL+density candidates per macro
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
+        cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
         cd_polish_verbose: bool = True,
     ):
         self.num_restarts = int(num_restarts)
@@ -249,6 +250,7 @@ class v60_Placer:
         self.cd_polish_top_k       = int(cd_polish_top_k)
         self.cd_polish_min_improve = float(cd_polish_min_improve)
         self.cd_polish_patience    = int(cd_polish_patience)
+        self.cd_polish_include_hard = bool(cd_polish_include_hard)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
 
     def _log(self, msg):
@@ -850,12 +852,15 @@ class v60_Placer:
         benchmark: Benchmark,
         plc: PlacementCost,
     ):
-        """Single-macro coordinate descent over soft macros using IncrementalEval.
+        """Single-macro coordinate descent over movable macros (soft and,
+        if `cd_polish_include_hard`, hard too) using IncrementalEval.
 
         Strategy per macro:
           1. For each candidate offset (8 directions × cd_polish_step_set),
              compute the WL+density delta via `delta_for_move(include_cong=False)`
-             (cheap, ~0.1 ms each).
+             (cheap, ~0.1 ms each). For hard macros, candidates that would
+             cause overlap with another hard macro are rejected via a
+             vectorised AABB intersection check (~5 µs).
           2. Take the top-K WL+density-improving candidates (most-negative
              delta_wl + 0.5·delta_density).
           3. For each of those K, tentatively commit, re-evaluate the *real*
@@ -871,6 +876,13 @@ class v60_Placer:
         Top-K = 8 catches these without exploding the cost — only candidates
         with delta_wlden < 0 are eligible, so weak macros stay cheap.
 
+        Hard-macro inclusion: hard macros have outsize cong impact (their
+        blockage shifts whole rows/columns of routing demand) but are also
+        constrained by no-overlap legality. We enforce legality by skipping
+        any candidate move that would create a hard-hard AABB intersection.
+        Soft macros are not subject to the overlap check (they're virtual
+        cluster proxies that legally overlap stuff in the placement).
+
         Sweeps stop after `cd_polish_patience` consecutive zero-move sweeps,
         or after `cd_polish_sweeps` complete.
         """
@@ -881,8 +893,11 @@ class v60_Placer:
             return placement, None
 
         movable = benchmark.get_movable_mask().cpu().numpy().astype(bool)
-        soft_idx = np.where(movable[:nM] & (np.arange(nM) >= nH))[0]
-        if soft_idx.size == 0:
+        if self.cd_polish_include_hard:
+            target_idx = np.where(movable[:nM])[0]
+        else:
+            target_idx = np.where(movable[:nM] & (np.arange(nM) >= nH))[0]
+        if target_idx.size == 0:
             return placement, None
 
         cw = float(benchmark.canvas_width)
@@ -905,20 +920,35 @@ class v60_Placer:
 
         # Initial real proxy from the same caches the CD loop will be reading.
         cur_proxy = float(e.proxy(include_cong=True))
+        # Count targets split into soft/hard for the start-of-run log.
+        n_hard_targets = int(np.sum(target_idx < nH))
+        n_soft_targets = int(target_idx.size - n_hard_targets)
         self._cd_log(
             f"[v60 {benchmark.name}] CD polish start: proxy={cur_proxy:.6f}  "
-            f"nS={int(soft_idx.size)}  sweeps={self.cd_polish_sweeps}  "
+            f"nS={n_soft_targets} nH={n_hard_targets} (include_hard={self.cd_polish_include_hard})  "
+            f"sweeps={self.cd_polish_sweeps}  "
             f"step_frac={self.cd_polish_step_frac:.4f}  "
             f"step_set={self.cd_polish_step_set}  top_k={self.cd_polish_top_k}"
         )
         t0 = time.time()
+
+        # Hard-macro AABB cache (xlo, xhi, ylo, yhi). Used to gate candidate
+        # hard-macro moves so they don't overlap any other hard macro.
+        hard_aabb = np.zeros((nH, 4), dtype=np.float64)
+        for m in range(nH):
+            cx = float(e.macro_pos[m, 0]); cy = float(e.macro_pos[m, 1])
+            hw = float(e.macro_w[m]) * 0.5; hh = float(e.macro_h[m]) * 0.5
+            hard_aabb[m, 0] = cx - hw
+            hard_aabb[m, 1] = cx + hw
+            hard_aabb[m, 2] = cy - hh
+            hard_aabb[m, 3] = cy + hh
 
         rng = np.random.default_rng(self.seed if self.deterministic else None)
         total_moved = 0
         zero_streak = 0   # consecutive zero-move sweeps for patience-based stop
 
         for sweep in range(self.cd_polish_sweeps):
-            order = soft_idx[rng.permutation(len(soft_idx))]
+            order = target_idx[rng.permutation(len(target_idx))]
             moved_this_sweep = 0
             tested_this_sweep = 0
             wl_den_pos = 0    # candidates with delta_wlden <= 0 (worth trying full eval)
@@ -927,9 +957,15 @@ class v60_Placer:
                 m_i = int(m_i)
                 cur_x = float(e.macro_pos[m_i, 0])
                 cur_y = float(e.macro_pos[m_i, 1])
+                is_hard = (m_i < nH)
+                if is_hard:
+                    hw_i = float(e.macro_w[m_i]) * 0.5
+                    hh_i = float(e.macro_h[m_i]) * 0.5
 
                 # Cheap scan: collect all WL+density-improving candidates.
                 # WL weight is 1.0, density weight is 0.5 in the real proxy.
+                # For hard macros, also reject candidates that would overlap
+                # any other hard macro (AABB intersection, vectorised).
                 cands = []  # list of (d_wlden, (new_x, new_y))
                 for mult in step_mults:
                     s = base_step * mult
@@ -939,6 +975,19 @@ class v60_Placer:
                         if new_x == cur_x and new_y == cur_y:
                             continue
                         tested_this_sweep += 1
+                        if is_hard:
+                            # Vectorised hard-hard AABB overlap check.
+                            new_xlo = new_x - hw_i; new_xhi = new_x + hw_i
+                            new_ylo = new_y - hh_i; new_yhi = new_y + hh_i
+                            no_overlap = (
+                                (new_xhi <= hard_aabb[:, 0]) |
+                                (new_xlo >= hard_aabb[:, 1]) |
+                                (new_yhi <= hard_aabb[:, 2]) |
+                                (new_ylo >= hard_aabb[:, 3])
+                            )
+                            no_overlap[m_i] = True  # ignore self
+                            if not np.all(no_overlap):
+                                continue
                         st = e.delta_for_move(m_i, (new_x, new_y), include_cong=False)
                         d_wlden = st['delta_wl'] + 0.5 * st['delta_density']
                         if d_wlden < 0.0:
@@ -976,6 +1025,13 @@ class v60_Placer:
                     e.commit_move(m_i, best_new_xy, final_st)
                     cur_proxy = best_new_proxy
                     moved_this_sweep += 1
+                    # Refresh the AABB so subsequent overlap checks see the new
+                    # position. (Soft macros aren't in hard_aabb so no-op there.)
+                    if is_hard:
+                        hard_aabb[m_i, 0] = best_new_xy[0] - hw_i
+                        hard_aabb[m_i, 1] = best_new_xy[0] + hw_i
+                        hard_aabb[m_i, 2] = best_new_xy[1] - hh_i
+                        hard_aabb[m_i, 3] = best_new_xy[1] + hh_i
                 else:
                     cong_rejected += 1
 
