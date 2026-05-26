@@ -89,7 +89,7 @@ class v60_Placer:
     def __init__(
         self,
         # ── Restart count for the cohort ──────────────────────────────────
-        num_restarts: int = 16,
+        num_restarts: int = 32,
 
         # ── Multi-level config ─────────────────────────────────────────────
         num_clusters             = 'auto',
