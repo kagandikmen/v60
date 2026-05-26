@@ -187,6 +187,7 @@ class v60_Placer:
         cd_polish_sweeps: int = 15,
         cd_polish_step_frac: float = 0.01,        # candidate offset = step_frac * 0.5 * (W+H)
         cd_polish_step_set: tuple = (0.25, 0.5, 1.0, 2.0),   # multipliers of base step
+        cd_polish_top_k: int = 8,                 # full-eval the top-K WL+density candidates per macro
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
         cd_polish_verbose: bool = True,
@@ -245,6 +246,7 @@ class v60_Placer:
         self.cd_polish_sweeps     = int(cd_polish_sweeps)
         self.cd_polish_step_frac  = float(cd_polish_step_frac)
         self.cd_polish_step_set   = tuple(float(s) for s in cd_polish_step_set)
+        self.cd_polish_top_k       = int(cd_polish_top_k)
         self.cd_polish_min_improve = float(cd_polish_min_improve)
         self.cd_polish_patience    = int(cd_polish_patience)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
@@ -852,20 +854,25 @@ class v60_Placer:
 
         Strategy per macro:
           1. For each candidate offset (8 directions × cd_polish_step_set),
-             compute the WL+density delta via `delta_for_move(include_cong=False)`.
-             This is the cheap path (~0.1 ms per candidate).
-          2. Pick the candidate with the most-negative WL+density delta.
-          3. Tentatively commit that candidate and re-evaluate the *real* proxy
-             (incremental cong cache, ~4 ms). If the proxy improvement
-             exceeds `cd_polish_min_improve`, keep the move. Otherwise revert.
+             compute the WL+density delta via `delta_for_move(include_cong=False)`
+             (cheap, ~0.1 ms each).
+          2. Take the top-K WL+density-improving candidates (most-negative
+             delta_wl + 0.5·delta_density).
+          3. For each of those K, tentatively commit, re-evaluate the *real*
+             proxy (incremental cong cache, ~4 ms), and revert. Track the
+             candidate with the best actual proxy improvement.
+          4. If the best real-proxy improvement exceeds `cd_polish_min_improve`,
+             commit that candidate; else skip the macro this sweep.
 
-        Why the two-stage filter: WL+density together carry 1.5/2.0 of the proxy
-        weight (cong = 0.5). Picking the best by WL+density and then verifying
-        with full proxy catches the small cases where a "good" WL+density move
-        actually worsens cong. Avoids doing the full eval for every candidate.
+        Why top-K instead of top-1: on cong-sensitive benches, the
+        WL+density-best candidate often has bad cong (and gets rejected).
+        Meanwhile the #2 or #3 WL+density candidate may be slightly worse
+        on WL+density but enough better on cong to be a net improvement.
+        Top-K = 8 catches these without exploding the cost — only candidates
+        with delta_wlden < 0 are eligible, so weak macros stay cheap.
 
-        Sweeps stop early when no soft macro is moved during a sweep, or after
-        `cd_polish_sweeps` complete.
+        Sweeps stop after `cd_polish_patience` consecutive zero-move sweeps,
+        or after `cd_polish_sweeps` complete.
         """
         nM = int(benchmark.num_macros)
         nH = int(benchmark.num_hard_macros)
@@ -902,7 +909,7 @@ class v60_Placer:
             f"[v60 {benchmark.name}] CD polish start: proxy={cur_proxy:.6f}  "
             f"nS={int(soft_idx.size)}  sweeps={self.cd_polish_sweeps}  "
             f"step_frac={self.cd_polish_step_frac:.4f}  "
-            f"step_set={self.cd_polish_step_set}"
+            f"step_set={self.cd_polish_step_set}  top_k={self.cd_polish_top_k}"
         )
         t0 = time.time()
 
@@ -921,10 +928,9 @@ class v60_Placer:
                 cur_x = float(e.macro_pos[m_i, 0])
                 cur_y = float(e.macro_pos[m_i, 1])
 
-                # Scan candidate offsets via cheap WL+density delta.
-                best_delta_wlden = 0.0
-                best_xy = None
-                best_state = None
+                # Cheap scan: collect all WL+density-improving candidates.
+                # WL weight is 1.0, density weight is 0.5 in the real proxy.
+                cands = []  # list of (d_wlden, (new_x, new_y))
                 for mult in step_mults:
                     s = base_step * mult
                     for (dx, dy) in dirs:
@@ -934,27 +940,43 @@ class v60_Placer:
                             continue
                         tested_this_sweep += 1
                         st = e.delta_for_move(m_i, (new_x, new_y), include_cong=False)
-                        # WL weight is 1.0, density weight is 0.5 in the real proxy.
                         d_wlden = st['delta_wl'] + 0.5 * st['delta_density']
-                        if d_wlden < best_delta_wlden:
-                            best_delta_wlden = d_wlden
-                            best_xy = (new_x, new_y)
-                            best_state = st
+                        if d_wlden < 0.0:
+                            cands.append((d_wlden, (new_x, new_y)))
 
-                if best_xy is None:
-                    continue  # no candidate improves WL+density; skip.
-
+                if not cands:
+                    continue
                 wl_den_pos += 1
-                # Tentatively commit, then re-evaluate full proxy.
-                e.commit_move(m_i, best_xy, best_state)
-                new_proxy = float(e.proxy(include_cong=True))
-                if cur_proxy - new_proxy >= self.cd_polish_min_improve:
-                    cur_proxy = new_proxy
-                    moved_this_sweep += 1
-                else:
-                    # Revert. Recompute delta (caches changed after commit).
+
+                # Top-K by WL+density delta, ascending (most negative first).
+                cands.sort(key=lambda t: t[0])
+                cands = cands[: max(1, self.cd_polish_top_k)]
+
+                # Full-eval each candidate by commit + proxy + revert.
+                # Track the one with the best real-proxy improvement.
+                best_new_proxy = cur_proxy
+                best_new_xy = None
+                for (_dw, new_xy) in cands:
+                    st = e.delta_for_move(m_i, new_xy, include_cong=False)
+                    e.commit_move(m_i, new_xy, st)
+                    new_proxy = float(e.proxy(include_cong=True))
+                    if new_proxy < best_new_proxy:
+                        best_new_proxy = new_proxy
+                        best_new_xy = new_xy
+                    # Revert to original. cur_x/cur_y were captured before any
+                    # commits in this macro's evaluation, so the revert is exact.
                     revert = e.delta_for_move(m_i, (cur_x, cur_y), include_cong=False)
                     e.commit_move(m_i, (cur_x, cur_y), revert)
+
+                if best_new_xy is not None and \
+                        (cur_proxy - best_new_proxy) >= self.cd_polish_min_improve:
+                    # Commit the best candidate (state recomputed since we
+                    # reverted after each eval).
+                    final_st = e.delta_for_move(m_i, best_new_xy, include_cong=False)
+                    e.commit_move(m_i, best_new_xy, final_st)
+                    cur_proxy = best_new_proxy
+                    moved_this_sweep += 1
+                else:
                     cong_rejected += 1
 
             total_moved += moved_this_sweep
