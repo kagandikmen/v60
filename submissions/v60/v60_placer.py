@@ -50,6 +50,7 @@ from v60_kernels   import (
     _DiagLogger, _resolve_log_path, _basin_hop, _congestion_work_tier,
     _extract_raw, _parse_plc_routing_params, _run_batch,
 )
+from v60_incremental_eval import IncrementalEval
 
 
 def _set_deterministic(seed: int = 0) -> None:
@@ -175,6 +176,20 @@ class v60_Placer:
         soft_polish_jitter_fracs='auto',
         soft_polish_use_degree_inflation: bool = False,
         soft_polish_verbose: bool = True,
+        # -- v60 CD polish (real-proxy local search after soft polish) ----------
+        # Single-macro coordinate descent over soft macros, using
+        # IncrementalEval to evaluate the real proxy cost per candidate move.
+        # Cheap WL+density delta picks the best candidate per macro; the full
+        # proxy is then re-evaluated (incremental cong cache) to confirm the
+        # move actually improves the real objective before committing. Catches
+        # the small surrogate-vs-real gaps soft polish leaves behind.
+        cd_polish_enabled: bool = True,
+        cd_polish_sweeps: int = 15,
+        cd_polish_step_frac: float = 0.01,        # candidate offset = step_frac * 0.5 * (W+H)
+        cd_polish_step_set: tuple = (0.25, 0.5, 1.0, 2.0),   # multipliers of base step
+        cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
+        cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
+        cd_polish_verbose: bool = True,
     ):
         self.num_restarts = int(num_restarts)
         self.num_clusters         = num_clusters
@@ -226,6 +241,13 @@ class v60_Placer:
                                          else tuple(float(x) for x in soft_polish_jitter_fracs))
         self.soft_polish_use_degree_inflation = bool(soft_polish_use_degree_inflation)
         self.soft_polish_verbose = bool(soft_polish_verbose)
+        self.cd_polish_enabled    = bool(cd_polish_enabled)
+        self.cd_polish_sweeps     = int(cd_polish_sweeps)
+        self.cd_polish_step_frac  = float(cd_polish_step_frac)
+        self.cd_polish_step_set   = tuple(float(s) for s in cd_polish_step_set)
+        self.cd_polish_min_improve = float(cd_polish_min_improve)
+        self.cd_polish_patience    = int(cd_polish_patience)
+        self.cd_polish_verbose    = bool(cd_polish_verbose)
 
     def _log(self, msg):
         if self.verbose:
@@ -233,6 +255,10 @@ class v60_Placer:
 
     def _soft_log(self, msg):
         if self.soft_polish_verbose:
+            self._log(msg)
+
+    def _cd_log(self, msg):
+        if self.cd_polish_verbose:
             self._log(msg)
 
     def _resolve_device(self) -> str:
@@ -552,6 +578,26 @@ class v60_Placer:
                     f"total {time.time()-t0:.1f}s"
                 )
 
+        if (self.cd_polish_enabled and best_pos is not None
+                and math.isfinite(best_proxy) and plc is not None):
+            cd_out, cd_costs = self._cd_polish(best_pos, benchmark, plc)
+            if cd_costs is not None:
+                cd_proxy = float(cd_costs['proxy_cost'])
+                if cd_proxy < best_proxy - 1e-9:
+                    self._cd_log(
+                        f"[v60 {benchmark.name}] CD polish improved proxy "
+                        f"{best_proxy:.4f} -> {cd_proxy:.4f}  total {time.time()-t0:.1f}s"
+                    )
+                    best_pos   = cd_out
+                    best_proxy = cd_proxy
+                    best_tag   = f"{best_tag}+cd"
+                else:
+                    self._cd_log(
+                        f"[v60 {benchmark.name}] CD polish: no improvement over "
+                        f"{best_proxy:.4f} (got {cd_proxy:.4f}) — kept pre-CD result  "
+                        f"total {time.time()-t0:.1f}s"
+                    )
+
         if diag_logger.active:
             diag_logger.log(
                 'result',
@@ -795,6 +841,164 @@ class v60_Placer:
         out = placement.clone()
         out[:nM] = torch.tensor(best_pos, dtype=out.dtype)
         return out, best_costs
+
+    def _cd_polish(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        plc: PlacementCost,
+    ):
+        """Single-macro coordinate descent over soft macros using IncrementalEval.
+
+        Strategy per macro:
+          1. For each candidate offset (8 directions × cd_polish_step_set),
+             compute the WL+density delta via `delta_for_move(include_cong=False)`.
+             This is the cheap path (~0.1 ms per candidate).
+          2. Pick the candidate with the most-negative WL+density delta.
+          3. Tentatively commit that candidate and re-evaluate the *real* proxy
+             (incremental cong cache, ~4 ms). If the proxy improvement
+             exceeds `cd_polish_min_improve`, keep the move. Otherwise revert.
+
+        Why the two-stage filter: WL+density together carry 1.5/2.0 of the proxy
+        weight (cong = 0.5). Picking the best by WL+density and then verifying
+        with full proxy catches the small cases where a "good" WL+density move
+        actually worsens cong. Avoids doing the full eval for every candidate.
+
+        Sweeps stop early when no soft macro is moved during a sweep, or after
+        `cd_polish_sweeps` complete.
+        """
+        nM = int(benchmark.num_macros)
+        nH = int(benchmark.num_hard_macros)
+        nS = nM - nH
+        if nS <= 0 or not self.cd_polish_enabled:
+            return placement, None
+
+        movable = benchmark.get_movable_mask().cpu().numpy().astype(bool)
+        soft_idx = np.where(movable[:nM] & (np.arange(nM) >= nH))[0]
+        if soft_idx.size == 0:
+            return placement, None
+
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
+        base_step = self.cd_polish_step_frac * 0.5 * (cw + ch)
+        # 8-direction offsets per step multiplier. Diagonals normalized so the
+        # diagonal step has the same Euclidean length as an axis step (×1/√2).
+        dirs = []
+        diag = 1.0 / math.sqrt(2.0)
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                         (-diag, -diag), (-diag, diag),
+                         ( diag, -diag), ( diag, diag)]:
+            dirs.append((dx, dy))
+        step_mults = self.cd_polish_step_set if self.cd_polish_step_set else (1.0,)
+
+        # Build IncrementalEval from current placement.
+        e = IncrementalEval(benchmark, plc=plc)
+        base_pos = placement[:nM].detach().cpu().numpy().astype(np.float64)
+        e.set_placement(base_pos)
+
+        # Initial real proxy from the same caches the CD loop will be reading.
+        cur_proxy = float(e.proxy(include_cong=True))
+        self._cd_log(
+            f"[v60 {benchmark.name}] CD polish start: proxy={cur_proxy:.6f}  "
+            f"nS={int(soft_idx.size)}  sweeps={self.cd_polish_sweeps}  "
+            f"step_frac={self.cd_polish_step_frac:.4f}  "
+            f"step_set={self.cd_polish_step_set}"
+        )
+        t0 = time.time()
+
+        rng = np.random.default_rng(self.seed if self.deterministic else None)
+        total_moved = 0
+        zero_streak = 0   # consecutive zero-move sweeps for patience-based stop
+
+        for sweep in range(self.cd_polish_sweeps):
+            order = soft_idx[rng.permutation(len(soft_idx))]
+            moved_this_sweep = 0
+            tested_this_sweep = 0
+            wl_den_pos = 0    # candidates with delta_wlden <= 0 (worth trying full eval)
+            cong_rejected = 0 # full-eval moves that didn't beat min_improve
+            for m_i in order:
+                m_i = int(m_i)
+                cur_x = float(e.macro_pos[m_i, 0])
+                cur_y = float(e.macro_pos[m_i, 1])
+
+                # Scan candidate offsets via cheap WL+density delta.
+                best_delta_wlden = 0.0
+                best_xy = None
+                best_state = None
+                for mult in step_mults:
+                    s = base_step * mult
+                    for (dx, dy) in dirs:
+                        new_x = float(np.clip(cur_x + dx * s, 0.0, cw))
+                        new_y = float(np.clip(cur_y + dy * s, 0.0, ch))
+                        if new_x == cur_x and new_y == cur_y:
+                            continue
+                        tested_this_sweep += 1
+                        st = e.delta_for_move(m_i, (new_x, new_y), include_cong=False)
+                        # WL weight is 1.0, density weight is 0.5 in the real proxy.
+                        d_wlden = st['delta_wl'] + 0.5 * st['delta_density']
+                        if d_wlden < best_delta_wlden:
+                            best_delta_wlden = d_wlden
+                            best_xy = (new_x, new_y)
+                            best_state = st
+
+                if best_xy is None:
+                    continue  # no candidate improves WL+density; skip.
+
+                wl_den_pos += 1
+                # Tentatively commit, then re-evaluate full proxy.
+                e.commit_move(m_i, best_xy, best_state)
+                new_proxy = float(e.proxy(include_cong=True))
+                if cur_proxy - new_proxy >= self.cd_polish_min_improve:
+                    cur_proxy = new_proxy
+                    moved_this_sweep += 1
+                else:
+                    # Revert. Recompute delta (caches changed after commit).
+                    revert = e.delta_for_move(m_i, (cur_x, cur_y), include_cong=False)
+                    e.commit_move(m_i, (cur_x, cur_y), revert)
+                    cong_rejected += 1
+
+            total_moved += moved_this_sweep
+            self._cd_log(
+                f"  CD sweep {sweep+1}/{self.cd_polish_sweeps}: "
+                f"tested={tested_this_sweep} wlden_neg={wl_den_pos} "
+                f"moved={moved_this_sweep} cong_rej={cong_rejected} "
+                f"proxy={cur_proxy:.6f}  elapsed={time.time()-t0:.1f}s"
+            )
+            if moved_this_sweep == 0:
+                zero_streak += 1
+                if zero_streak >= max(1, self.cd_polish_patience):
+                    self._cd_log(
+                        f"  CD: {zero_streak} consecutive zero-move sweep(s); "
+                        f"patience={self.cd_polish_patience} hit, ending."
+                    )
+                    break
+                else:
+                    self._cd_log(
+                        f"  CD: zero moves this sweep "
+                        f"({zero_streak}/{self.cd_polish_patience}); continuing."
+                    )
+            else:
+                zero_streak = 0
+
+        # Return polished placement.
+        out = placement.clone()
+        out[:nM] = torch.tensor(e.macro_pos, dtype=out.dtype)
+        # Also return a dict resembling compute_proxy_cost's output, computed
+        # from the IncrementalEval caches we already have populated.
+        br = e.proxy_breakdown(include_cong=True)
+        costs = {
+            'proxy_cost':      br['proxy_cost'],
+            'wirelength_cost': br['wirelength_cost'],
+            'density_cost':    br['density_cost'],
+            'congestion_cost': br['congestion_cost'],
+        }
+        self._cd_log(
+            f"[v60 {benchmark.name}] CD polish done: "
+            f"total_moved={total_moved} proxy={cur_proxy:.6f}  "
+            f"wl={costs['wirelength_cost']:.3f} den={costs['density_cost']:.3f} "
+            f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
+        )
+        return out, costs
 
 
 def place(benchmark: Benchmark) -> torch.Tensor:
