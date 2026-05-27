@@ -187,6 +187,7 @@ class v60_Placer:
         cd_polish_sweeps: int = 15,
         cd_polish_step_frac: float = 0.01,        # candidate offset = step_frac * 0.5 * (W+H)
         cd_polish_step_set: tuple = tuple(2.0**i for i in range(-3, 16)),   # multipliers of base step: 2^-3 .. 2^15
+        cd_polish_num_directions: int = 16,       # evenly-spaced unit vectors per macro candidate scan
         cd_polish_top_k: int = 8,                 # full-eval the top-K WL+density candidates per macro
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
@@ -254,6 +255,7 @@ class v60_Placer:
         self.cd_polish_sweeps     = int(cd_polish_sweeps)
         self.cd_polish_step_frac  = float(cd_polish_step_frac)
         self.cd_polish_step_set   = tuple(float(s) for s in cd_polish_step_set)
+        self.cd_polish_num_directions = max(1, int(cd_polish_num_directions))
         self.cd_polish_top_k       = int(cd_polish_top_k)
         self.cd_polish_min_improve = float(cd_polish_min_improve)
         self.cd_polish_patience    = int(cd_polish_patience)
@@ -912,10 +914,13 @@ class v60_Placer:
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
         base_step = self.cd_polish_step_frac * 0.5 * (cw + ch)
-        # 16-direction unit vectors at 22.5° spacing. Unit-length so each
-        # candidate has the same Euclidean step magnitude regardless of angle.
-        dirs = [(math.cos(k * math.pi / 8.0), math.sin(k * math.pi / 8.0))
-                for k in range(16)]
+        # N evenly-spaced unit vectors around the circle (N = cd_polish_num_directions).
+        # Unit-length so each candidate has the same Euclidean step magnitude
+        # regardless of angle.
+        N_dirs = self.cd_polish_num_directions
+        dirs = [(math.cos(2.0 * k * math.pi / N_dirs),
+                 math.sin(2.0 * k * math.pi / N_dirs))
+                for k in range(N_dirs)]
         step_mults = self.cd_polish_step_set if self.cd_polish_step_set else (1.0,)
 
         # Build IncrementalEval from current placement.
