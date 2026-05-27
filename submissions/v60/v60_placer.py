@@ -192,6 +192,13 @@ class v60_Placer:
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
         cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
         cd_polish_verbose: bool = True,
+        # -- Stage 2 seed picker overlap tolerance ------------------------------
+        # Threshold = ratio * median(hard_macro_area), floored at 1e-9.
+        # ratio=0 → strict (legal-only). ratio=0.1 lets seeds with up to ~10%
+        # of one typical macro's area in cumulative overlap count as "legal"
+        # for the lowest-proxy-legal pick. Downstream stages (basin-hop, soft
+        # polish, CD) then have a chance to legalize the residual.
+        stage2_overlap_tol_ratio: float = 0.1,
     ):
         self.num_restarts = int(num_restarts)
         self.num_clusters         = num_clusters
@@ -252,6 +259,7 @@ class v60_Placer:
         self.cd_polish_patience    = int(cd_polish_patience)
         self.cd_polish_include_hard = bool(cd_polish_include_hard)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
+        self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
     def _log(self, msg):
         if self.verbose:
@@ -361,6 +369,7 @@ class v60_Placer:
             log_dir                   = None,
             log_every_n_steps         = self.log_every_n_steps,
             log_positions_per_step    = self.log_positions_per_step,
+            stage2_overlap_tol_ratio  = self.stage2_overlap_tol_ratio,
         )
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:

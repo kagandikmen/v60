@@ -251,6 +251,14 @@ class v60_Engine:
         log_dir:           str = None,
         log_every_n_steps: int = 50,
         log_positions_per_step: bool = False,   # v60 debug
+        # ── Stage-2 seed picker overlap tolerance.
+        # Threshold under which a seed counts as "legal" for the lowest-proxy-
+        # legal pick. Computed as ratio * median(hard_macro_area), with a 1e-9
+        # absolute floor. ratio=0.0 (default) → strict 1e-9 behavior. Loosen
+        # if you trust the downstream stages (basin-hop, soft polish, CD) to
+        # legalize small residual overlaps; e.g. ratio=0.1 gives ~0.1 µm²
+        # tolerance on ibm02 (median hard macro ~1 µm²).
+        stage2_overlap_tol_ratio: float = 0.0,
     ):
         # Multi-level
         self.num_clusters        = num_clusters
@@ -323,6 +331,8 @@ class v60_Engine:
         self.log_dir                = log_dir
         self.log_every_n_steps      = int(log_every_n_steps)
         self.log_positions_per_step = bool(log_positions_per_step)
+        # Stage-2 picker overlap tolerance
+        self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
     def _resolve_device(self) -> str:
         if self.device == 'auto':
@@ -632,6 +642,28 @@ class v60_Engine:
         best_legal_pos   = None
         plc        = None
 
+        # Stage-2 picker overlap tolerance: ratio × median(hard_macro_area),
+        # floored at 1e-9. ratio=0 (default) → strict legal-pick. Loosening
+        # this lets downstream stages (basin-hop, soft polish, CD) start from
+        # a lower-proxy near-legal seed and legalize the residual overlap.
+        # NB: raw['hw_np'] / hh_np are HALF-widths (size/2), so full area =
+        # (2·hw)·(2·hh) = 4·hw·hh.
+        if self.stage2_overlap_tol_ratio > 0.0 and raw['nH'] > 0:
+            hw = raw['hw_np'][:raw['nH']]
+            hh = raw['hh_np'][:raw['nH']]
+            hard_areas = 4.0 * hw * hh
+            median_hard_area = float(np.median(hard_areas))
+            stage2_ovlp_tol = max(1e-9,
+                                  self.stage2_overlap_tol_ratio * median_hard_area)
+            self._log(
+                f"[v60_engine {benchmark.name}] stage2 legal-pick tol="
+                f"{stage2_ovlp_tol:.4g} "
+                f"(ratio={self.stage2_overlap_tol_ratio} × "
+                f"median_hard_area={median_hard_area:.4g})"
+            )
+        else:
+            stage2_ovlp_tol = 1e-9
+
         if osp.exists(netlist):
             plc      = PlacementCost(netlist)
             init_plc = osp.join(self.plc_root, benchmark.name, "initial.plc")
@@ -674,8 +706,8 @@ class v60_Engine:
                     if proxy < best_proxy:
                         best_proxy = proxy
                         best_pos   = pos_np
-                    # v60: track the best *legal* (overlap-free) seed too
-                    if ovlp <= 1e-9 and proxy < best_legal_proxy:
+                    # v60: track the best *legal* seed (overlap below tolerance).
+                    if ovlp <= stage2_ovlp_tol and proxy < best_legal_proxy:
                         best_legal_proxy = float(proxy)
                         best_legal_pos   = pos_np
                 except Exception as exc:
