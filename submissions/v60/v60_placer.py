@@ -186,7 +186,7 @@ class v60_Placer:
         cd_polish_enabled: bool = True,
         cd_polish_sweeps: int = 15,
         cd_polish_step_frac: float = 0.01,        # candidate offset = step_frac * 0.5 * (W+H)
-        cd_polish_step_set: tuple = (0.125, 0.25, 0.5, 1.0, 2.0),   # multipliers of base step
+        cd_polish_step_set: tuple = tuple(2.0**i for i in range(-3, 16)),   # multipliers of base step: 2^-3 .. 2^15
         cd_polish_top_k: int = 8,                 # full-eval the top-K WL+density candidates per macro
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
@@ -912,14 +912,10 @@ class v60_Placer:
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
         base_step = self.cd_polish_step_frac * 0.5 * (cw + ch)
-        # 8-direction offsets per step multiplier. Diagonals normalized so the
-        # diagonal step has the same Euclidean length as an axis step (×1/√2).
-        dirs = []
-        diag = 1.0 / math.sqrt(2.0)
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1),
-                         (-diag, -diag), (-diag, diag),
-                         ( diag, -diag), ( diag, diag)]:
-            dirs.append((dx, dy))
+        # 16-direction unit vectors at 22.5° spacing. Unit-length so each
+        # candidate has the same Euclidean step magnitude regardless of angle.
+        dirs = [(math.cos(k * math.pi / 8.0), math.sin(k * math.pi / 8.0))
+                for k in range(16)]
         step_mults = self.cd_polish_step_set if self.cd_polish_step_set else (1.0,)
 
         # Build IncrementalEval from current placement.
