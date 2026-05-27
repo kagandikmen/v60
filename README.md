@@ -58,31 +58,6 @@ A few implementation details worth noting: the congestion term is a differentiab
 - **Determinism is opt-in.** Setting `deterministic=True` on `v60_Placer` in `v60_placer.py` pins every RNG and disables non-deterministic kernels, giving bit-identical placements across runs — but it costs roughly **1.3–2× runtime**.
 - **Other tradeoffs.** `torch.compile` is used automatically when the environment supports it and falls back to eager execution otherwise; Stage 2 uses bf16 autocast on GPU for speed; and the runtime guard trades a little solution quality on the largest designs to stay safely under the 1-hour cap.
 
-## Results
-
-Proxy costs on the 17 IBM benchmarks (`deterministic=True`, single run):
-
-| Benchmark | Proxy Cost |
-|-----------|------------|
-| ibm01     | 0.7977     |
-| ibm02     | 1.0645     |
-| ibm03     | 1.0301     |
-| ibm04     | 0.9725     |
-| ibm06     | 1.1374     |
-| ibm07     | 1.1159     |
-| ibm08     | 1.1218     |
-| ibm09     | 0.8278     |
-| ibm10     | 1.0366     |
-| ibm11     | 0.9349     |
-| ibm12     | 1.2029     |
-| ibm13     | 0.9981     |
-| ibm14     | 1.2336     |
-| ibm15     | 1.1741     |
-| ibm16     | 1.1600     |
-| ibm17     | 1.3203     |
-| ibm18     | 1.2773     |
-| **Average** | **1.0827** |
-
 ## License
 
 Licensed under the Apache License 2.0 — see [`LICENSE.md`](LICENSE.md) for details.
