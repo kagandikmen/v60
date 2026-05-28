@@ -193,6 +193,23 @@ class v60_Placer:
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
         cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
         cd_polish_verbose: bool = True,
+        # -- v60 pair-swap polish (hard-hard position swaps after CD polish) ---
+        # Coordinate descent over PAIRS of hard macros: for each hard macro
+        # m_i, consider swapping positions with each of its k-nearest hard
+        # macros. The cheap filter is the sum of single-macro WL+density
+        # deltas (approximate — misses interaction on shared nets); the top-K
+        # candidates are then full-eval'd on the real proxy and the best
+        # improving swap (if any) is committed. Catches the moves that
+        # single-macro CD misses: configurations where A and B both want
+        # each other's spot but neither move alone improves.
+        pair_swap_enabled: bool = True,
+        pair_swap_sweeps: int = 30,
+        pair_swap_k_neighbors: int = 24,          # k-nearest hard macros (spatial)
+        pair_swap_k_co_net: int = 8,              # top-K hard macros by shared-net count
+        pair_swap_top_k: int = 4,                 # currently unused (no cheap filter)
+        pair_swap_min_improve: float = 1e-7,
+        pair_swap_patience: int = 3,
+        pair_swap_verbose: bool = True,
         # -- Stage 2 seed picker overlap tolerance ------------------------------
         # Threshold = ratio * median(hard_macro_area), floored at 1e-9.
         # ratio=0 → strict (legal-only). ratio=0.1 lets seeds with up to ~10%
@@ -261,6 +278,14 @@ class v60_Placer:
         self.cd_polish_patience    = int(cd_polish_patience)
         self.cd_polish_include_hard = bool(cd_polish_include_hard)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
+        self.pair_swap_enabled       = bool(pair_swap_enabled)
+        self.pair_swap_sweeps        = int(pair_swap_sweeps)
+        self.pair_swap_k_neighbors   = max(1, int(pair_swap_k_neighbors))
+        self.pair_swap_k_co_net      = max(0, int(pair_swap_k_co_net))
+        self.pair_swap_top_k         = max(1, int(pair_swap_top_k))
+        self.pair_swap_min_improve   = float(pair_swap_min_improve)
+        self.pair_swap_patience      = int(pair_swap_patience)
+        self.pair_swap_verbose       = bool(pair_swap_verbose)
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
     def _log(self, msg):
@@ -273,6 +298,10 @@ class v60_Placer:
 
     def _cd_log(self, msg):
         if self.cd_polish_verbose:
+            self._log(msg)
+
+    def _swap_log(self, msg):
+        if self.pair_swap_verbose:
             self._log(msg)
 
     def _resolve_device(self) -> str:
@@ -610,6 +639,26 @@ class v60_Placer:
                     self._cd_log(
                         f"[v60 {benchmark.name}] CD polish: no improvement over "
                         f"{best_proxy:.4f} (got {cd_proxy:.4f}) — kept pre-CD result  "
+                        f"total {time.time()-t0:.1f}s"
+                    )
+
+        if (self.pair_swap_enabled and best_pos is not None
+                and math.isfinite(best_proxy) and plc is not None):
+            ps_out, ps_costs = self._pair_swap_polish(best_pos, benchmark, plc)
+            if ps_costs is not None:
+                ps_proxy = float(ps_costs['proxy_cost'])
+                if ps_proxy < best_proxy - 1e-9:
+                    self._swap_log(
+                        f"[v60 {benchmark.name}] pair-swap improved proxy "
+                        f"{best_proxy:.4f} -> {ps_proxy:.4f}  total {time.time()-t0:.1f}s"
+                    )
+                    best_pos   = ps_out
+                    best_proxy = ps_proxy
+                    best_tag   = f"{best_tag}+swap"
+                else:
+                    self._swap_log(
+                        f"[v60 {benchmark.name}] pair-swap: no improvement over "
+                        f"{best_proxy:.4f} (got {ps_proxy:.4f}) — kept pre-swap result  "
                         f"total {time.time()-t0:.1f}s"
                     )
 
@@ -1083,6 +1132,284 @@ class v60_Placer:
         self._cd_log(
             f"[v60 {benchmark.name}] CD polish done: "
             f"total_moved={total_moved} proxy={cur_proxy:.6f}  "
+            f"wl={costs['wirelength_cost']:.3f} den={costs['density_cost']:.3f} "
+            f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
+        )
+        return out, costs
+
+    def _pair_swap_polish(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        plc: PlacementCost,
+    ):
+        """Pair-swap coordinate descent over hard macros.
+
+        For each movable hard macro m_i, consider swapping positions with
+        each of its k-nearest hard-macro neighbors. The cheap filter is
+        the sum of the two single-macro WL+density deltas — approximate,
+        since it ignores the interaction on nets that touch BOTH macros
+        (their shared-net bbox changes are double-counted, not composed),
+        but cheap enough to use as a candidate ranker. The top-K cheap
+        candidates are then fully re-evaluated against the real proxy
+        (commit both moves, eval, revert both moves), and the best
+        improving swap (if any) is committed.
+
+        Why this complements single-macro CD: single-macro CD misses
+        configurations where macro A is at the spot B 'wants' and vice
+        versa — neither move alone is an improvement, but swapping is.
+        Restricting to hard-hard swaps keeps the legality check tractable:
+        the swap is gated by AABB checks ensuring each macro at its new
+        position doesn't collide with any OTHER hard macro (the swap
+        partner is excluded from the check since it has moved out of the
+        way).
+
+        Sweeps stop after `pair_swap_patience` consecutive zero-swap
+        sweeps, or after `pair_swap_sweeps` complete. Within a sweep, a
+        macro that has already participated in a committed swap is
+        skipped for the rest of that sweep.
+        """
+        nM = int(benchmark.num_macros)
+        nH = int(benchmark.num_hard_macros)
+        if nH < 2 or not self.pair_swap_enabled:
+            return placement, None
+
+        movable = benchmark.get_movable_mask().cpu().numpy().astype(bool)
+        target_idx = np.where(movable[:nH])[0]
+        if target_idx.size < 2:
+            return placement, None
+
+        # Build IncrementalEval from current placement.
+        e = IncrementalEval(benchmark, plc=plc)
+        base_pos = placement[:nM].detach().cpu().numpy().astype(np.float64)
+        e.set_placement(base_pos)
+        cur_proxy = float(e.proxy(include_cong=True))
+
+        self._swap_log(
+            f"[v60 {benchmark.name}] pair-swap start: proxy={cur_proxy:.6f}  "
+            f"nT={int(target_idx.size)}  sweeps={self.pair_swap_sweeps}  "
+            f"k_neighbors={self.pair_swap_k_neighbors}  k_co_net={self.pair_swap_k_co_net}  "
+            f"multi_swap=on"
+        )
+        t0 = time.time()
+
+        # Hard-macro AABB cache (xlo, xhi, ylo, yhi).
+        hard_aabb = np.zeros((nH, 4), dtype=np.float64)
+        for m in range(nH):
+            cx = float(e.macro_pos[m, 0]); cy = float(e.macro_pos[m, 1])
+            hw = float(e.macro_w[m]) * 0.5; hh = float(e.macro_h[m]) * 0.5
+            hard_aabb[m, 0] = cx - hw
+            hard_aabb[m, 1] = cx + hw
+            hard_aabb[m, 2] = cy - hh
+            hard_aabb[m, 3] = cy + hh
+
+        # Co-net partner counts: co_net_count[i, j] is the number of nets
+        # whose pin set covers both hard macros i and j. Used as a second
+        # partner-selection axis alongside spatial proximity — many pairs
+        # that are net-coupled are spatially distant and would never be
+        # considered by k-nearest alone.
+        co_net_count = None
+        if self.pair_swap_k_co_net > 0:
+            co_net_count = np.zeros((nH, nH), dtype=np.int32)
+            pin_owner = e.pin_owner
+            for pin_idxs in e.net_pins:
+                pin_idxs = np.asarray(pin_idxs)
+                if pin_idxs.size < 2:
+                    continue
+                owners = pin_owner[pin_idxs]
+                hard_on_net = np.unique(owners[owners < nH])
+                if hard_on_net.size < 2:
+                    continue
+                for ii in range(hard_on_net.size):
+                    for jj in range(ii + 1, hard_on_net.size):
+                        i = int(hard_on_net[ii]); j = int(hard_on_net[jj])
+                        co_net_count[i, j] += 1
+                        co_net_count[j, i] += 1
+            nonzero_pairs = int(np.count_nonzero(co_net_count) // 2)
+            self._swap_log(
+                f"  pair-swap co-net precomp: {nonzero_pairs} hard-hard pairs "
+                f"share ≥1 net (k_co_net={self.pair_swap_k_co_net})"
+            )
+        all_others_base = np.array(
+            [j for j in target_idx], dtype=int,
+        )
+
+        rng = np.random.default_rng(self.seed if self.deterministic else None)
+        total_swaps = 0
+        zero_streak = 0
+
+        for sweep in range(self.pair_swap_sweeps):
+            order = target_idx[rng.permutation(len(target_idx))]
+            swaps_this_sweep = 0
+            cands_evaluated  = 0
+            aabb_pass        = 0
+            full_evals       = 0
+
+            for m_i in order:
+                m_i = int(m_i)
+                pos_i = e.macro_pos[m_i].copy()
+                hw_i = float(e.macro_w[m_i]) * 0.5
+                hh_i = float(e.macro_h[m_i]) * 0.5
+
+                # Partner pool: union of (a) k-nearest spatial neighbors and
+                # (b) top-K macros by shared-net count. The once-per-sweep
+                # lockout is intentionally absent — a macro can participate
+                # in multiple committed swaps per sweep, with min_improve > 0
+                # preventing oscillation.
+                avail = all_others_base[all_others_base != m_i]
+                if avail.size == 0:
+                    continue
+                other_pos = e.macro_pos[avail]
+                dists = np.linalg.norm(other_pos - pos_i, axis=1)
+                k = min(self.pair_swap_k_neighbors, avail.size)
+                if k < avail.size:
+                    spatial = avail[np.argpartition(dists, k - 1)[:k]]
+                else:
+                    spatial = avail
+                if co_net_count is not None and self.pair_swap_k_co_net > 0:
+                    row = co_net_count[m_i]
+                    if row.max() > 0:
+                        K_co = min(self.pair_swap_k_co_net, nH - 1)
+                        top_idx = np.argpartition(row, -K_co)[-K_co:]
+                        co_partners = top_idx[row[top_idx] > 0]
+                        nearest = np.unique(np.concatenate([spatial, co_partners]))
+                        nearest = nearest[nearest != m_i]
+                    else:
+                        nearest = spatial
+                else:
+                    nearest = spatial
+
+                # Collect AABB-legal swap candidates. The WL+density cheap
+                # filter was dropped after empirical evidence on ibm06: cong
+                # is the dominant cost term, and cong-improving swaps with
+                # neutral-or-positive WL+density were being rejected before
+                # full-eval. We now full-eval every legal swap with one of
+                # the k-nearest hard macros.
+                cands = []  # list of (m_j, pos_j)
+                for m_j in nearest:
+                    m_j = int(m_j)
+                    pos_j = e.macro_pos[m_j].copy()
+                    hw_j = float(e.macro_w[m_j]) * 0.5
+                    hh_j = float(e.macro_h[m_j]) * 0.5
+                    cands_evaluated += 1
+
+                    # AABB legality: i at pos_j and j at pos_i must not
+                    # overlap any OTHER hard macro. Exclude {i, j} since
+                    # they swap out of each other's way.
+                    xlo_i = pos_j[0] - hw_i; xhi_i = pos_j[0] + hw_i
+                    ylo_i = pos_j[1] - hh_i; yhi_i = pos_j[1] + hh_i
+                    no_ov_i = (
+                        (xhi_i <= hard_aabb[:, 0]) |
+                        (xlo_i >= hard_aabb[:, 1]) |
+                        (yhi_i <= hard_aabb[:, 2]) |
+                        (ylo_i >= hard_aabb[:, 3])
+                    )
+                    no_ov_i[m_i] = True; no_ov_i[m_j] = True
+                    if not np.all(no_ov_i):
+                        continue
+                    xlo_j = pos_i[0] - hw_j; xhi_j = pos_i[0] + hw_j
+                    ylo_j = pos_i[1] - hh_j; yhi_j = pos_i[1] + hh_j
+                    no_ov_j = (
+                        (xhi_j <= hard_aabb[:, 0]) |
+                        (xlo_j >= hard_aabb[:, 1]) |
+                        (yhi_j <= hard_aabb[:, 2]) |
+                        (ylo_j >= hard_aabb[:, 3])
+                    )
+                    no_ov_j[m_i] = True; no_ov_j[m_j] = True
+                    if not np.all(no_ov_j):
+                        continue
+                    # The pair themselves can't overlap each other at their
+                    # new positions either.
+                    pair_ok = (
+                        (xhi_i <= xlo_j) or (xlo_i >= xhi_j) or
+                        (yhi_i <= ylo_j) or (ylo_i >= yhi_j)
+                    )
+                    if not pair_ok:
+                        continue
+
+                    cands.append((m_j, pos_j))
+
+                if not cands:
+                    continue
+                aabb_pass += 1
+
+                # Full real-proxy evaluation of each AABB-legal swap. Commit
+                # both moves, evaluate, then revert both — order of revert
+                # doesn't matter for final state since the moves are disjoint.
+                best_new_proxy = cur_proxy
+                best_j = None
+                best_pos_j = None
+                for (m_j, pos_j) in cands:
+                    full_evals += 1
+                    pj = (float(pos_j[0]), float(pos_j[1]))
+                    pi = (float(pos_i[0]), float(pos_i[1]))
+                    st_i = e.delta_for_move(m_i, pj, include_cong=False)
+                    e.commit_move(m_i, pj, st_i)
+                    st_j = e.delta_for_move(m_j, pi, include_cong=False)
+                    e.commit_move(m_j, pi, st_j)
+                    new_proxy = float(e.proxy(include_cong=True))
+                    if new_proxy < best_new_proxy:
+                        best_new_proxy = new_proxy
+                        best_j = m_j
+                        best_pos_j = pos_j
+                    # Revert.
+                    rev_j = e.delta_for_move(m_j, pj, include_cong=False)
+                    e.commit_move(m_j, pj, rev_j)
+                    rev_i = e.delta_for_move(m_i, pi, include_cong=False)
+                    e.commit_move(m_i, pi, rev_i)
+
+                if best_j is not None and \
+                        (cur_proxy - best_new_proxy) >= self.pair_swap_min_improve:
+                    pj = (float(best_pos_j[0]), float(best_pos_j[1]))
+                    pi = (float(pos_i[0]), float(pos_i[1]))
+                    st_i = e.delta_for_move(m_i, pj, include_cong=False)
+                    e.commit_move(m_i, pj, st_i)
+                    st_j = e.delta_for_move(best_j, pi, include_cong=False)
+                    e.commit_move(best_j, pi, st_j)
+                    cur_proxy = best_new_proxy
+                    swaps_this_sweep += 1
+                    # Refresh AABB for both swapped macros.
+                    hw_b = float(e.macro_w[best_j]) * 0.5
+                    hh_b = float(e.macro_h[best_j]) * 0.5
+                    hard_aabb[m_i, 0] = pj[0] - hw_i
+                    hard_aabb[m_i, 1] = pj[0] + hw_i
+                    hard_aabb[m_i, 2] = pj[1] - hh_i
+                    hard_aabb[m_i, 3] = pj[1] + hh_i
+                    hard_aabb[best_j, 0] = pi[0] - hw_b
+                    hard_aabb[best_j, 1] = pi[0] + hw_b
+                    hard_aabb[best_j, 2] = pi[1] - hh_b
+                    hard_aabb[best_j, 3] = pi[1] + hh_b
+
+            total_swaps += swaps_this_sweep
+            self._swap_log(
+                f"  pair-swap sweep {sweep+1}/{self.pair_swap_sweeps}: "
+                f"cands={cands_evaluated} aabb_pass={aabb_pass} "
+                f"full_evals={full_evals} swaps={swaps_this_sweep} "
+                f"proxy={cur_proxy:.6f}  elapsed={time.time()-t0:.1f}s"
+            )
+            if swaps_this_sweep == 0:
+                zero_streak += 1
+                if zero_streak >= max(1, self.pair_swap_patience):
+                    self._swap_log(
+                        f"  pair-swap: {zero_streak} consecutive zero-swap sweep(s); "
+                        f"patience={self.pair_swap_patience} hit, ending."
+                    )
+                    break
+            else:
+                zero_streak = 0
+
+        out = placement.clone()
+        out[:nM] = torch.tensor(e.macro_pos, dtype=out.dtype)
+        br = e.proxy_breakdown(include_cong=True)
+        costs = {
+            'proxy_cost':      br['proxy_cost'],
+            'wirelength_cost': br['wirelength_cost'],
+            'density_cost':    br['density_cost'],
+            'congestion_cost': br['congestion_cost'],
+        }
+        self._swap_log(
+            f"[v60 {benchmark.name}] pair-swap done: total_swaps={total_swaps} "
+            f"proxy={cur_proxy:.6f}  "
             f"wl={costs['wirelength_cost']:.3f} den={costs['density_cost']:.3f} "
             f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
         )
