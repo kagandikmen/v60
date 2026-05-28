@@ -186,9 +186,9 @@ class v60_Placer:
         cd_polish_enabled: bool = True,
         cd_polish_sweeps: int = 15,
         cd_polish_step_frac: float = 0.01,        # candidate offset = step_frac * 0.5 * (W+H)
-        cd_polish_step_set: tuple = tuple(2.0**i for i in range(-3, 16)),   # multipliers of base step: 2^-3 .. 2^15
-        cd_polish_num_directions: int = 16,       # evenly-spaced unit vectors per macro candidate scan
-        cd_polish_top_k: int = 8,                 # full-eval the top-K WL+density candidates per macro
+        cd_polish_step_set: tuple = tuple(2.0**i for i in range(-3, 8)),    # multipliers of base step: 2^-3 .. 2^7 (mults above this clip to canvas edges and duplicate)
+        cd_polish_num_directions: int = 8,        # evenly-spaced unit vectors per macro candidate scan
+        cd_polish_top_k: int = 4,                 # full-eval the top-K WL+density candidates per macro
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
         cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
