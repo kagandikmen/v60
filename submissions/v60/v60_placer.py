@@ -204,7 +204,8 @@ class v60_Placer:
         # each other's spot but neither move alone improves.
         pair_swap_enabled: bool = True,
         pair_swap_sweeps: int = 30,
-        pair_swap_k_neighbors: int = 24,          # k-nearest hard macros considered per source
+        pair_swap_k_neighbors: int = 24,          # k-nearest hard macros (spatial)
+        pair_swap_k_co_net: int = 8,              # top-K hard macros by shared-net count
         pair_swap_top_k: int = 4,                 # currently unused (no cheap filter)
         pair_swap_min_improve: float = 1e-7,
         pair_swap_patience: int = 3,
@@ -280,6 +281,7 @@ class v60_Placer:
         self.pair_swap_enabled       = bool(pair_swap_enabled)
         self.pair_swap_sweeps        = int(pair_swap_sweeps)
         self.pair_swap_k_neighbors   = max(1, int(pair_swap_k_neighbors))
+        self.pair_swap_k_co_net      = max(0, int(pair_swap_k_co_net))
         self.pair_swap_top_k         = max(1, int(pair_swap_top_k))
         self.pair_swap_min_improve   = float(pair_swap_min_improve)
         self.pair_swap_patience      = int(pair_swap_patience)
@@ -1186,7 +1188,8 @@ class v60_Placer:
         self._swap_log(
             f"[v60 {benchmark.name}] pair-swap start: proxy={cur_proxy:.6f}  "
             f"nT={int(target_idx.size)}  sweeps={self.pair_swap_sweeps}  "
-            f"k_neighbors={self.pair_swap_k_neighbors}  top_k={self.pair_swap_top_k}"
+            f"k_neighbors={self.pair_swap_k_neighbors}  k_co_net={self.pair_swap_k_co_net}  "
+            f"multi_swap=on"
         )
         t0 = time.time()
 
@@ -1200,6 +1203,37 @@ class v60_Placer:
             hard_aabb[m, 2] = cy - hh
             hard_aabb[m, 3] = cy + hh
 
+        # Co-net partner counts: co_net_count[i, j] is the number of nets
+        # whose pin set covers both hard macros i and j. Used as a second
+        # partner-selection axis alongside spatial proximity — many pairs
+        # that are net-coupled are spatially distant and would never be
+        # considered by k-nearest alone.
+        co_net_count = None
+        if self.pair_swap_k_co_net > 0:
+            co_net_count = np.zeros((nH, nH), dtype=np.int32)
+            pin_owner = e.pin_owner
+            for pin_idxs in e.net_pins:
+                pin_idxs = np.asarray(pin_idxs)
+                if pin_idxs.size < 2:
+                    continue
+                owners = pin_owner[pin_idxs]
+                hard_on_net = np.unique(owners[owners < nH])
+                if hard_on_net.size < 2:
+                    continue
+                for ii in range(hard_on_net.size):
+                    for jj in range(ii + 1, hard_on_net.size):
+                        i = int(hard_on_net[ii]); j = int(hard_on_net[jj])
+                        co_net_count[i, j] += 1
+                        co_net_count[j, i] += 1
+            nonzero_pairs = int(np.count_nonzero(co_net_count) // 2)
+            self._swap_log(
+                f"  pair-swap co-net precomp: {nonzero_pairs} hard-hard pairs "
+                f"share ≥1 net (k_co_net={self.pair_swap_k_co_net})"
+            )
+        all_others_base = np.array(
+            [j for j in target_idx], dtype=int,
+        )
+
         rng = np.random.default_rng(self.seed if self.deterministic else None)
         total_swaps = 0
         zero_streak = 0
@@ -1210,31 +1244,40 @@ class v60_Placer:
             cands_evaluated  = 0
             aabb_pass        = 0
             full_evals       = 0
-            swapped: set = set()
 
             for m_i in order:
                 m_i = int(m_i)
-                if m_i in swapped:
-                    continue
                 pos_i = e.macro_pos[m_i].copy()
                 hw_i = float(e.macro_w[m_i]) * 0.5
                 hh_i = float(e.macro_h[m_i]) * 0.5
 
-                # Candidate partners: all other movable hard macros not yet
-                # swapped this sweep, k-nearest by Euclidean distance.
-                avail = np.array(
-                    [j for j in target_idx if j != m_i and j not in swapped],
-                    dtype=int,
-                )
+                # Partner pool: union of (a) k-nearest spatial neighbors and
+                # (b) top-K macros by shared-net count. The once-per-sweep
+                # lockout is intentionally absent — a macro can participate
+                # in multiple committed swaps per sweep, with min_improve > 0
+                # preventing oscillation.
+                avail = all_others_base[all_others_base != m_i]
                 if avail.size == 0:
                     continue
                 other_pos = e.macro_pos[avail]
                 dists = np.linalg.norm(other_pos - pos_i, axis=1)
                 k = min(self.pair_swap_k_neighbors, avail.size)
                 if k < avail.size:
-                    nearest = avail[np.argpartition(dists, k - 1)[:k]]
+                    spatial = avail[np.argpartition(dists, k - 1)[:k]]
                 else:
-                    nearest = avail
+                    spatial = avail
+                if co_net_count is not None and self.pair_swap_k_co_net > 0:
+                    row = co_net_count[m_i]
+                    if row.max() > 0:
+                        K_co = min(self.pair_swap_k_co_net, nH - 1)
+                        top_idx = np.argpartition(row, -K_co)[-K_co:]
+                        co_partners = top_idx[row[top_idx] > 0]
+                        nearest = np.unique(np.concatenate([spatial, co_partners]))
+                        nearest = nearest[nearest != m_i]
+                    else:
+                        nearest = spatial
+                else:
+                    nearest = spatial
 
                 # Collect AABB-legal swap candidates. The WL+density cheap
                 # filter was dropped after empirical evidence on ibm06: cong
@@ -1325,7 +1368,6 @@ class v60_Placer:
                     e.commit_move(best_j, pi, st_j)
                     cur_proxy = best_new_proxy
                     swaps_this_sweep += 1
-                    swapped.add(m_i); swapped.add(int(best_j))
                     # Refresh AABB for both swapped macros.
                     hw_b = float(e.macro_w[best_j]) * 0.5
                     hh_b = float(e.macro_h[best_j]) * 0.5
