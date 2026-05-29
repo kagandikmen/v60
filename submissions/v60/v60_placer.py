@@ -163,7 +163,7 @@ class v60_Placer:
         congestion_runtime_mode: str = 'auto',
         # -- v60 soft-only polish -------------------------------------------------
         soft_polish_enabled: bool = True,
-        soft_polish_restarts: int = 32,
+        soft_polish_restarts: int = 16,
         # The L-driven knobs default to 'auto' -> resolved per-benchmark from the
         # canvas size in _resolve_soft_polish (see the v60 Optuna sweep re-fit).
         # An explicit number/tuple still overrides 'auto' (used by the sweep).
@@ -186,11 +186,15 @@ class v60_Placer:
         cd_polish_enabled: bool = True,
         cd_polish_sweeps: int = 15,
         cd_polish_step_frac: float = 0.01,        # candidate offset = step_frac * 0.5 * (W+H)
-        cd_polish_step_set: tuple = tuple(2.0**i for i in range(-3, 8)),    # multipliers of base step: 2^-3 .. 2^7 (mults above this clip to canvas edges and duplicate)
-        cd_polish_num_directions: int = 8,        # evenly-spaced unit vectors per macro candidate scan
-        cd_polish_top_k: int = 4,                 # full-eval the top-K WL+density candidates per macro
+        cd_polish_step_set: tuple = tuple(2.0**i for i in range(-3, 16)),  # multipliers of base step: 2^-3 .. 2^15
+        cd_polish_num_directions: int = 16,       # evenly-spaced unit vectors per macro candidate scan
+        cd_polish_top_k: int = 8,                 # full-eval the top-K WL+density candidates per macro
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
+        # Early-stop a CD run once a full sweep reduces the proxy by less than
+        # this fraction of the pre-sweep proxy. Complements patience: patience
+        # catches "no moves at all", this catches "moves that barely help".
+        cd_polish_min_sweep_improve_frac: float = 0.001,   # 0.1% relative
         cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
         cd_polish_verbose: bool = True,
         # -- v60 pair-swap polish (hard-hard position swaps after CD polish) ---
@@ -290,6 +294,7 @@ class v60_Placer:
         self.cd_polish_top_k       = int(cd_polish_top_k)
         self.cd_polish_min_improve = float(cd_polish_min_improve)
         self.cd_polish_patience    = int(cd_polish_patience)
+        self.cd_polish_min_sweep_improve_frac = float(cd_polish_min_sweep_improve_frac)
         self.cd_polish_include_hard = bool(cd_polish_include_hard)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
         self.pair_swap_enabled       = bool(pair_swap_enabled)
@@ -1051,6 +1056,7 @@ class v60_Placer:
         zero_streak = 0   # consecutive zero-move sweeps for patience-based stop
 
         for sweep in range(self.cd_polish_sweeps):
+            proxy_before_sweep = cur_proxy
             order = target_idx[rng.permutation(len(target_idx))]
             moved_this_sweep = 0
             tested_this_sweep = 0
@@ -1139,12 +1145,24 @@ class v60_Placer:
                     cong_rejected += 1
 
             total_moved += moved_this_sweep
+            sweep_rel_improve = ((proxy_before_sweep - cur_proxy)
+                                 / max(abs(proxy_before_sweep), 1e-12))
             self._cd_log(
                 f"  CD sweep {sweep+1}/{self.cd_polish_sweeps}: "
                 f"tested={tested_this_sweep} wlden_neg={wl_den_pos} "
                 f"moved={moved_this_sweep} cong_rej={cong_rejected} "
-                f"proxy={cur_proxy:.6f}  elapsed={time.time()-t0:.1f}s"
+                f"proxy={cur_proxy:.6f} sweep_improve={sweep_rel_improve*100:.3f}%  "
+                f"elapsed={time.time()-t0:.1f}s"
             )
+            # Early stop: this sweep reduced the proxy by less than the
+            # required fraction. Catches the long tail of marginal sweeps
+            # (the zero-move patience check below only fires on no moves at all).
+            if sweep_rel_improve < self.cd_polish_min_sweep_improve_frac:
+                self._cd_log(
+                    f"  CD: sweep improvement {sweep_rel_improve*100:.3f}% < "
+                    f"{self.cd_polish_min_sweep_improve_frac*100:.3f}% threshold, ending."
+                )
+                break
             if moved_this_sweep == 0:
                 zero_streak += 1
                 if zero_streak >= max(1, self.cd_polish_patience):
