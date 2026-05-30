@@ -150,7 +150,7 @@ class v60_Placer:
         basin_hop_sigma_set                = (0.015, 0.025, 0.035),  # productive band only
         basin_hop_tabu_eps:         float = 0.01,                    # spatial: mean macro disp / scale
         basin_hop_tabu_proxy_eps:   float = 0.005,                   # cost gate: |Δproxy| (0 to disable)
-        basin_hop_improve_quota:    int   = 2,                       # stop after N non-improving hops (0 = full budget)
+        basin_hop_improve_quota:    int   = 1,                       # stop after N non-improving (under-threshold) hops (0 = full budget)
         # v60: only reductions >= this fraction of the current incumbent count
         # as improvements for the quota / sigma-push logic. Tiny gains are
         # still accepted as the new incumbent but increment no_improve so the
@@ -234,7 +234,7 @@ class v60_Placer:
         # of one typical macro's area in cumulative overlap count as "legal"
         # for the lowest-proxy-legal pick. Downstream stages (basin-hop, soft
         # polish, CD) then have a chance to legalize the residual.
-        stage2_overlap_tol_ratio: float = 0.1,
+        stage2_overlap_tol_ratio: float = 1.0,
     ):
         self.num_restarts = int(num_restarts)
         self.num_clusters         = num_clusters
