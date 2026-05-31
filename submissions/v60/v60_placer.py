@@ -246,7 +246,7 @@ class v60_Placer:
         # of one typical macro's area in cumulative overlap count as "legal"
         # for the lowest-proxy-legal pick. Downstream stages (basin-hop, soft
         # polish, CD) then have a chance to legalize the residual.
-        stage2_overlap_tol_ratio: float = 1.0,
+        stage2_overlap_tol_ratio: float = 0.5,
     ):
         self.num_restarts = int(num_restarts)
         self.num_clusters         = num_clusters
