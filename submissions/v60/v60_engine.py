@@ -664,6 +664,11 @@ class v60_Engine:
         else:
             stage2_ovlp_tol = 1e-9
 
+        # v60: per-seed pool (pos, proxy, overlap) so the orchestrator can pull
+        # the top-N seeds — not just the single winner — for multi-candidate
+        # post-Stage-2 refinement. Populated in the scoring loop below.
+        seed_pool = []
+
         if osp.exists(netlist):
             plc      = PlacementCost(netlist)
             init_plc = osp.join(self.plc_root, benchmark.name, "initial.plc")
@@ -703,6 +708,11 @@ class v60_Engine:
                             overlap_area=float(ovlp),
                             internal_metrics=all_metrics[i],
                         )
+                    seed_pool.append({
+                        'pos':          pos_np,
+                        'proxy':        float(proxy),
+                        'overlap_area': float(ovlp),
+                    })
                     if proxy < best_proxy:
                         best_proxy = proxy
                         best_pos   = pos_np
@@ -731,6 +741,11 @@ class v60_Engine:
             best_pos   = best_legal_pos
 
         self._last_run_metrics = all_metrics
+        # Expose the seed pool (used by the orchestrator's multi-candidate
+        # post-Stage-2 path). Ranked best-first: legal seeds (overlap below
+        # the picker tolerance) by proxy, then the rest by proxy.
+        seed_pool.sort(key=lambda s: (s['overlap_area'] > stage2_ovlp_tol, s['proxy']))
+        self._last_seed_pool = seed_pool
 
         if self.dump_diagnostic_path and plc is not None:
             try:

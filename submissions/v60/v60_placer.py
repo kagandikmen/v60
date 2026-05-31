@@ -21,6 +21,7 @@ Usage:
 """
 
 import math
+import multiprocessing as mp
 import os
 import os.path as osp
 import random
@@ -228,6 +229,27 @@ class v60_Placer:
         soft_pair_swap_min_improve: float = 1e-7,
         soft_pair_swap_patience: int = 2,
         soft_pair_swap_verbose: bool = True,
+        # -- v60 multi-candidate post-Stage-2 refinement -----------------------
+        # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
+        # winner, with separate widths for the (expensive, GPU) and (cheap,
+        # parallelizable, CPU) halves:
+        #   - post_stage2_n_gpu: how many top engine seeds get the GPU side
+        #     (basin-hop + soft polish). Each is runtime-heavy, so keep small.
+        #   - post_stage2_n_cpu: how many legal candidates from the pooled GPU
+        #     output get the CPU side (CD + pair-swap + soft-pair-swap). The
+        #     GPU stages emit their top legal candidates (soft-polish restarts +
+        #     basin-hop incumbents); the global top-n_cpu of that pool are
+        #     polished, and the best final wins. CPU side is ~independent per
+        #     candidate, so this widens cheaply (parallel) for little runtime.
+        # Defaults (1, 1) reproduce the original single-winner pipeline exactly.
+        post_stage2_n_gpu: int = 1,
+        post_stage2_n_cpu: int = 8,
+        # Run the n_cpu CPU-downstream chains in parallel processes (GIL makes
+        # threads useless for the Python-bound CD/swap loops). Falls back to a
+        # sequential loop if the pool can't be created. max_workers caps the
+        # process count ('auto' = min(n_cpu, os.cpu_count())).
+        post_stage2_cpu_parallel: bool = True,
+        post_stage2_cpu_max_workers = 'auto',
         # -- Stage 2 seed picker overlap tolerance ------------------------------
         # Threshold = ratio * median(hard_macro_area), floored at 1e-9.
         # ratio=0 → strict (legal-only). ratio=0.1 lets seeds with up to ~10%
@@ -311,6 +333,10 @@ class v60_Placer:
         self.soft_pair_swap_min_improve    = float(soft_pair_swap_min_improve)
         self.soft_pair_swap_patience       = int(soft_pair_swap_patience)
         self.soft_pair_swap_verbose        = bool(soft_pair_swap_verbose)
+        self.post_stage2_n_gpu = max(1, int(post_stage2_n_gpu))
+        self.post_stage2_n_cpu = max(1, int(post_stage2_n_cpu))
+        self.post_stage2_cpu_parallel = bool(post_stage2_cpu_parallel)
+        self.post_stage2_cpu_max_workers = post_stage2_cpu_max_workers
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
     def _log(self, msg):
@@ -545,171 +571,59 @@ class v60_Placer:
             f"best={best_proxy:.4f}  total {time.time()-t0:.1f}s"
         )
 
-        # ── Basin-hopping: perturb the running best and re-minimise (Stage 2
-        #    only) with a promising-seed priority queue + visited-basin tabu.
-        if (self.basin_hop and best_pos is not None and best_tag in cohorts
-                and math.isfinite(best_proxy)):
-            winner  = cohorts[best_tag]
+        # ── Multi-candidate post-Stage-2 refinement ──────────────────────
+        # GPU side (basin-hop + soft polish) runs for the top-n_gpu engine
+        # seeds and emits a pool of legal candidates; the CPU side (CD +
+        # pair-swap + soft-pair-swap) then polishes the top-n_cpu of that pool
+        # (in parallel processes when enabled), and the best final wins.
+        if (best_pos is not None and math.isfinite(best_proxy)
+                and best_tag in cohorts):
+            winner_cohort = cohorts[best_tag]
             nM      = int(benchmark.num_macros)
             mov_idx = np.where(benchmark.get_movable_mask().numpy())[0]
             scale   = 0.5 * (float(benchmark.canvas_width) + float(benchmark.canvas_height))
-            Bhop    = (self.basin_hop_restarts if self.basin_hop_restarts > 0
-                       else int(getattr(winner, 'num_restarts', 16)))
-            Bhop    = self._cap_for_congestion_runtime(benchmark, Bhop, caps=(5, 6, 7, 8))
-            rng     = np.random.default_rng(self.seed if self.deterministic else None)
-            try:
-                ic      = compute_proxy_cost(best_pos[:nM].to(torch.float32), benchmark, plc)
-                init_ov = float(ic.get('total_overlap_area', float('nan')))
-            except Exception:
-                init_ov = float('nan')
-            initial = {
-                'pos':          best_pos[:nM].detach().cpu().numpy().astype(np.float32),
-                'proxy':        float(best_proxy),
-                'overlap_area': init_ov,
-            }
 
-            def run_from_init(init_b_nmov_2):
-                p = winner.place(benchmark, init_positions=init_b_nmov_2, diag_logger=diag_logger)
-                metrics = getattr(winner, '_last_run_metrics', None) or []
-                if metrics:
-                    # match the cohort placer's best-legal pick: lowest proxy
-                    # among overlap-free seeds, else lowest proxy overall
-                    legal_m = [m for m in metrics
-                               if float(m.get('overlap_area', float('nan'))) <= 1e-9]
-                    mm = min(legal_m if legal_m else metrics,
-                             key=lambda m: m.get('score_proxy', float('inf')))
-                    pr = float(mm.get('score_proxy', float('inf')))
-                    ov = float(mm.get('overlap_area', float('nan')))
-                    if not math.isfinite(pr):
-                        pr = self._proxy_cost(p, benchmark, plc)
-                else:
-                    pr = self._proxy_cost(p, benchmark, plc)
-                    ov = float('nan')
-                return {'pos': p[:nM].detach().cpu().numpy().astype(np.float32),
-                        'proxy': pr, 'overlap_area': ov}
-
+            seed_pool = list(getattr(winner_cohort, '_last_seed_pool', None) or [])
+            if not seed_pool:
+                seed_pool = [{'pos': best_pos[:nM].detach().cpu().numpy().astype(np.float64),
+                              'proxy': float(best_proxy), 'overlap_area': 0.0}]
+            n_gpu = min(self.post_stage2_n_gpu, len(seed_pool))
             self._log(
-                f"[v60 {benchmark.name}] basin-hop: winner={best_tag}  B={Bhop}  "
-                f"max_hops={self.basin_hop_max_hops}  final_explore={self.basin_hop_final_explore}  "
-                f"sigmas={self.basin_hop_sigma_set}  stratify={self.basin_hop_stratify}  "
-                f"tabu_eps={self.basin_hop_tabu_eps}  tabu_proxy_eps={self.basin_hop_tabu_proxy_eps}  "
-                f"improve_quota={self.basin_hop_improve_quota}  "
-                f"min_improve_frac={self.basin_hop_min_improve_frac}"
+                f"[v60 {benchmark.name}] post-Stage-2: n_gpu={n_gpu}  "
+                f"n_cpu={self.post_stage2_n_cpu}  (engine seed pool={len(seed_pool)})"
             )
-            bh = _basin_hop(
-                run_from_init, initial, mov_idx, scale, Bhop, rng,
-                max_hops=self.basin_hop_max_hops,
-                final_explore_n=self.basin_hop_final_explore,
-                sigma_set=self.basin_hop_sigma_set,
-                tabu_eps=self.basin_hop_tabu_eps,
-                tabu_proxy_eps=self.basin_hop_tabu_proxy_eps,
-                improve_quota=self.basin_hop_improve_quota,
-                min_improve_frac=self.basin_hop_min_improve_frac,
-                stratify=self.basin_hop_stratify,
-                log=self._log,
+
+            # GPU side: build the legal candidate pool across the top-n_gpu seeds.
+            cand_pool = []
+            for gi in range(n_gpu):
+                seed = seed_pool[gi]
+                cand_pool += self._gpu_side(
+                    seed['pos'], seed['proxy'], benchmark, plc, winner_cohort,
+                    mov_idx, scale, diag_logger, t0, label=f"{best_tag}#{gi}")
+
+            # Rank best-first, dedup by proxy, take top-n_cpu for the CPU side.
+            cand_pool.sort(key=lambda c: c['proxy'])
+            seen, deduped = set(), []
+            for c in cand_pool:
+                key = round(c['proxy'], 9)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(c)
+            cpu_cands = deduped[: self.post_stage2_n_cpu]
+            self._log(
+                f"[v60 {benchmark.name}] CPU side: polishing {len(cpu_cands)} "
+                f"candidate(s)  (gpu pool={len(cand_pool)})  total {time.time()-t0:.1f}s"
             )
-            if bh['proxy'] < best_proxy - 1e-9:
-                self._log(f"[v60 {benchmark.name}] basin-hop improved "
-                          f"{best_proxy:.4f} -> {bh['proxy']:.4f}")
-                out_t      = benchmark.macro_positions.clone()
-                out_t[:nM] = torch.tensor(bh['pos'], dtype=out_t.dtype)
-                best_pos   = out_t
-                best_proxy = float(bh['proxy'])
-                best_tag   = f"{best_tag}+bh"
-            else:
-                self._log(f"[v60 {benchmark.name}] basin-hop: no improvement "
-                          f"over {best_proxy:.4f}")
-            if diag_logger.active:
-                diag_logger.log('basin_hop_end', benchmark=benchmark.name,
-                                winner=best_tag, best_proxy=float(best_proxy),
-                                B=int(Bhop), max_hops=int(self.basin_hop_max_hops),
-                                final_explore=int(self.basin_hop_final_explore))
 
-        if self.soft_polish_enabled and best_pos is not None and math.isfinite(best_proxy):
-            base_costs = compute_proxy_cost(best_pos[:int(benchmark.num_macros)].to(torch.float32), benchmark, plc)
-            self._soft_log(
-                f"[v60 {benchmark.name}] soft polish start: proxy={base_costs['proxy_cost']:.4f}  "
-                f"wl={base_costs['wirelength_cost']:.3f} den={base_costs['density_cost']:.3f} "
-                f"cong={base_costs['congestion_cost']:.3f}"
+            results = self._run_cpu_side(cpu_cands, benchmark, plc)
+            for (rpos, rproxy, rtag) in results:
+                if rproxy < best_proxy - 1e-9:
+                    best_pos, best_proxy, best_tag = rpos, rproxy, rtag
+            self._log(
+                f"[v60 {benchmark.name}] post-Stage-2 done: best={best_proxy:.4f}  "
+                f"tag={best_tag}  total {time.time()-t0:.1f}s"
             )
-            polished, polish_costs = self._soft_only_polish(best_pos, benchmark, plc)
-            polished_proxy = float(polish_costs['proxy_cost'])
-            if polished_proxy < best_proxy - 1e-9:
-                self._soft_log(
-                    f"[v60 {benchmark.name}] soft polish done: proxy "
-                    f"{best_proxy:.4f} -> {polished_proxy:.4f}  "
-                    f"wl={polish_costs['wirelength_cost']:.3f} den={polish_costs['density_cost']:.3f} "
-                    f"cong={polish_costs['congestion_cost']:.3f}  total {time.time()-t0:.1f}s"
-                )
-                best_pos = polished
-                best_proxy = polished_proxy
-                best_tag = f"{best_tag}+soft"
-            else:
-                self._soft_log(
-                    f"[v60 {benchmark.name}] soft polish: no improvement over "
-                    f"{best_proxy:.4f} (got {polished_proxy:.4f}) — kept pre-polish result  "
-                    f"total {time.time()-t0:.1f}s"
-                )
-
-        if (self.cd_polish_enabled and best_pos is not None
-                and math.isfinite(best_proxy) and plc is not None):
-            cd_out, cd_costs = self._cd_polish(best_pos, benchmark, plc)
-            if cd_costs is not None:
-                cd_proxy = float(cd_costs['proxy_cost'])
-                if cd_proxy < best_proxy - 1e-9:
-                    self._cd_log(
-                        f"[v60 {benchmark.name}] CD polish improved proxy "
-                        f"{best_proxy:.4f} -> {cd_proxy:.4f}  total {time.time()-t0:.1f}s"
-                    )
-                    best_pos   = cd_out
-                    best_proxy = cd_proxy
-                    best_tag   = f"{best_tag}+cd"
-                else:
-                    self._cd_log(
-                        f"[v60 {benchmark.name}] CD polish: no improvement over "
-                        f"{best_proxy:.4f} (got {cd_proxy:.4f}) — kept pre-CD result  "
-                        f"total {time.time()-t0:.1f}s"
-                    )
-
-        if (self.pair_swap_enabled and best_pos is not None
-                and math.isfinite(best_proxy) and plc is not None):
-            ps_out, ps_costs = self._pair_swap_polish(best_pos, benchmark, plc)
-            if ps_costs is not None:
-                ps_proxy = float(ps_costs['proxy_cost'])
-                if ps_proxy < best_proxy - 1e-9:
-                    self._swap_log(
-                        f"[v60 {benchmark.name}] pair-swap improved proxy "
-                        f"{best_proxy:.4f} -> {ps_proxy:.4f}  total {time.time()-t0:.1f}s"
-                    )
-                    best_pos   = ps_out
-                    best_proxy = ps_proxy
-                    best_tag   = f"{best_tag}+swap"
-                else:
-                    self._swap_log(
-                        f"[v60 {benchmark.name}] pair-swap: no improvement over "
-                        f"{best_proxy:.4f} (got {ps_proxy:.4f}) — kept pre-swap result  "
-                        f"total {time.time()-t0:.1f}s"
-                    )
-
-        if (self.soft_pair_swap_enabled and best_pos is not None
-                and math.isfinite(best_proxy) and plc is not None):
-            sps_out, sps_costs = self._pair_swap_polish_soft(best_pos, benchmark, plc)
-            if sps_costs is not None:
-                sps_proxy = float(sps_costs['proxy_cost'])
-                if sps_proxy < best_proxy - 1e-9:
-                    self._soft_swap_log(
-                        f"[v60 {benchmark.name}] soft-pair-swap improved proxy "
-                        f"{best_proxy:.4f} -> {sps_proxy:.4f}  total {time.time()-t0:.1f}s"
-                    )
-                    best_pos   = sps_out
-                    best_proxy = sps_proxy
-                    best_tag   = f"{best_tag}+softswap"
-                else:
-                    self._soft_swap_log(
-                        f"[v60 {benchmark.name}] soft-pair-swap: no improvement over "
-                        f"{best_proxy:.4f} (got {sps_proxy:.4f}) — kept pre-softswap result  "
-                        f"total {time.time()-t0:.1f}s"
-                    )
 
         if diag_logger.active:
             diag_logger.log(
@@ -731,6 +645,219 @@ class v60_Placer:
             diag_logger.close()
         return best_pos
 
+    def _gpu_side(self, seed_pos_np, seed_proxy, benchmark, plc, winner_cohort,
+                  mov_idx, scale, diag_logger, t0, label):
+        """GPU-side refinement (basin-hop + soft polish) from one engine seed.
+
+        Returns a list of legal candidate dicts {pos: tensor, proxy: float,
+        tag: str}: the basin-hop incumbent plus the top soft-polish legal
+        restarts. These feed the pooled top-n_cpu selection for the CPU side.
+        """
+        nM = int(benchmark.num_macros)
+        cur_t = benchmark.macro_positions.clone()
+        cur_t[:nM] = torch.tensor(seed_pos_np, dtype=cur_t.dtype)
+        cur_proxy = float(seed_proxy)
+        cur_tag = label
+
+        # ── Basin-hop from this seed ─────────────────────────────────────
+        if (self.basin_hop and winner_cohort is not None
+                and math.isfinite(cur_proxy)):
+            Bhop = (self.basin_hop_restarts if self.basin_hop_restarts > 0
+                    else int(getattr(winner_cohort, 'num_restarts', 16)))
+            Bhop = self._cap_for_congestion_runtime(benchmark, Bhop, caps=(5, 6, 7, 8))
+            rng  = np.random.default_rng(self.seed if self.deterministic else None)
+            try:
+                ic      = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
+                init_ov = float(ic.get('total_overlap_area', float('nan')))
+            except Exception:
+                init_ov = float('nan')
+            initial = {
+                'pos':          cur_t[:nM].detach().cpu().numpy().astype(np.float32),
+                'proxy':        cur_proxy,
+                'overlap_area': init_ov,
+            }
+
+            def run_from_init(init_b_nmov_2):
+                p = winner_cohort.place(benchmark, init_positions=init_b_nmov_2,
+                                        diag_logger=diag_logger)
+                metrics = getattr(winner_cohort, '_last_run_metrics', None) or []
+                if metrics:
+                    legal_m = [m for m in metrics
+                               if float(m.get('overlap_area', float('nan'))) <= 1e-9]
+                    mm = min(legal_m if legal_m else metrics,
+                             key=lambda m: m.get('score_proxy', float('inf')))
+                    pr = float(mm.get('score_proxy', float('inf')))
+                    ov = float(mm.get('overlap_area', float('nan')))
+                    if not math.isfinite(pr):
+                        pr = self._proxy_cost(p, benchmark, plc)
+                else:
+                    pr = self._proxy_cost(p, benchmark, plc)
+                    ov = float('nan')
+                return {'pos': p[:nM].detach().cpu().numpy().astype(np.float32),
+                        'proxy': pr, 'overlap_area': ov}
+
+            self._log(
+                f"[v60 {benchmark.name}] basin-hop ({label}): B={Bhop}  "
+                f"max_hops={self.basin_hop_max_hops}  improve_quota={self.basin_hop_improve_quota}"
+            )
+            bh = _basin_hop(
+                run_from_init, initial, mov_idx, scale, Bhop, rng,
+                max_hops=self.basin_hop_max_hops,
+                final_explore_n=self.basin_hop_final_explore,
+                sigma_set=self.basin_hop_sigma_set,
+                tabu_eps=self.basin_hop_tabu_eps,
+                tabu_proxy_eps=self.basin_hop_tabu_proxy_eps,
+                improve_quota=self.basin_hop_improve_quota,
+                min_improve_frac=self.basin_hop_min_improve_frac,
+                stratify=self.basin_hop_stratify,
+                log=self._log,
+            )
+            if bh['proxy'] < cur_proxy - 1e-9:
+                self._log(f"[v60 {benchmark.name}] basin-hop ({label}) improved "
+                          f"{cur_proxy:.4f} -> {bh['proxy']:.4f}")
+                out_t      = benchmark.macro_positions.clone()
+                out_t[:nM] = torch.tensor(bh['pos'], dtype=out_t.dtype)
+                cur_t      = out_t
+                cur_proxy  = float(bh['proxy'])
+                cur_tag    = f"{label}+bh"
+
+        candidates = [{'pos': cur_t, 'proxy': cur_proxy, 'tag': cur_tag}]
+
+        # ── Soft polish; pull its top legal restarts into the pool ───────
+        if self.soft_polish_enabled and math.isfinite(cur_proxy):
+            base_costs = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
+            self._soft_log(
+                f"[v60 {benchmark.name}] soft polish ({cur_tag}) start: "
+                f"proxy={base_costs['proxy_cost']:.4f}"
+            )
+            self._last_soft_pool = []
+            _polished, _pc = self._soft_only_polish(cur_t, benchmark, plc)
+            pool = getattr(self, '_last_soft_pool', []) or []
+            for (pr, pos_np) in pool[: self.post_stage2_n_cpu]:
+                cand_t = benchmark.macro_positions.clone()
+                cand_t[:nM] = torch.tensor(pos_np, dtype=cand_t.dtype)
+                candidates.append({'pos': cand_t, 'proxy': float(pr),
+                                   'tag': f"{cur_tag}+soft"})
+
+        return candidates
+
+    def _cpu_side(self, cand_pos, cand_proxy, cand_tag, benchmark, plc, t0=None):
+        """CPU-side refinement (CD polish -> hard pair-swap -> soft pair-swap)
+        from one candidate. Returns (pos tensor, proxy, tag). Self-contained so
+        it can run in a worker process."""
+        if t0 is None:
+            t0 = time.time()
+        best_pos   = cand_pos
+        best_proxy = float(cand_proxy)
+        best_tag   = cand_tag
+
+        if (self.cd_polish_enabled and best_pos is not None
+                and math.isfinite(best_proxy) and plc is not None):
+            cd_out, cd_costs = self._cd_polish(best_pos, benchmark, plc)
+            if cd_costs is not None and float(cd_costs['proxy_cost']) < best_proxy - 1e-9:
+                best_pos   = cd_out
+                best_proxy = float(cd_costs['proxy_cost'])
+                best_tag   = f"{best_tag}+cd"
+
+        if (self.pair_swap_enabled and best_pos is not None
+                and math.isfinite(best_proxy) and plc is not None):
+            ps_out, ps_costs = self._pair_swap_polish(best_pos, benchmark, plc)
+            if ps_costs is not None and float(ps_costs['proxy_cost']) < best_proxy - 1e-9:
+                best_pos   = ps_out
+                best_proxy = float(ps_costs['proxy_cost'])
+                best_tag   = f"{best_tag}+swap"
+
+        if (self.soft_pair_swap_enabled and best_pos is not None
+                and math.isfinite(best_proxy) and plc is not None):
+            sps_out, sps_costs = self._pair_swap_polish_soft(best_pos, benchmark, plc)
+            if sps_costs is not None and float(sps_costs['proxy_cost']) < best_proxy - 1e-9:
+                best_pos   = sps_out
+                best_proxy = float(sps_costs['proxy_cost'])
+                best_tag   = f"{best_tag}+softswap"
+
+        return best_pos, best_proxy, best_tag
+
+    def _run_cpu_side(self, cpu_cands, benchmark, plc):
+        """Run the CPU downstream on each candidate; return a list of
+        (pos tensor, proxy, tag).
+
+        Parallelism uses a *fork*-context multiprocessing.Process per candidate
+        (not ProcessPoolExecutor): with fork the target closure and all inputs
+        (self, benchmark, plc) are inherited through the fork — never pickled —
+        which sidesteps the module-identity pickling failure that ProcessPool
+        hits under the path-loaded submission. Only the numpy result returns
+        over the Queue. Children are CPU-only (CD/swap stages don't touch CUDA),
+        so the parent's CUDA context is irrelevant to them. A child that raises
+        reports it (sends a None result) and that candidate is re-run
+        sequentially in the parent. There is no wall-clock guard: the parent
+        blocks until every child of a wave reports."""
+        nM = int(benchmark.num_macros)
+        if not cpu_cands:
+            return []
+
+        def _seq_one(c):
+            return self._cpu_side(c['pos'], c['proxy'], c['tag'], benchmark, plc)
+
+        if (not self.post_stage2_cpu_parallel) or len(cpu_cands) == 1:
+            return [_seq_one(c) for c in cpu_cands]
+
+        if self.post_stage2_cpu_max_workers == 'auto':
+            max_workers = min(len(cpu_cands), os.cpu_count() or 1)
+        else:
+            max_workers = max(1, min(int(self.post_stage2_cpu_max_workers), len(cpu_cands)))
+
+        try:
+            ctx = mp.get_context('fork')
+        except (ValueError, RuntimeError) as exc:
+            self._log(f"[v60 {benchmark.name}] fork context unavailable ({exc}); "
+                      f"CPU side sequential")
+            return [_seq_one(c) for c in cpu_cands]
+
+        def _child(idx, cand, q):
+            # Inherited via fork; never pickled. Only the result is sent back.
+            try:
+                pos, proxy, tag = self._cpu_side(
+                    cand['pos'], cand['proxy'], cand['tag'], benchmark, plc)
+                q.put((idx, pos[:nM].detach().cpu().numpy().astype(np.float64),
+                       float(proxy), tag))
+            except Exception as exc:  # report; parent re-runs this idx
+                q.put((idx, None, None, repr(exc)))
+
+        results = [None] * len(cpu_cands)
+        failed = []
+        n = len(cpu_cands)
+        self._log(
+            f"[v60 {benchmark.name}] CPU side: {n} candidate(s), "
+            f"fork pool max_workers={max_workers}"
+        )
+        for ws in range(0, n, max_workers):
+            wave = list(range(ws, min(ws + max_workers, n)))
+            q = ctx.Queue()
+            procs = {}
+            for idx in wave:
+                p = ctx.Process(target=_child, args=(idx, cpu_cands[idx], q),
+                                daemon=True)
+                p.start()
+                procs[idx] = p
+            # Each child sends exactly one message (result or error sentinel),
+            # so block for exactly len(wave) messages — no wall-clock guard.
+            for _ in wave:
+                idx, pos_np, proxy, tag = q.get()
+                if pos_np is None:
+                    self._log(f"[v60 {benchmark.name}] CPU child {idx} errored: {tag}")
+                    failed.append(idx)
+                else:
+                    t = benchmark.macro_positions.clone()
+                    t[:nM] = torch.tensor(pos_np, dtype=t.dtype)
+                    results[idx] = (t, float(proxy), tag)
+            for p in procs.values():
+                p.join()
+
+        # Re-run any errored candidates sequentially in the parent.
+        for idx in failed:
+            results[idx] = _seq_one(cpu_cands[idx])
+
+        return [r for r in results if r is not None]
 
     @staticmethod
     def _canvas_L(benchmark: Benchmark) -> float:
@@ -918,6 +1045,7 @@ class v60_Placer:
         best_legal_pos = None
         best_legal_costs = None
         best_legal_proxy = float('inf')
+        legal_restarts = []   # (proxy, pos_np) for overlap-free restarts
         for i, pos_np in enumerate(all_pos):
             costs = compute_proxy_cost(torch.tensor(pos_np, dtype=torch.float32), benchmark, plc)
             proxy = float(costs['proxy_cost'])
@@ -932,10 +1060,17 @@ class v60_Placer:
                 best_pos = pos_np
                 best_costs = costs
             # v60: track the best *legal* (overlap-free) soft restart too
-            if ovlp <= 1e-9 and proxy < best_legal_proxy:
-                best_legal_proxy = proxy
-                best_legal_pos = pos_np
-                best_legal_costs = costs
+            if ovlp <= 1e-9:
+                legal_restarts.append((proxy, pos_np))
+                if proxy < best_legal_proxy:
+                    best_legal_proxy = proxy
+                    best_legal_pos = pos_np
+                    best_legal_costs = costs
+
+        # Stash the ranked legal-restart pool (best-first) so the multi-candidate
+        # post-Stage-2 path can pull the top-K, not just the single best.
+        legal_restarts.sort(key=lambda t: t[0])
+        self._last_soft_pool = legal_restarts
 
         # prefer the best legal restart; fall back to best-proxy if none legal
         if best_legal_pos is not None:
