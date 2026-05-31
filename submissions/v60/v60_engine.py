@@ -166,9 +166,9 @@ class v60_Engine:
         stage0_gamma_start:     float = 2.0,
         stage0_gamma_end:       float = 0.3,
         stage0_target_density:  float = 0.7,
-        # ── Stage 1 / Stage 2 (defaults seeded from the v53 ibm01 best) ─────
+        # ── Stage 1 / Stage 2 (defaults tuned on the ibm01 best) ───────────
         num_steps_s1          = 'auto',
-        lr_s1                 = 'auto',     # v60: rescaled formula, anchored 1.15 at L=23.
+        lr_s1                 = 'auto',     # rescaled formula, anchored 1.15 at L=23.
         gamma_s1_start: float = 2.149,
         gamma_s1_end: float   = 0.351,
         lambda_cong_s1: float = 8000.0,   # v60 (2026-05-20): sweep top-20 median at ibm01.

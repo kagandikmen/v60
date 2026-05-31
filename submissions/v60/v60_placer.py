@@ -1,23 +1,24 @@
 """
-Analytical Placer v60 — v59 set plus soft-only polish
+Analytical Placer v60 — orchestrator.
 
-This is the file to run. v60_placer.py is the orchestrator: it drives the
-v60 engine (v60_engine.py), then a basin-hop wrapper and a soft-only
-Stage 2 polish on top.
+This is the file to run. v60_placer.py drives the placement engine
+(v60_engine.py, which clusters hard macros via K-means on the 2D Fiedler
+embedding and runs the three-stage gradient descent), then layers several
+refinement stages on top of the engine's best seeds:
 
-v60 starts from the v59 single-cohort orchestrator, then freezes hard macros
-and re-optimizes only soft macros from the base placement. The engine
-clusters hard macros via K-means on the 2D Fiedler embedding.
+  - a basin-hopping wrapper (perturb-and-reminimize),
+  - a soft-only Stage 2 polish (hard macros frozen),
+  - real-proxy coordinate-descent (CD) polish, and
+  - hard-hard and soft-soft pair-swap polish.
 
-Wall-time savings vs v57: ~3x for the base run. v60 adds a local
-soft-only Stage 2 polish after the base placement.
+A multi-candidate path runs the top engine seeds through these stages and
+keeps the best final placement.
 
 The engine lives in v60_engine.py.
-No v60 module imports across version boundaries.
 
 Usage:
-    uv run evaluate submissions/examples/v60_placer.py -b ibm01
-    uv run evaluate submissions/examples/v60_placer.py --all
+    uv run evaluate submissions/v60/v60_placer.py -b ibm01
+    uv run evaluate submissions/v60/v60_placer.py --all
 """
 
 import math
@@ -81,8 +82,8 @@ def _set_fast_nondeterministic() -> None:
 
 class v60_Placer:
     """
-    v60 orchestrator: runs the v60 engine, then the inherited basin-hop
-    wrapper plus a soft-only Stage 2 polish on top.
+    v60 orchestrator: runs the engine, then a basin-hop wrapper, a
+    soft-only Stage 2 polish, real-proxy CD polish, and pair-swap polish.
 
     The engine clusters hard macros via K-means on the 2D Fiedler
     embedding (see v60_engine.py).
@@ -133,8 +134,8 @@ class v60_Placer:
         #     flagged as the same basin and we stop spawning around it.
         #   - improve_quota ends the hop loop after 3 non-improving hops to
         #     hand the freed budget to final_explore.
-        #   - B per hop dropped from inherited 32 to 8; max_hops/final_explore
-        #     bumped to use the freed wall-time on more hop attempts.
+        #   - B per hop is small (8) so the freed wall-time goes to more hop
+        #     attempts (higher max_hops / final_explore).
         basin_hop:                  bool  = True,
         basin_hop_max_hops:         int   = 24,
         basin_hop_final_explore:    int   = 0,
@@ -148,7 +149,7 @@ class v60_Placer:
         # loop escalates / ends on time. 0.0 = legacy behaviour.
         basin_hop_min_improve_frac: float = 0.005,                   # 0.5% of current proxy
         basin_hop_stratify:         bool  = False,                   # split B across sigma_set per hop
-        basin_hop_restarts:         int   = 8,                       # was 0 (inherit cohort B); now small B + more hops
+        basin_hop_restarts:         int   = 8,                       # small B per hop + more hops
         # Runtime guard for large/routability-heavy benchmarks. 'auto' keeps
         # ibm01-style behavior but caps expensive Stage-2 reruns on big netlists.
         congestion_runtime_mode: str = 'auto',

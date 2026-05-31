@@ -115,7 +115,7 @@ def _set_fast_nondeterministic() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Legalization (verbatim from v8)
+#  Legalization
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _split_push_legalize(pos_np, nH, cw, ch, hwH, hhH, movable_mask, gap=0.001, max_passes=500):
@@ -545,13 +545,13 @@ def _rudy_congestion_batch(pos_batch, node_ids_t, net_ids_t, num_nets, net_weigh
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  v60: faithful differentiable congestion port (_official_congestion_batch_v2)
+#  Faithful differentiable congestion port (_official_congestion_batch_v2)
 # ──────────────────────────────────────────────────────────────────────────────
-#  v54's _official_congestion_batch put a single soft H stripe at each net's
+#  An earlier, cruder congestion proxy put a single soft H stripe at each net's
 #  bbox y-midpoint (and a V stripe at the x-midpoint), which systematically
 #  under-counts multi-pin nets and ignores the box-blur smoothing pass — a
-#  diagnostic showed it under-reports real ABU cong by ~40%. v60 replaces it
-#  with a near-faithful port of plc_client_os.get_routing()/get_congestion_cost():
+#  diagnostic showed it under-reports real ABU cong by ~40%. This port replaces
+#  it with a near-faithful copy of plc_client_os.get_routing()/get_congestion_cost():
 #    * every net is a star from its driver pin; each (driver, sink) edge is an
 #      L-route — H demand along the driver's row over the columns spanned by
 #      [d_x, s_x], V demand along the sink's column over the rows spanned by
@@ -868,10 +868,10 @@ def _compute_preconditioner(raw: dict) -> np.ndarray:
 # At initialisation, every hard macro starts at its cluster's centre
 # (plus a small per-macro jitter). Connected macros that fall in the
 # same cluster start clustered together, breaking the random/quadratic-
-# init topology that traps v52 at the cong=1.14 floor.
+# init topology that traps the optimiser at the cong=1.14 floor.
 #
 # We deliberately do NOT enforce a hard cluster boundary in Stage 1/2 —
-# the loss is the standard v52 loss. Clustering only changes where macros
+# the loss is the standard placement loss. Clustering only changes where macros
 # START. The optimiser is free to dissolve cluster boundaries during
 # refinement; we just give it a connectivity-respecting initial
 # topology to descend from.
@@ -1012,11 +1012,11 @@ def _spectral_embed_to_canvas(embed_2d: np.ndarray, cw: float, ch: float,
 # Given cluster labels, build a K-super-macro problem and place those
 # super-macros via mini-analytical (WAWL + density + pairwise overlap),
 # using the embedding-derived centres as init. The optimised K positions
-# replace v53's "spectral embedding linearly scaled to canvas" centres,
-# which were never tuned by any objective.
+# replace a plain "spectral embedding linearly scaled to canvas" init,
+# which was never tuned by any objective.
 #
 # Soft macros are skipped at Stage 0 (only super-clusters of hard macros +
-# fixed ports participate). Stage 1+2 still place softs as in v53.
+# fixed ports participate). Stage 1+2 place the softs.
 
 def _build_super_net_list(benchmark: Benchmark, labels: np.ndarray,
                            nH: int, nM: int, K: int):
@@ -1237,7 +1237,7 @@ def _extract_raw(benchmark: Benchmark) -> dict:
 # cell. The helpers below mirror the kernel's arithmetic in pure numpy
 # and add the breakdown.
 #
-# Why this exists: v52→v60 placements all converge to cong ≈ 1.13 on
+# Why this exists: placements all converge to cong ≈ 1.13 on
 # ibm01 regardless of init. The diagnostic answers:
 #   * Are the same cells always saturating? (structural chokepoint?)
 #   * Is the saturation net demand or macro blockage?
@@ -1723,7 +1723,7 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
     if init_positions is None:
         B = B_init
 
-        # ── Cluster-aware init for hard macros (multi-level v53) ──────────
+        # ── Cluster-aware init for hard macros (multi-level) ──────────────
         # If cluster_data is provided, each hard macro starts at its
         # cluster's centre + a per-restart, per-macro jitter (jitter_frac of
         # canvas side). Soft macros stay random in canvas. The standard

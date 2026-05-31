@@ -1334,8 +1334,9 @@ class IncrementalEval:
         include_cong=False; for True we currently fall back to a full
         recompute on a temporary placement, which is slow).
 
-        include_cong=True is only useful for validation; for SA prefer
-        include_cong=False then full-eval after the cheap delta wins.
+        include_cong=True is only useful for validation; the local-search
+        polish stages prefer include_cong=False then full-eval after the
+        cheap delta wins.
         """
         delta_total_hpwl, wl_state = self._delta_wl_for_move(macro_idx, new_xy)
         delta_wl = delta_total_hpwl / self.wl_denominator
@@ -1352,8 +1353,8 @@ class IncrementalEval:
         if include_cong:
             # Tentative-apply path: snapshot ALL mutable state, commit, eval,
             # restore. Smoothing + ABU is O(grid_size) per call, so this is
-            # ~100× faster than the previous PLC fallback. Mostly useful for
-            # validation; for production SA prefer include_cong=False + full
+            # ~100× faster than a full PLC rebuild. Mostly useful for
+            # validation; the polish stages prefer include_cong=False + full
             # eval after the cheap delta wins.
             old_cong = self.compute_cong_cost_full()
             saved = {
@@ -1558,7 +1559,7 @@ def benchmark_per_move(benchmark: Benchmark, plc: PlacementCost,
 
     A) compute_proxy_cost: rebuild PLC state from the placement tensor and
        call get_wirelength + get_density_cost + get_congestion_cost. This is
-       what v60's current Stage 2 / SA / basin-hop pipelines call.
+       what the Stage 2 / basin-hop / polish pipelines call.
     B) IncrementalEval: delta_for_move (WL+density) + commit_move (updates all
        three caches) + proxy_breakdown (reads cached cong, O(grid_size)).
 
