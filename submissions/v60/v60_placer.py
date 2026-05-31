@@ -911,7 +911,6 @@ class v60_Placer:
             return placement, costs
 
         B = max(1, self.soft_polish_restarts)
-        B = self._cap_for_congestion_runtime(benchmark, B, caps=(12, 16, 20, 24))
         rng = np.random.default_rng(self.seed if self.deterministic else None)
         scale = 0.5 * (float(benchmark.canvas_width) + float(benchmark.canvas_height))
         jitter_fracs = self._resolve_soft_polish(benchmark)['jitter_fracs']
