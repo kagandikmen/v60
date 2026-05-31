@@ -48,7 +48,7 @@ from macro_place.objective import compute_proxy_cost
 
 from v60_engine import v60_Engine
 from v60_kernels   import (
-    _DiagLogger, _resolve_log_path, _basin_hop, _congestion_work_tier,
+    _basin_hop, _congestion_work_tier,
     _extract_raw, _parse_plc_routing_params, _run_batch,
 )
 from v60_incremental_eval import IncrementalEval
@@ -119,16 +119,6 @@ class v60_Placer:
         verbose: bool = True,
         deterministic: bool = False,   # production default: keep TF32 / fast kernels on
         seed: int           = 0,
-        # ── "Logging final boss". When log_dir is set, a single per-benchmark
-        # JSONL is opened by the orchestrator and threaded into the cohort so
-        # every Stage 0/1/2 step, per-seed final position, legalization
-        # delta and per-seed score lands in one trace. Default OFF.
-        log_dir:           str = None,
-        log_every_n_steps: int = 50,
-        # Per-step per-seed full hard-macro positions in the JSONL trace.
-        # Costs ~50MB/run on 24 seeds × 246 macros × 100 sampled steps.
-        # The cheap centroid+spread aggregates always log either way.
-        log_positions_per_step: bool = False,   # v60 debug
         # ── Basin-hopping wrapper (v60). After the cohort run, perturb
         # the running-best placement and re-run Stage 2 from it, with a
         # promising-seed priority queue + visited-basin tabu list (see
@@ -278,9 +268,6 @@ class v60_Placer:
         self.verbose       = verbose
         self.deterministic = deterministic
         self.seed          = seed
-        self.log_dir                = log_dir
-        self.log_every_n_steps      = int(log_every_n_steps)
-        self.log_positions_per_step = bool(log_positions_per_step)
         self.basin_hop                = bool(basin_hop)
         self.basin_hop_max_hops       = int(basin_hop_max_hops)
         self.basin_hop_final_explore  = int(basin_hop_final_explore)
@@ -427,10 +414,6 @@ class v60_Placer:
         return _congestion_work_tier(benchmark) + 2
 
     def _make_cohort(self, cls, num_restarts):
-        # log_dir intentionally NOT passed — the orchestrator owns one logger
-        # for the whole run and threads it into each cohort via place(...,
-        # diag_logger=...). log_every_n_steps still goes through so cohorts
-        # know the cadence.
         return cls(
             num_restarts              = num_restarts,
             num_clusters              = self.num_clusters,
@@ -452,9 +435,6 @@ class v60_Placer:
             verbose                   = self.verbose,
             deterministic             = self.deterministic,
             seed                      = self.seed,
-            log_dir                   = None,
-            log_every_n_steps         = self.log_every_n_steps,
-            log_positions_per_step    = self.log_positions_per_step,
             stage2_overlap_tol_ratio  = self.stage2_overlap_tol_ratio,
         )
 
@@ -474,54 +454,11 @@ class v60_Placer:
             f"s0_steps={self.stage0_steps}  s0_lr={self.stage0_lr:.2f}"
         )
 
-        # ── Diagnostic logger (one file per benchmark per run).
-        # When log_dir is None, logger is no-op.
-        log_path   = _resolve_log_path(self.log_dir, benchmark.name, tag='v60')
-        diag_logger = _DiagLogger(log_path)
-        if diag_logger.active:
-            self._log(f"[v60 {benchmark.name}] diag log: {log_path}")
-            diag_logger.log(
-                'run_start',
-                benchmark=benchmark.name, device=str(device_str),
-                cohort_pick={'tag': 'engine', 'hard_frac': float(hard_frac)},
-                num_restarts={'engine': int(self.num_restarts)},
-                config={
-                    'num_clusters': self.num_clusters,
-                    'cluster_jitter_frac': float(self.cluster_jitter_frac),
-                    'cluster_margin_frac': float(self.cluster_margin_frac),
-                    'cluster_seed':        int(self.cluster_seed),
-                    'stage0_steps':        int(self.stage0_steps),
-                    'stage0_lr':           float(self.stage0_lr),
-                    'stage0_lambda_density': float(self.stage0_lambda_density),
-                    'stage0_lambda_overlap': float(self.stage0_lambda_overlap),
-                    'stage0_gamma_start':    float(self.stage0_gamma_start),
-                    'stage0_gamma_end':      float(self.stage0_gamma_end),
-                    'stage0_target_density': float(self.stage0_target_density),
-                    'use_hh_overlap':            bool(self.use_hh_overlap),
-                    'use_ss_overlap':            bool(self.use_ss_overlap),
-                    'use_soft_degree_inflation': bool(self.use_soft_degree_inflation),
-                    'deterministic':             bool(self.deterministic),
-                    'seed':                      int(self.seed),
-                    'log_every_n_steps':         int(self.log_every_n_steps),
-                    'log_positions_per_step':    bool(self.log_positions_per_step),
-                },
-                benchmark_stats={
-                    'num_macros':      int(benchmark.num_macros),
-                    'num_hard_macros': int(benchmark.num_hard_macros),
-                    'num_soft_macros': int(benchmark.num_macros - benchmark.num_hard_macros),
-                    'num_nets':        int(len(benchmark.net_nodes)),
-                    'canvas_width':    float(benchmark.canvas_width),
-                    'canvas_height':   float(benchmark.canvas_height),
-                    'grid_rows':       int(benchmark.grid_rows),
-                    'grid_cols':       int(benchmark.grid_cols),
-                },
-            )
-
         # v60: single engine run.
         cohort_elapsed = {}
         cohorts = {'engine': self._make_cohort(v60_Engine, self.num_restarts)}
         t = time.time()
-        pos_pick = cohorts['engine'].place(benchmark, diag_logger=diag_logger)
+        pos_pick = cohorts['engine'].place(benchmark)
         cohort_elapsed['engine'] = round(time.time() - t, 3)
 
         netlist  = osp.join(self.plc_root, benchmark.name, "netlist.pb.txt")
@@ -533,18 +470,7 @@ class v60_Placer:
             for tag, pos in all_results:
                 if pos is not None:
                     self._log(f"[v60 {benchmark.name}] no netlist; returning {tag}")
-                    if diag_logger.active:
-                        diag_logger.log('run_end', benchmark=benchmark.name,
-                                        elapsed_s=round(time.time() - t0, 3),
-                                        winner=tag, reason='no_netlist',
-                                        cohort_elapsed=cohort_elapsed)
-                        diag_logger.close()
                     return pos
-            if diag_logger.active:
-                diag_logger.log('run_end', benchmark=benchmark.name,
-                                elapsed_s=round(time.time() - t0, 3),
-                                winner=None, reason='no_results')
-                diag_logger.close()
             return None
 
         plc = PlacementCost(netlist)
@@ -599,7 +525,7 @@ class v60_Placer:
                 seed = seed_pool[gi]
                 cand_pool += self._gpu_side(
                     seed['pos'], seed['proxy'], benchmark, plc, winner_cohort,
-                    mov_idx, scale, diag_logger, t0, label=f"{best_tag}#{gi}")
+                    mov_idx, scale, t0, label=f"{best_tag}#{gi}")
 
             # Rank best-first, dedup by proxy, take top-n_cpu for the CPU side.
             cand_pool.sort(key=lambda c: c['proxy'])
@@ -625,28 +551,10 @@ class v60_Placer:
                 f"tag={best_tag}  total {time.time()-t0:.1f}s"
             )
 
-        if diag_logger.active:
-            diag_logger.log(
-                'result',
-                benchmark=benchmark.name,
-                scores={tag: (None if p == float('inf') else float(p))
-                        for tag, p, _, _ in scored},
-                winner=best_tag,
-                best_proxy=float(best_proxy) if best_proxy != float('inf') else None,
-                cohort_elapsed=cohort_elapsed,
-            )
-            diag_logger.log(
-                'run_end',
-                benchmark=benchmark.name,
-                elapsed_s=round(time.time() - t0, 3),
-                winner=best_tag,
-                best_proxy=float(best_proxy) if best_proxy != float('inf') else None,
-            )
-            diag_logger.close()
         return best_pos
 
     def _gpu_side(self, seed_pos_np, seed_proxy, benchmark, plc, winner_cohort,
-                  mov_idx, scale, diag_logger, t0, label):
+                  mov_idx, scale, t0, label):
         """GPU-side refinement (basin-hop + soft polish) from one engine seed.
 
         Returns a list of legal candidate dicts {pos: tensor, proxy: float,
@@ -678,8 +586,7 @@ class v60_Placer:
             }
 
             def run_from_init(init_b_nmov_2):
-                p = winner_cohort.place(benchmark, init_positions=init_b_nmov_2,
-                                        diag_logger=diag_logger)
+                p = winner_cohort.place(benchmark, init_positions=init_b_nmov_2)
                 metrics = getattr(winner_cohort, '_last_run_metrics', None) or []
                 if metrics:
                     legal_m = [m for m in metrics
@@ -972,8 +879,6 @@ class v60_Placer:
             'inflation_factor': 1.0,
             'target_density': 0.7,
             'cluster_jitter_frac': 0.0,
-            'log_every_n_steps': 10**9,
-            'log_positions_per_step': False,
         }
         params.update(_parse_plc_routing_params(
             osp.join(self.plc_root, benchmark.name, 'initial.plc')
@@ -1035,8 +940,6 @@ class v60_Placer:
             raw, params, B, device,
             init_positions=init,
             cluster_data=None,
-            diag_logger=None,
-            cohort_tag='soft_polish',
         )
 
         best_pos = None

@@ -18,8 +18,6 @@ and place().
 Not directly runnable — import via v60_engine.py / v60_placer.py.
 """
 
-import datetime
-import json
 import os
 import os.path as osp
 import random
@@ -49,131 +47,6 @@ from macro_place.objective import compute_proxy_cost
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32        = True
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Diagnostic logger (JSONL, "logging final boss")
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _to_jsonable(obj):
-    """Recursively coerce numpy / torch / sets to JSON-friendly types."""
-    if obj is None or isinstance(obj, (bool, int, str)):
-        return obj
-    if isinstance(obj, float):
-        return obj if (obj == obj and obj not in (float('inf'), float('-inf'))) else None
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        v = float(obj)
-        return v if (v == v and v not in (float('inf'), float('-inf'))) else None
-    if isinstance(obj, np.ndarray):
-        return _to_jsonable(obj.tolist())
-    if isinstance(obj, torch.Tensor):
-        try:
-            return _to_jsonable(obj.detach().cpu().to(torch.float32).numpy().tolist())
-        except Exception:
-            return _to_jsonable(obj.detach().cpu().tolist())
-    if isinstance(obj, dict):
-        return {str(k): _to_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_to_jsonable(v) for v in obj]
-    # Fallback — last-ditch repr so logging never crashes.
-    try:
-        return float(obj)
-    except Exception:
-        return str(obj)
-
-
-class _DiagLogger:
-    """
-    JSONL append-only logger for v60 diagnostic dumps. One line per event.
-
-    Construct with a path or None (None = no-op for every method). Safe to
-    call .log() from anywhere; values are coerced via _to_jsonable so numpy
-    arrays / torch tensors / nested dicts work without further effort.
-
-    Always carries `ts` (seconds since logger creation) and `wall` (wall
-    clock ISO timestamp) on every record so post-hoc time analysis is easy.
-
-    Not thread-safe. Multiple cohorts share the same path serially (each
-    cohort opens, writes, closes — file is append-mode so no truncation).
-    """
-
-    def __init__(self, path):
-        self.path = path
-        self.t0   = time.time()
-        self.f    = None
-        if path:
-            os.makedirs(osp.dirname(osp.abspath(path)) or '.', exist_ok=True)
-            # Append; multiple cohorts on the same path interleave events.
-            self.f = open(path, 'a', buffering=1)  # line-buffered
-
-    @property
-    def active(self) -> bool:
-        return self.f is not None
-
-    def log(self, event: str, **fields):
-        if self.f is None:
-            return
-        record = {
-            'ts':    round(time.time() - self.t0, 4),
-            'wall':  datetime.datetime.now().isoformat(timespec='seconds'),
-            'event': event,
-        }
-        record.update(_to_jsonable(fields))
-        try:
-            self.f.write(json.dumps(record, default=str) + '\n')
-        except Exception as exc:
-            # Never let logging blow up a run.
-            self.f.write(json.dumps({
-                'ts': round(time.time() - self.t0, 4),
-                'event': 'log_error',
-                'attempted_event': event,
-                'error': str(exc),
-            }) + '\n')
-
-    def close(self):
-        if self.f is not None:
-            try:
-                self.f.close()
-            except Exception:
-                pass
-            self.f = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
-
-def _resolve_log_path(log_dir, benchmark_name: str, tag: str = 'v60') -> str:
-    """Build a per-benchmark, per-run log path under log_dir.
-
-    Accepts:
-      - None / False        → returns None (logging off)
-      - True                → uses default directory './logs'
-      - str (non-empty)     → uses that directory
-      - str ending in .jsonl→ uses that exact path (no auto-naming)
-    """
-    if log_dir is None or log_dir is False:
-        return None
-    if log_dir is True:
-        log_dir = 'logs'
-    if not isinstance(log_dir, (str, os.PathLike)):
-        raise TypeError(
-            f"log_dir must be None / bool / str / PathLike, got {type(log_dir).__name__}"
-        )
-    log_dir = str(log_dir)
-    if not log_dir:
-        return None
-    # Allow the user to pass an exact .jsonl path if they don't want auto-naming.
-    if log_dir.endswith('.jsonl'):
-        return log_dir
-    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    return osp.join(log_dir, f"{tag}_{benchmark_name}_{ts}.jsonl")
 
 
 def _congestion_work_tier(benchmark) -> int:
@@ -1220,10 +1093,7 @@ def _run_stage0(benchmark: Benchmark, labels: np.ndarray, K: int,
                 lambda_overlap: float = 500.0,
                 gamma_start: float = 2.0,
                 gamma_end: float = 0.3,
-                target_density: float = 0.7,
-                diag_logger=None,
-                cohort_tag: str = '?',
-                log_every_n_steps: int = 50) -> np.ndarray:
+                target_density: float = 0.7) -> np.ndarray:
     """
     Mini-analytical placement of K super-macros. Returns optimised
     [K, 2] super-macro positions in canvas coordinates.
@@ -1235,30 +1105,11 @@ def _run_stage0(benchmark: Benchmark, labels: np.ndarray, K: int,
     G_rows = int(benchmark.grid_rows)
     G_cols = int(benchmark.grid_cols)
 
-    log = diag_logger if (diag_logger is not None and diag_logger.active) else None
-    log_n = max(1, int(log_every_n_steps))
-    if log is not None:
-        cluster_sizes = np.bincount(labels, minlength=K).tolist() if labels is not None else None
-        log.log(
-            'stage0_start', cohort_tag=cohort_tag, benchmark=getattr(benchmark, 'name', '?'),
-            K=int(K), num_steps=int(num_steps), lr=float(lr),
-            lambda_density=float(lambda_density),
-            lambda_overlap=float(lambda_overlap),
-            gamma_start=float(gamma_start), gamma_end=float(gamma_end),
-            target_density=float(target_density),
-            cluster_sizes=cluster_sizes,
-            init_centers=(init_centers.tolist() if init_centers is not None else None),
-        )
-    t_s0 = time.time()
-
     if K < 2:
         if init_centers is None or init_centers.shape[0] != K:
             out = np.full((K, 2), [cw * 0.5, ch * 0.5], dtype=np.float32)
         else:
             out = init_centers.astype(np.float32).copy()
-        if log is not None:
-            log.log('stage0_end', cohort_tag=cohort_tag, benchmark=getattr(benchmark, 'name', '?'),
-                    elapsed_s=round(time.time() - t_s0, 3), reason='K<2', final_centers=out.tolist())
         return out
 
     super_data = _build_super_net_list(benchmark, labels, nH, nM, K)
@@ -1267,10 +1118,6 @@ def _run_stage0(benchmark: Benchmark, labels: np.ndarray, K: int,
 
     if super_data['num_nets'] == 0:
         out = init_centers.astype(np.float32).copy()
-        if log is not None:
-            log.log('stage0_end', cohort_tag=cohort_tag, benchmark=getattr(benchmark, 'name', '?'),
-                    elapsed_s=round(time.time() - t_s0, 3), reason='no_super_nets',
-                    final_centers=out.tolist())
         return out
 
     # Stage 0 is tiny — CPU avoids GPU sync overhead.
@@ -1318,29 +1165,12 @@ def _run_stage0(benchmark: Benchmark, labels: np.ndarray, K: int,
         ovlp  = _pairwise_overlap_loss_batch(sub_b, hw_t, hh_t)
         loss  = wl + lambda_density * den + lambda_overlap * ovlp
         loss.sum().backward()
-        if log is not None and (step % log_n == 0 or step == num_steps - 1):
-            with torch.no_grad():
-                centers_now = super_pos.detach().cpu().numpy().tolist()
-            log.log(
-                'stage0_step', cohort_tag=cohort_tag, benchmark=getattr(benchmark, 'name', '?'),
-                step=int(step), gamma=float(g),
-                lr=float(opt.param_groups[0]['lr']),
-                wl=float(wl.item()), density=float(den.item()),
-                overlap=float(ovlp.item()), total=float(loss.item()),
-                centers=centers_now,
-            )
         opt.step(); sched.step()
         with torch.no_grad():
             super_pos.data[:, 0].clamp_(x_lo, x_hi)
             super_pos.data[:, 1].clamp_(y_lo, y_hi)
 
     out = super_pos.detach().cpu().numpy().astype(np.float32)
-    if log is not None:
-        log.log(
-            'stage0_end', cohort_tag=cohort_tag, benchmark=getattr(benchmark, 'name', '?'),
-            elapsed_s=round(time.time() - t_s0, 3),
-            final_centers=out.tolist(),
-        )
     return out
 
 
@@ -1802,8 +1632,7 @@ def _dump_cong_diagnostic_multi(out_base: str, raw: dict, params: dict,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
-               init_positions=None, cluster_data=None,
-               diag_logger=None, cohort_tag: str = '?') -> list:
+               init_positions=None, cluster_data=None) -> list:
     """
     If `init_positions` is provided ([B, n_mov, 2]), Stage 1 is skipped
     (positions feed straight into Stage 2). Used by basin-hop and the
@@ -1840,32 +1669,6 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
     hh_t          = torch.tensor(hh_np,              dtype=dtype,       device=device)
     movable_idx_t = torch.tensor(movable_idx.tolist(), dtype=torch.long, device=device)
     n_mov         = len(movable_idx)
-
-    # ── Diagnostic logger setup (no-op if diag_logger is None) ────────────
-    if diag_logger is None:
-        diag_logger = _DiagLogger(None)
-    log_active = diag_logger.active
-    log_n      = max(1, int(params.get('log_every_n_steps', 50)))
-    log_pos    = bool(params.get('log_positions_per_step', True))
-    bench_name = raw.get('name', '?')
-
-    if log_active:
-        diag_logger.log(
-            'run_batch_start',
-            cohort_tag=cohort_tag,
-            benchmark=bench_name,
-            device=str(device_str),
-            B_init=int(B_init),
-            n_mov=int(n_mov),
-            nH=int(nH), nM=int(nM), nP=int(nP), nS=int(nS),
-            num_nets=int(num_nets),
-            canvas={'cw': float(cw), 'ch': float(ch),
-                    'G_rows': int(G_rows), 'G_cols': int(G_cols)},
-            init_mode='from_init_positions' if init_positions is not None else (
-                      'cluster' if cluster_data is not None else 'random'),
-            cluster_K=(int(cluster_data['K']) if cluster_data is not None else None),
-            params=params,
-        )
 
     # ── Routing parameters (parsed from initial.plc) ────────────────────────
     hpm = float(params.get('hroutes_per_micron', 0.0))
@@ -2017,9 +1820,6 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
     cong_v2_data = _build_cong_v2_data(raw) if use_cong_v2 else None
     if use_cong_v2 and cong_v2_data is None:
         use_cong_v2 = False
-        if log_active:
-            diag_logger.log('cong_v2_fallback', cohort_tag=cohort_tag,
-                            reason='net_pin_nodes unavailable')
     if use_cong_v2:
         pin_owner_t = torch.tensor(cong_v2_data['pin_owner'], dtype=torch.long, device=device)
         pin_off_t   = torch.tensor(cong_v2_data['pin_off'],   dtype=dtype,      device=device)
@@ -2077,18 +1877,6 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
         opt1   = optim.Adam([movable_params], lr=params['lr_s1'])
         sched1 = optim.lr_scheduler.CosineAnnealingLR(opt1, ns1, eta_min=params['lr_s1'] * 0.01)
 
-        if log_active:
-            diag_logger.log(
-                'stage1_start', cohort_tag=cohort_tag, benchmark=bench_name,
-                B=int(B), n_mov=int(n_mov), num_steps=int(ns1),
-                lr_s1=float(params['lr_s1']),
-                gamma_s1_start=float(params['gamma_s1_start']),
-                gamma_s1_end=float(params['gamma_s1_end']),
-                lambda_cong_s1=float(lc_s1),
-                cong_eval_interval=int(cong_interval_s1),
-            )
-        t_s1 = time.time()
-
         for step in range(ns1):
             g = gamma_at(step, ns1, params['gamma_s1_start'], params['gamma_s1_end'])
             opt1.zero_grad()
@@ -2105,59 +1893,11 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
             loss_seed_s1.sum().backward()
             if v_inv_t is not None and movable_params.grad is not None:
                 movable_params.grad.mul_(v_inv_t)
-            # Log a step BEFORE opt.step()/sched.step() so values reflect what
-            # the gradient was computed against.
-            if log_active and (step % log_n == 0 or step == ns1 - 1):
-                with torch.no_grad():
-                    grad_t = movable_params.grad
-                    if grad_t is None:
-                        grad_norm_seed = [None] * int(B)
-                    else:
-                        grad_norm_seed = grad_t.detach().to(torch.float32).reshape(B, -1).norm(dim=1).cpu().numpy().tolist()
-                    per_seed = {
-                        'wl':       wl_b.detach().to(torch.float32).cpu().numpy().tolist(),
-                        'cong':     cong_b.detach().to(torch.float32).cpu().numpy().tolist(),
-                        'cong_evaluated': bool(eval_cong),
-                        'total':    loss_seed_s1.detach().to(torch.float32).cpu().numpy().tolist(),
-                        'grad_norm': grad_norm_seed,
-                    }
-                    # Per-step position trace: cheap aggregates always, full
-                    # [B, nH, 2] tensor only when log_positions_per_step is set.
-                    if nH > 0:
-                        hard_pos_b = pos_b[:, :nH, :].detach().to(torch.float32).cpu().numpy()
-                        per_seed['centroid_x'] = hard_pos_b[:, :, 0].mean(axis=1).tolist()
-                        per_seed['centroid_y'] = hard_pos_b[:, :, 1].mean(axis=1).tolist()
-                        per_seed['spread_x']   = hard_pos_b[:, :, 0].std(axis=1).tolist()
-                        per_seed['spread_y']   = hard_pos_b[:, :, 1].std(axis=1).tolist()
-                        if log_pos:
-                            per_seed['hard_positions'] = hard_pos_b.tolist()
-                    diag_logger.log(
-                        'stage1_step',
-                        cohort_tag=cohort_tag, benchmark=bench_name,
-                        step=int(step), gamma=float(g),
-                        lr=float(opt1.param_groups[0]['lr']),
-                        per_seed=per_seed,
-                    )
             opt1.step(); sched1.step(); project(movable_params)
 
         # No Stage-1 pruning. We never rank seeds with the differentiable
         # proxy — the only valid ranker is compute_proxy_cost, which runs
         # once per seed at the end (in the cohort placer).
-        if log_active:
-            with torch.no_grad():
-                pos_after = make_full_pos(movable_params, b_idx_full, m_idx_full)
-                hard_pos_after = pos_after[:, :nH, :].detach().to(torch.float32).cpu().numpy() if nH > 0 else None
-                diag_logger.log(
-                    'stage1_end', cohort_tag=cohort_tag, benchmark=bench_name,
-                    elapsed_s=round(time.time() - t_s1, 3),
-                    B_after=int(B),
-                    hard_macro_centroid={
-                        'mean_x_per_seed': (hard_pos_after[:, :, 0].mean(axis=1).tolist() if hard_pos_after is not None else None),
-                        'mean_y_per_seed': (hard_pos_after[:, :, 1].mean(axis=1).tolist() if hard_pos_after is not None else None),
-                        'std_x_per_seed':  (hard_pos_after[:, :, 0].std(axis=1).tolist()  if hard_pos_after is not None else None),
-                        'std_y_per_seed':  (hard_pos_after[:, :, 1].std(axis=1).tolist()  if hard_pos_after is not None else None),
-                    },
-                )
 
     # ── Stage 2 (spreading + repulsion + congestion) ─────────────────────────
     ns2     = params['num_steps_s2']
@@ -2188,25 +1928,6 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
             return float(end)
         progress = min(1.0, (step / max(total - 1, 1)) / frac)
         return float(start + (end - start) * progress)
-
-    if log_active:
-        diag_logger.log(
-            'stage2_start', cohort_tag=cohort_tag, benchmark=bench_name,
-            B=int(B), n_mov=int(n_mov), num_steps=int(ns2),
-            lr_s2=float(params['lr_s2']),
-            gamma_s2_start=float(params['gamma_s2_start']),
-            gamma_s2_end=float(params['gamma_s2_end']),
-            lambda_density_end=float(ld_end),
-            lambda_hs={'start': float(ld_hs_start), 'end': float(ld_hs_end)},
-            lambda_hh={'start': float(ld_hh_start), 'end': float(ld_hh_end), 'active': bool(hh_active)},
-            lambda_ss={'start': float(ld_ss_start), 'end': float(ld_ss_end), 'active': bool(ss_active)},
-            lambda_cong_s2=float(lc_s2),
-            cong_eval_interval=int(cong_interval_s2),
-            ramp_frac=float(ramp_frac),
-            target_density=float(target_density),
-            use_bf16=bool(use_bf16),
-        )
-    t_s2 = time.time()
 
     # No mid-stage pruning. Every seed runs all the way through Stage 2 and
     # is ranked at the end by compute_proxy_cost — never by the
@@ -2245,46 +1966,6 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
         loss.sum().backward()
         if v_inv_t is not None and movable_params.grad is not None:
             movable_params.grad.mul_(v_inv_t)
-        if log_active and (step % log_n == 0 or step == ns2 - 1):
-            with torch.no_grad():
-                grad_t = movable_params.grad
-                if grad_t is None:
-                    grad_norm_seed = [None] * int(B)
-                else:
-                    grad_norm_seed = grad_t.detach().to(torch.float32).reshape(B, -1).norm(dim=1).cpu().numpy().tolist()
-                per_seed = {
-                    'wl':   wl_b.detach().to(torch.float32).cpu().numpy().tolist(),
-                    'den':  den_b.detach().to(torch.float32).cpu().numpy().tolist(),
-                    'hs':   hs_ovlp_b.detach().to(torch.float32).cpu().numpy().tolist(),
-                    'cong': cong_b.detach().to(torch.float32).cpu().numpy().tolist(),
-                    'cong_evaluated': bool(eval_cong),
-                    'total': loss.detach().to(torch.float32).cpu().numpy().tolist(),
-                    'grad_norm': grad_norm_seed,
-                }
-                if hh_active and hh_ovlp_b is not None:
-                    per_seed['hh'] = hh_ovlp_b.detach().to(torch.float32).cpu().numpy().tolist()
-                if ss_active and ss_ovlp_b is not None:
-                    per_seed['ss'] = ss_ovlp_b.detach().to(torch.float32).cpu().numpy().tolist()
-                # Per-step position trace: cheap aggregates always, full
-                # [B, nH, 2] tensor only when log_positions_per_step is set.
-                if nH > 0:
-                    hard_pos_b = pos_macro_b[:, :nH, :].detach().to(torch.float32).cpu().numpy()
-                    per_seed['centroid_x'] = hard_pos_b[:, :, 0].mean(axis=1).tolist()
-                    per_seed['centroid_y'] = hard_pos_b[:, :, 1].mean(axis=1).tolist()
-                    per_seed['spread_x']   = hard_pos_b[:, :, 0].std(axis=1).tolist()
-                    per_seed['spread_y']   = hard_pos_b[:, :, 1].std(axis=1).tolist()
-                    if log_pos:
-                        per_seed['hard_positions'] = hard_pos_b.tolist()
-                diag_logger.log(
-                    'stage2_step',
-                    cohort_tag=cohort_tag, benchmark=bench_name,
-                    step=int(step), gamma=float(g),
-                    lr=float(opt2.param_groups[0]['lr']),
-                    lam_d=float(lam_d), lam_hs=float(lam_hs),
-                    lam_hh=float(lam_hh), lam_ss=float(lam_ss),
-                    lam_cong=float(lc_s2),
-                    per_seed=per_seed,
-                )
         opt2.step(); sched2.step(); project(movable_params)
 
     with torch.no_grad():
@@ -2328,33 +2009,6 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
     hwH = hw_np[:nH]
     hhH = hh_np[:nH]
 
-    if log_active:
-        diag_logger.log(
-            'stage2_end', cohort_tag=cohort_tag, benchmark=bench_name,
-            elapsed_s=round(time.time() - t_s2, 3),
-            B=int(B),
-            per_seed_internal={
-                'wl':   wl_arr.tolist(),
-                'den':  den_arr.tolist(),
-                'hs':   hs_arr.tolist(),
-                'hh':   hh_arr.tolist(),
-                'ss':   ss_arr.tolist(),
-                'cong': cong_arr.tolist(),
-                'total': tot_arr.tolist(),
-            },
-            gamma_final=float(g_final),
-            lambda_final={
-                'density': float(lam_d_final),
-                'hs':      float(lam_hs_final),
-                'hh':      float(lam_hh_final),
-                'ss':      float(lam_ss_final),
-                'cong':    float(lc_s2),
-            },
-            hard_macro_positions_pre_legal=(
-                final_np[:, :nH, :].tolist() if nH > 0 else []
-            ),
-        )
-
     results = []
     metrics = []
     for b in range(B):
@@ -2375,29 +2029,7 @@ def _run_batch(raw: dict, params: dict, B_init: int, device_str: str,
             'lambda_ss_overlap_final':  float(lam_ss_final),
             'lambda_cong_final':        float(lc_s2),
         })
-        if log_active and nH > 0:
-            pre  = final_np[b, :nH, :]
-            post = legalized[:nH, :]
-            delta_xy   = (post - pre)
-            disp_per_macro = np.linalg.norm(delta_xy, axis=1)
-            diag_logger.log(
-                'seed_legalized', cohort_tag=cohort_tag, benchmark=bench_name,
-                seed=int(b),
-                num_macros_moved=int(np.count_nonzero(disp_per_macro > 1e-9)),
-                max_displacement=float(disp_per_macro.max() if disp_per_macro.size else 0.0),
-                total_displacement=float(disp_per_macro.sum()),
-                mean_displacement=float(disp_per_macro.mean() if disp_per_macro.size else 0.0),
-                hard_macro_positions_post_legal=post.tolist(),
-                # Per-macro displacement so we can spot which macros the
-                # legalizer actually moved (e.g. macro 243).
-                per_macro_displacement=disp_per_macro.tolist(),
-            )
 
-    if log_active:
-        diag_logger.log(
-            'run_batch_end', cohort_tag=cohort_tag, benchmark=bench_name,
-            B=int(B), num_seeds=int(B),
-        )
     return results, metrics
 
 

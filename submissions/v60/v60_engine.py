@@ -50,9 +50,6 @@ from v60_kernels import (
     _parse_plc_routing_params,
     _run_batch,
     _congestion_work_tier,
-    # diagnostic logger ("logging final boss")
-    _DiagLogger,
-    _resolve_log_path,
     _build_macro_macro_adjacency,
     _kmeans,
     _spectral_embed_to_canvas,
@@ -99,10 +96,7 @@ def _build_cluster_data_fiedler2d(benchmark: Benchmark, K: int,
                                     stage0_lambda_overlap: float = 500.0,
                                     stage0_gamma_start: float = 2.0,
                                     stage0_gamma_end: float = 0.3,
-                                    stage0_target_density: float = 0.7,
-                                    diag_logger=None,
-                                    cohort_tag: str = 'engine',
-                                    log_every_n_steps: int = 50):
+                                    stage0_target_density: float = 0.7):
     """Fiedler-2D K-means clustering + Stage 0 super-macro placement."""
     nH = int(benchmark.num_hard_macros)
     cw = float(benchmark.canvas_width)
@@ -128,9 +122,6 @@ def _build_cluster_data_fiedler2d(benchmark: Benchmark, K: int,
         gamma_start=stage0_gamma_start,
         gamma_end=stage0_gamma_end,
         target_density=stage0_target_density,
-        diag_logger=diag_logger,
-        cohort_tag=cohort_tag,
-        log_every_n_steps=log_every_n_steps,
     )
     return {
         'K':              K_eff,
@@ -247,10 +238,6 @@ class v60_Engine:
         dump_diagnostic_seeds: int = 3,
         dump_diagnostic_top_k_cells:    int = 30,
         dump_diagnostic_top_k_per_cell: int = 5,
-        # ── Logging final boss.
-        log_dir:           str = None,
-        log_every_n_steps: int = 50,
-        log_positions_per_step: bool = False,   # v60 debug
         # ── Stage-2 seed picker overlap tolerance.
         # Threshold under which a seed counts as "legal" for the lowest-proxy-
         # legal pick. Computed as ratio * median(hard_macro_area), with a 1e-9
@@ -327,10 +314,6 @@ class v60_Engine:
         self.dump_diagnostic_seeds          = int(dump_diagnostic_seeds)
         self.dump_diagnostic_top_k_cells    = int(dump_diagnostic_top_k_cells)
         self.dump_diagnostic_top_k_per_cell = int(dump_diagnostic_top_k_per_cell)
-        # Logging-final-boss config
-        self.log_dir                = log_dir
-        self.log_every_n_steps      = int(log_every_n_steps)
-        self.log_positions_per_step = bool(log_positions_per_step)
         # Stage-2 picker overlap tolerance
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
@@ -483,16 +466,12 @@ class v60_Engine:
         cells = int(benchmark.grid_rows) * int(benchmark.grid_cols)
         return interval, f'auto(nets={n}, cells={cells})'
 
-    def place(self, benchmark: Benchmark, init_positions=None, diag_logger=None) -> torch.Tensor:
+    def place(self, benchmark: Benchmark, init_positions=None) -> torch.Tensor:
         """
         If `init_positions` is provided, Stage 1 is skipped. Otherwise:
         Fiedler-2D K-means cluster the hard macros, run Stage 0 to place
         the K super-macros, init each individual macro at its cluster
         centre + jitter, then run Stage 1 + Stage 2.
-
-        diag_logger: when None, the cohort builds its own logger from
-        `self.log_dir` (if set). The orchestrator passes a shared logger so
-        all cohorts append to the same file.
         """
         t0 = time.time()
         if self.deterministic:
@@ -502,30 +481,9 @@ class v60_Engine:
         device_str = self._resolve_device()
         raw        = _extract_raw(benchmark)
         params     = self._params_dict()
-        params['log_every_n_steps']     = int(self.log_every_n_steps)
-        params['log_positions_per_step'] = bool(self.log_positions_per_step)
         params.update(_parse_plc_routing_params(
             osp.join(self.plc_root, benchmark.name, 'initial.plc')
         ))
-
-        # ── Diagnostic logger ──────────────────────────────────────────────
-        owns_logger = False
-        if diag_logger is None:
-            if self.log_dir:
-                diag_logger = _DiagLogger(_resolve_log_path(
-                    self.log_dir, benchmark.name, tag='v60_engine'))
-                owns_logger = True
-            else:
-                diag_logger = _DiagLogger(None)
-        cohort_tag = 'engine'
-        if diag_logger.active:
-            diag_logger.log(
-                'cohort_start', cohort_tag=cohort_tag, benchmark=benchmark.name,
-                from_init=(init_positions is not None),
-                deterministic=bool(self.deterministic), seed=int(self.seed),
-                num_restarts=int(self.num_restarts),
-                params_snapshot=params,
-            )
 
         ns1_val,   ns1_tag   = self._resolve_num_steps_s1(benchmark)
         ns2_val,   ns2_tag   = self._resolve_num_steps_s2(benchmark)
@@ -584,9 +542,6 @@ class v60_Engine:
                 stage0_gamma_start=self.stage0_gamma_start,
                 stage0_gamma_end=self.stage0_gamma_end,
                 stage0_target_density=self.stage0_target_density,
-                diag_logger=diag_logger,
-                cohort_tag=cohort_tag,
-                log_every_n_steps=self.log_every_n_steps,
             )
             cluster_tag = (f'fiedler2d K={cluster_data["K"]} ({K_tag})  '
                            f'jitter={self.cluster_jitter_frac:.3f}  '
@@ -625,8 +580,6 @@ class v60_Engine:
             raw, params, B, device_str,
             init_positions=init_positions,
             cluster_data=cluster_data,
-            diag_logger=diag_logger,
-            cohort_tag=cohort_tag,
         )
         for m in all_metrics:
             m.setdefault('score_proxy',   float('nan'))
@@ -697,17 +650,6 @@ class v60_Engine:
                         f"cong={costs['congestion_cost']:.3f}  "
                         f"ovlp_area={ovlp:.4f}"
                     )
-                    if diag_logger.active:
-                        diag_logger.log(
-                            'seed_score', cohort_tag=cohort_tag, benchmark=benchmark.name,
-                            seed=int(i),
-                            proxy=float(proxy),
-                            wl=float(costs['wirelength_cost']),
-                            density=float(costs['density_cost']),
-                            cong=float(costs['congestion_cost']),
-                            overlap_area=float(ovlp),
-                            internal_metrics=all_metrics[i],
-                        )
                     seed_pool.append({
                         'pos':          pos_np,
                         'proxy':        float(proxy),
@@ -723,11 +665,6 @@ class v60_Engine:
                 except Exception as exc:
                     self._log(f"  seed {i}: PLC eval failed ({exc})")
                     all_metrics[i]['overlap_area'] = float(ovlp)
-                    if diag_logger.active:
-                        diag_logger.log(
-                            'seed_score_failed', cohort_tag=cohort_tag, benchmark=benchmark.name,
-                            seed=int(i), error=str(exc), overlap_area=float(ovlp),
-                        )
 
         # v60: a Stage-2 seed with no hard-macro overlap is preferred over a
         # lower-proxy illegal seed; fall back to best-proxy only if none legal.
@@ -765,17 +702,6 @@ class v60_Engine:
             f"[v60_engine {benchmark.name}] best proxy={best_proxy:.4f}  "
             f"total {time.time()-t0:.1f}s"
         )
-
-        if diag_logger.active:
-            diag_logger.log(
-                'cohort_end', cohort_tag=cohort_tag, benchmark=benchmark.name,
-                elapsed_s=round(time.time() - t0, 3),
-                best_proxy=float(best_proxy) if best_proxy != float('inf') else None,
-                num_seeds_scored=int(len(all_metrics)),
-                all_metrics=all_metrics,
-            )
-        if owns_logger:
-            diag_logger.close()
 
         nM  = benchmark.num_macros
         out = benchmark.macro_positions.clone()
