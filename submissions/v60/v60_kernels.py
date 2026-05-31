@@ -4,7 +4,7 @@ v60 shared kernels and helpers.
 Hosts the placement primitives shared by the v60 engine and the
 orchestrator's soft-polish stage:
 loss kernels (WAWL, density, hard-soft / hard-hard / soft-soft overlap,
-official L-shape congestion, RUDY congestion), legalization, the bf16
+official L-shape congestion), legalization, the bf16
 torch.compile wrappers, the per-net Jacobi preconditioner, the Stage 0
 super-macro placer, the multi-level helpers (spectral cluster, K-means,
 embed-to-canvas), the cong diagnostic dump, and the Stage 1 + Stage 2
@@ -22,7 +22,6 @@ import os
 import os.path as osp
 import random
 import sys
-import time
 import warnings
 
 import numpy as np
@@ -33,7 +32,6 @@ if osp.dirname(osp.abspath(__file__)) not in sys.path:
     sys.path.insert(0, osp.dirname(osp.abspath(__file__)))
 
 from macro_place.benchmark import Benchmark
-from macro_place._plc import PlacementCost
 from macro_place.objective import compute_proxy_cost
 
 # Enable TF32 matmul + cuDNN TF32 explicitly. The modern API
@@ -393,8 +391,8 @@ def _official_congestion_batch(
         cell, keeping the gradient flowing through pin positions.
       * Hard-macro V/H blockage: each hard macro contributes its area
         coverage (m_ov_x * m_ov_y) divided by the perpendicular cell
-        extent, weighted by vrouting_alloc / hrouting_alloc. This is the
-        term RUDY missed entirely.
+        extent, weighted by vrouting_alloc / hrouting_alloc. A plain
+        bbox-density congestion proxy misses this blockage term entirely.
       * Concat V_total + H_total per cell and return the top-abu_frac
         mean (the official aggregator is ABU at frac=0.05).
 
@@ -497,51 +495,6 @@ def _official_congestion_batch(
     # the cong term toward parity (degenerate with lambda_cong but useful
     # as a calibration anchor or in the diagnostic comparison).
     return topk_vals.mean(dim=1) * cong_scale
-
-
-def _rudy_congestion_batch(pos_batch, node_ids_t, net_ids_t, num_nets, net_weights_t,
-                            cw, ch, G_rows, G_cols, gamma_rudy, cong_thr=0.0, eps=1e-3):
-    B = pos_batch.shape[0]
-    cell_w = cw / G_cols
-    cell_h = ch / G_rows
-    dev, dtype = pos_batch.device, pos_batch.dtype
-
-    xy = pos_batch[:, node_ids_t, :]
-    x, y = xy[:, :, 0], xy[:, :, 1]
-
-    lse_px = _lse_per_net_batch( x, net_ids_t, num_nets, gamma_rudy)
-    lse_nx = _lse_per_net_batch(-x, net_ids_t, num_nets, gamma_rudy)
-    lse_py = _lse_per_net_batch( y, net_ids_t, num_nets, gamma_rudy)
-    lse_ny = _lse_per_net_batch(-y, net_ids_t, num_nets, gamma_rudy)
-
-    wa_x_max =  lse_px * gamma_rudy
-    wa_x_min = -lse_nx * gamma_rudy
-    wa_y_max =  lse_py * gamma_rudy
-    wa_y_min = -lse_ny * gamma_rudy
-
-    bbox_area = torch.clamp((wa_x_max - wa_x_min) * (wa_y_max - wa_y_min), min=eps)
-    demand = net_weights_t / bbox_area
-
-    cx_lo = torch.arange(G_cols, device=dev, dtype=dtype) * cell_w
-    cx_hi = cx_lo + cell_w
-    cy_lo = torch.arange(G_rows, device=dev, dtype=dtype) * cell_h
-    cy_hi = cy_lo + cell_h
-
-    ov_x = torch.clamp(
-        torch.minimum(wa_x_max.unsqueeze(2), cx_hi) - torch.maximum(wa_x_min.unsqueeze(2), cx_lo),
-        min=0.0,
-    )
-    ov_y = torch.clamp(
-        torch.minimum(wa_y_max.unsqueeze(2), cy_hi) - torch.maximum(wa_y_min.unsqueeze(2), cy_lo),
-        min=0.0,
-    )
-
-    D = torch.bmm(
-        (demand.unsqueeze(2) * ov_y).transpose(1, 2),
-        ov_x,
-    )
-
-    return (torch.clamp(D - cong_thr, min=0.0) ** 2).sum(dim=(1, 2))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -766,7 +719,6 @@ _density_bc   = _maybe_compile(_density_loss_batch)
 _hs_ovlp_bc   = _maybe_compile(_hard_soft_overlap_loss_batch)
 _hh_ovlp_bc   = _maybe_compile(_hard_hard_overlap_loss_batch)
 _ss_ovlp_bc   = _maybe_compile(_soft_soft_overlap_loss_batch)
-_rudy_bc      = _maybe_compile(_rudy_congestion_batch)
 _off_cong_bc  = _maybe_compile(_official_congestion_batch)
 _off_cong_v2_compiled = (
     torch.compile(_official_congestion_batch_v2, dynamic=True) if _use_compile else None
@@ -940,45 +892,6 @@ def _kmeans(data: np.ndarray, K: int, rng: np.random.RandomState, max_iter: int 
             if len(members) > 0:
                 centroids[k] = members.mean(axis=0)
     return labels, centroids
-
-
-def _spectral_cluster_macros(
-    A: np.ndarray, K: int, embed_dim: int = None, seed: int = 0,
-):
-    """
-    Spectral clustering of macros via the normalized symmetric Laplacian.
-    Returns (labels[nH], embed_2d[nH, 2]) where embed_2d uses eigenvectors
-    2 and 3 (the Fiedler vector and its successor) — these give a 2D layout
-    that respects connectivity. The labels come from K-means on a K-dim
-    embedding (eigenvectors 2..K+1).
-    """
-    n = A.shape[0]
-    if n == 0:
-        return np.zeros(0, dtype=np.int64), np.zeros((0, 2), dtype=np.float32)
-    if K >= n or n < 3:
-        return np.arange(n, dtype=np.int64), np.zeros((n, 2), dtype=np.float32)
-
-    deg = A.sum(axis=1) + 1e-9
-    D_inv_sqrt = 1.0 / np.sqrt(deg)
-    L_norm = np.eye(n, dtype=np.float32) - (D_inv_sqrt[:, None] * A * D_inv_sqrt[None, :])
-    L_norm = 0.5 * (L_norm + L_norm.T)  # symmetrise vs. fp noise
-
-    # Eigh gives ascending eigenvalues
-    eigvals, eigvecs = np.linalg.eigh(L_norm)
-
-    # 2D embedding for spatial cluster centres (skip eigvec 0 which is constant)
-    embed_2d = eigvecs[:, 1:3].astype(np.float32)  # [n, 2]
-
-    # K-dim embedding for K-means clustering
-    if embed_dim is None:
-        embed_dim = K
-    embed_K = eigvecs[:, 1:1 + embed_dim].astype(np.float32)
-    norms = np.linalg.norm(embed_K, axis=1, keepdims=True) + 1e-9
-    embed_K = embed_K / norms
-
-    rng = np.random.RandomState(seed)
-    labels, _ = _kmeans(embed_K, K, rng)
-    return labels.astype(np.int64), embed_2d
 
 
 def _spectral_embed_to_canvas(embed_2d: np.ndarray, cw: float, ch: float,

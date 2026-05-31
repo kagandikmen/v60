@@ -19,7 +19,6 @@ diagnostic) lives in `v60_kernels`. The class below is fully
 standalone — it does not inherit from anything.
 """
 
-import os
 import os.path as osp
 import sys
 import time
@@ -222,7 +221,7 @@ class v60_Engine:
         cong_scale:    float = 1.0,
         # ── Jacobi preconditioner
         use_preconditioner: bool = False,
-        # ── Stage-2 acceleration. Mid-stage pruning was removed in v60.
+        # ── Stage-2 acceleration (no mid-stage pruning).
         s2_bf16: bool               = True,
         safety_gap: float = 0.001,
         inflation_factor: float = 1.0,    # v60 debug: no hard-macro inflation

@@ -105,8 +105,11 @@ class IncrementalEval:
         macro_overlap[m]        dict {(row, col) -> overlap_area} — what macro m contributes per cell
                                 (rebuilt incrementally; used for O(1) undo of contribution)
 
-      Cong caches (partial):
-        TODO
+      Cong caches:
+        raw_V, raw_H       [G_r*G_c] float — flat per-cell net routing
+                                             demand (V/H), updated per move
+        macro_raw_V, macro_raw_H [G_r*G_c] float — flat per-cell hard-macro
+                                             blockage demand (V/H)
 
       Misc:
         macro_pos   [nM, 2]

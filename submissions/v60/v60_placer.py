@@ -202,7 +202,6 @@ class v60_Placer:
         pair_swap_sweeps: int = 30,
         pair_swap_k_neighbors: int = 24,          # k-nearest hard macros (spatial)
         pair_swap_k_co_net: int = 8,              # top-K hard macros by shared-net count
-        pair_swap_top_k: int = 4,                 # currently unused (no cheap filter)
         pair_swap_min_improve: float = 1e-7,
         pair_swap_patience: int = 3,
         pair_swap_verbose: bool = True,
@@ -311,7 +310,6 @@ class v60_Placer:
         self.pair_swap_sweeps        = int(pair_swap_sweeps)
         self.pair_swap_k_neighbors   = max(1, int(pair_swap_k_neighbors))
         self.pair_swap_k_co_net      = max(0, int(pair_swap_k_co_net))
-        self.pair_swap_top_k         = max(1, int(pair_swap_top_k))
         self.pair_swap_min_improve   = float(pair_swap_min_improve)
         self.pair_swap_patience      = int(pair_swap_patience)
         self.pair_swap_verbose       = bool(pair_swap_verbose)
