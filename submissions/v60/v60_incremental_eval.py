@@ -76,6 +76,11 @@ DENSITY_HALF     = 0.5    # PLC: returns 0.5 * mean(top-10%)
 
 ABU_FRAC_CONG    = 0.05   # PLC get_congestion_cost: top-5% of (V + H)
 
+# Per-net pin count at/above which _add_net_to_routing vectorizes the grid-cell
+# lookup. Below it the scalar path is faster (numpy setup overhead dominates on
+# the 2-4 pin nets that make up most of a netlist); the two paths are bit-identical.
+_NET_VECTORIZE_MIN = 8
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  IncrementalEval
@@ -672,12 +677,11 @@ class IncrementalEval:
         tr, tc = sink_rc
         row_min = min(tr, sr); row_max = max(tr, sr)
         col_min = min(tc, sc); col_max = max(tc, sc)
-        # H routing along source row, columns [col_min, col_max)
-        for c in range(col_min, col_max):
-            H_arr[sr * self.G_cols + c] += weight
-        # V routing along sink column, rows [row_min, row_max)
-        for r in range(row_min, row_max):
-            V_arr[r * self.G_cols + tc] += weight
+        Gc = self.G_cols
+        # H routing along source row, columns [col_min, col_max) — contiguous.
+        H_arr[sr * Gc + col_min: sr * Gc + col_max] += weight
+        # V routing along sink column, rows [row_min, row_max) — strided by Gc.
+        V_arr[row_min * Gc + tc: row_max * Gc + tc: Gc] += weight
 
     def _add_three_pin_segment(self, node_gcells_list, weight: float,
                                  V_arr: np.ndarray, H_arr: np.ndarray) -> None:
@@ -688,30 +692,31 @@ class IncrementalEval:
         y2, x2 = temp[1]
         y3, x3 = temp[2]
 
+        Gc = self.G_cols
+        # Each scalar loop below maps to ONE basic slice add (contiguous along
+        # a row for H; strided by Gc along a column for V). Within a single
+        # loop all indices are distinct, and keeping one slice per original
+        # loop in the same sequence preserves the cross-loop += order into any
+        # shared cell — bit-identical to the per-cell version.
         if x1 < x2 and x2 < x3 and min(y1, y3) < y2 and max(y1, y3) > y2:
             # L-route: see PLC __l_routing.
-            for c in range(x1, x2):
-                H_arr[y1 * self.G_cols + c] += weight
-            for c in range(x2, x3):
-                H_arr[y2 * self.G_cols + c] += weight
-            for r in range(min(y1, y2), max(y1, y2)):
-                V_arr[r * self.G_cols + x2] += weight
-            for r in range(min(y2, y3), max(y2, y3)):
-                V_arr[r * self.G_cols + x3] += weight
+            H_arr[y1 * Gc + x1: y1 * Gc + x2] += weight
+            H_arr[y2 * Gc + x2: y2 * Gc + x3] += weight
+            lo = min(y1, y2); hi = max(y1, y2)
+            V_arr[lo * Gc + x2: hi * Gc + x2: Gc] += weight
+            lo = min(y2, y3); hi = max(y2, y3)
+            V_arr[lo * Gc + x3: hi * Gc + x3: Gc] += weight
         elif x2 == x3 and x1 < x2 and y1 < min(y2, y3):
             # Special case: two pins share x, third is to the left + below.
-            for c in range(x1, x2):
-                H_arr[y1 * self.G_cols + c] += weight
-            for r in range(y1, max(y2, y3)):
-                V_arr[r * self.G_cols + x2] += weight
+            H_arr[y1 * Gc + x1: y1 * Gc + x2] += weight
+            hi = max(y2, y3)
+            V_arr[y1 * Gc + x2: hi * Gc + x2: Gc] += weight
         elif y2 == y3:
             # Special case: two pins share y.
-            for c in range(x1, x2):
-                H_arr[y1 * self.G_cols + c] += weight
-            for c in range(x2, x3):
-                H_arr[y2 * self.G_cols + c] += weight
-            for r in range(min(y2, y1), max(y2, y1)):
-                V_arr[r * self.G_cols + x2] += weight
+            H_arr[y1 * Gc + x1: y1 * Gc + x2] += weight
+            H_arr[y2 * Gc + x2: y2 * Gc + x3] += weight
+            lo = min(y2, y1); hi = max(y2, y1)
+            V_arr[lo * Gc + x2: hi * Gc + x2: Gc] += weight
         else:
             # T-route: PLC __t_routing.
             # PLC: node_gcells.sort() — default tuple sort, i.e. by (row, col).
@@ -720,12 +725,11 @@ class IncrementalEval:
             y2t, x2t = t2[1]
             y3t, x3t = t2[2]
             xmin = min(x1t, x2t, x3t); xmax = max(x1t, x2t, x3t)
-            for c in range(xmin, xmax):
-                H_arr[y2t * self.G_cols + c] += weight
-            for r in range(min(y1t, y2t), max(y1t, y2t)):
-                V_arr[r * self.G_cols + x1t] += weight
-            for r in range(min(y2t, y3t), max(y2t, y3t)):
-                V_arr[r * self.G_cols + x3t] += weight
+            H_arr[y2t * Gc + xmin: y2t * Gc + xmax] += weight
+            lo = min(y1t, y2t); hi = max(y1t, y2t)
+            V_arr[lo * Gc + x1t: hi * Gc + x1t: Gc] += weight
+            lo = min(y2t, y3t); hi = max(y2t, y3t)
+            V_arr[lo * Gc + x3t: hi * Gc + x3t: Gc] += weight
 
     def _add_net_to_routing(self, net_idx: int,
                               V_arr: np.ndarray, H_arr: np.ndarray,
@@ -742,21 +746,36 @@ class IncrementalEval:
         if pis.size < 2:
             return
         weight = float(self.net_weight[net_idx]) * sign
-        # Driver pin = first.
-        drv = int(pis[0])
-        source_rc = self._grid_cell_for_pos_f32(
-            np.float32(self.pin_xy[drv, 0]),
-            np.float32(self.pin_xy[drv, 1]),
-        )
-        # Build unique gcells across all pins.
-        gcells = {source_rc}
-        for p in pis:
-            p_int = int(p)
-            rc = self._grid_cell_for_pos_f32(
-                np.float32(self.pin_xy[p_int, 0]),
-                np.float32(self.pin_xy[p_int, 1]),
+        # Per-pin grid-cell lookup. Driver pin = pis[0], so source_rc is its
+        # cell. Small nets use the scalar path (numpy setup overhead dominates);
+        # larger nets vectorize. Both reproduce _grid_cell_for_pos_f32 exactly:
+        # float32-narrow the position, then np.float32(x / grid_w) (NEP-50-
+        # faithful across numpy versions), then floor + clamp — so the unique
+        # gcell SET is identical, and the constant per-net weight makes the
+        # downstream += order irrelevant.
+        if pis.size < _NET_VECTORIZE_MIN:
+            drv = int(pis[0])
+            source_rc = self._grid_cell_for_pos_f32(
+                np.float32(self.pin_xy[drv, 0]),
+                np.float32(self.pin_xy[drv, 1]),
             )
-            gcells.add(rc)
+            gcells = {source_rc}
+            for p in pis[1:]:
+                p_int = int(p)
+                gcells.add(self._grid_cell_for_pos_f32(
+                    np.float32(self.pin_xy[p_int, 0]),
+                    np.float32(self.pin_xy[p_int, 1]),
+                ))
+        else:
+            idx = pis.astype(np.intp)
+            xs = self.pin_xy[idx, 0].astype(np.float32)
+            ys = self.pin_xy[idx, 1].astype(np.float32)
+            cols = np.floor(np.float32(xs / self.grid_w)).astype(np.int64)
+            rows = np.floor(np.float32(ys / self.grid_h)).astype(np.int64)
+            np.clip(cols, 0, self.G_cols - 1, out=cols)
+            np.clip(rows, 0, self.G_rows - 1, out=rows)
+            source_rc = (int(rows[0]), int(cols[0]))
+            gcells = set(zip(rows.tolist(), cols.tolist()))
 
         n = len(gcells)
         if n == 2:
@@ -891,62 +910,41 @@ class IncrementalEval:
         vra = self.vrouting_alloc * sign
         hra = self.hrouting_alloc * sign
 
-        if_partial_v = False
-        if_partial_h = False
-        # First pass: add to both grids — using PLC's coupled __overlap_dist.
-        for r in range(bl_row, ur_row + 1):
-            cy_lo = r * gh
-            cy_hi = cy_lo + gh
-            y_raw = min(y_hi, cy_hi) - max(y_lo, cy_lo)
-            for c in range(bl_col, ur_col + 1):
-                cx_lo = c * gw
-                cx_hi = cx_lo + gw
-                x_raw = min(x_hi, cx_hi) - max(x_lo, cx_lo)
-                # PLC __overlap_dist: returns (0, 0) if EITHER is non-positive.
-                if x_raw > 0 and y_raw > 0:
-                    x_dist = x_raw; y_dist = y_raw
-                else:
-                    x_dist = 0.0; y_dist = 0.0
-                if ur_row != bl_row:
-                    if (r == bl_row and abs(y_dist - gh) > 1e-5) or \
-                       (r == ur_row and abs(y_dist - gh) > 1e-5):
-                        if_partial_v = True
-                if ur_col != bl_col:
-                    if (c == bl_col and abs(x_dist - gw) > 1e-5) or \
-                       (c == ur_col and abs(x_dist - gw) > 1e-5):
-                        if_partial_h = True
-                V_arr[r * self.G_cols + c] += x_dist * vra
-                H_arr[r * self.G_cols + c] += y_dist * hra
-        # Second pass: partial-overlap correction. PLC re-computes x/y_dist
-        # via __overlap_dist (same coupled rule) inside the correction loops.
-        if if_partial_v:
-            r = ur_row
-            cy_lo = r * gh
-            cy_hi = cy_lo + gh
-            y_raw = min(y_hi, cy_hi) - max(y_lo, cy_lo)
-            for c in range(bl_col, ur_col + 1):
-                cx_lo = c * gw
-                cx_hi = cx_lo + gw
-                x_raw = min(x_hi, cx_hi) - max(x_lo, cx_lo)
-                if x_raw > 0 and y_raw > 0:
-                    x_dist = x_raw
-                else:
-                    x_dist = 0.0
-                V_arr[r * self.G_cols + c] -= x_dist * vra
-        if if_partial_h:
-            c = ur_col
-            cx_lo = c * gw
-            cx_hi = cx_lo + gw
-            x_raw = min(x_hi, cx_hi) - max(x_lo, cx_lo)
-            for r in range(bl_row, ur_row + 1):
-                cy_lo = r * gh
-                cy_hi = cy_lo + gh
-                y_raw = min(y_hi, cy_hi) - max(y_lo, cy_lo)
-                if x_raw > 0 and y_raw > 0:
-                    y_dist = y_raw
-                else:
-                    y_dist = 0.0
-                H_arr[r * self.G_cols + c] -= y_dist * hra
+        # Vectorized block update, bit-identical to the per-cell double loop.
+        # Row/col overlap distances are 1-D; PLC's __overlap_dist couples them
+        # (a cell contributes only where BOTH overlaps are positive), so each
+        # cell's x_dist/y_dist is the 1-D value masked by the outer-product
+        # validity. cx_hi/cy_hi are formed as cx_lo+gw / cy_lo+gh (NOT
+        # (c+1)*gw) to match the scalar rounding exactly.
+        rows = np.arange(bl_row, ur_row + 1)
+        cols = np.arange(bl_col, ur_col + 1)
+        cy_lo = rows * gh
+        cy_hi = cy_lo + gh
+        y_raw = np.minimum(y_hi, cy_hi) - np.maximum(y_lo, cy_lo)        # [nr]
+        cx_lo = cols * gw
+        cx_hi = cx_lo + gw
+        x_raw = np.minimum(x_hi, cx_hi) - np.maximum(x_lo, cx_lo)        # [nc]
+        valid = (y_raw > 0.0)[:, None] & (x_raw > 0.0)[None, :]          # [nr, nc]
+        x_dist = np.where(valid, x_raw[None, :], 0.0)
+        y_dist = np.where(valid, y_raw[:, None], 0.0)
+        xd_vra = x_dist * vra
+        yd_hra = y_dist * hra
+
+        V2 = V_arr.reshape(self.G_rows, self.G_cols)
+        H2 = H_arr.reshape(self.G_rows, self.G_cols)
+        V2[bl_row:ur_row + 1, bl_col:ur_col + 1] += xd_vra
+        H2[bl_row:ur_row + 1, bl_col:ur_col + 1] += yd_hra
+
+        # Partial-overlap correction at the top boundary row / right boundary
+        # column. The flag is derived from the COUPLED dists on the two
+        # boundary rows/cols (matching PLC), and the correction subtracts the
+        # EXACT first-pass products so the net (prev + d) - d is bit-identical.
+        if ur_row != bl_row:
+            if np.any(np.abs(y_dist[[0, -1], :] - gh) > 1e-5):
+                V2[ur_row, bl_col:ur_col + 1] -= xd_vra[-1, :]
+        if ur_col != bl_col:
+            if np.any(np.abs(x_dist[:, [0, -1]] - gw) > 1e-5):
+                H2[bl_row:ur_row + 1, ur_col] -= yd_hra[:, -1]
 
     def _smooth_routing(self, V_in: np.ndarray, H_in: np.ndarray
                           ) -> Tuple[np.ndarray, np.ndarray]:
@@ -967,31 +965,46 @@ class IncrementalEval:
         Gc = self.G_cols
         Gr = self.G_rows
 
-        # V cong: smooth across columns. For each (row, col), distribute
-        # V_in[row, col] / window_size across [col-sr, col+sr] clipped.
-        for r in range(Gr):
-            base = r * Gc
-            for c in range(Gc):
-                lp = c - sr
-                if lp < 0: lp = 0
-                rp = c + sr
-                if rp >= Gc: rp = Gc - 1
-                cnt = rp - lp + 1
-                val = V_in[base + c] / cnt
-                for ptr in range(lp, rp + 1):
-                    out_V[base + ptr] += val
-        # H cong: smooth across rows. For each (row, col), distribute
-        # H_in[row, col] / window_size across [row-sr, row+sr] clipped.
-        for r in range(Gr):
-            for c in range(Gc):
-                lp = r - sr
-                if lp < 0: lp = 0
-                up = r + sr
-                if up >= Gr: up = Gr - 1
-                cnt = up - lp + 1
-                val = H_in[r * Gc + c] / cnt
-                for ptr in range(lp, up + 1):
-                    out_H[ptr * Gc + c] += val
+        # Vectorized box blur, bit-identical to the per-cell scatter above.
+        # The scatter sends each source cell's value (pre-divided by its OWN
+        # clipped window count) to every output cell within ±sr, and for a
+        # valid output cell p the source set is exactly {c : |c - p| <= sr}
+        # (the clip only affects the per-source divisor, never membership).
+        # So: pre-divide each source by its window count, then accumulate the
+        # fixed-width window via integer shifts. Offsets MUST run in increasing
+        # order (-sr..+sr) so each output cell receives contributions in order
+        # of increasing source index, reproducing the scalar loop's += order
+        # exactly (constant-step shifts add identical operands per output).
+        V2d = V_in.reshape(Gr, Gc)
+        H2d = H_in.reshape(Gr, Gc)
+        out_V2d = out_V.reshape(Gr, Gc)   # views into the contiguous out arrays
+        out_H2d = out_H.reshape(Gr, Gc)
+
+        # V cong: smooth across columns (axis 1). Per-column window count.
+        cols = np.arange(Gc)
+        cntc = (np.minimum(Gc - 1, cols + sr) - np.maximum(0, cols - sr) + 1).astype(np.float64)
+        Wc = V2d / cntc[None, :]
+        for off in range(-sr, sr + 1):
+            if off >= 0:
+                if off < Gc:
+                    out_V2d[:, 0:Gc - off] += Wc[:, off:Gc]
+            else:
+                k = -off
+                if k < Gc:
+                    out_V2d[:, k:Gc] += Wc[:, 0:Gc - k]
+
+        # H cong: smooth across rows (axis 0). Per-row window count.
+        rows = np.arange(Gr)
+        cntr = (np.minimum(Gr - 1, rows + sr) - np.maximum(0, rows - sr) + 1).astype(np.float64)
+        Wr = H2d / cntr[:, None]
+        for off in range(-sr, sr + 1):
+            if off >= 0:
+                if off < Gr:
+                    out_H2d[0:Gr - off, :] += Wr[off:Gr, :]
+            else:
+                k = -off
+                if k < Gr:
+                    out_H2d[k:Gr, :] += Wr[0:Gr - k, :]
         return out_V, out_H
 
     def _abu_top_frac_mean(self, flat: np.ndarray, frac: float) -> float:
