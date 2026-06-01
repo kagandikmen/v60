@@ -52,7 +52,9 @@ from v60_kernels   import (
     _basin_hop, _congestion_work_tier,
     _extract_raw, _parse_plc_routing_params, _run_batch,
 )
-from v60_incremental_eval import IncrementalEval
+from v60_incremental_eval import (
+    IncrementalEval, WEIGHT_WL, WEIGHT_DENSITY, WEIGHT_CONG,
+)
 
 
 def _set_deterministic(seed: int = 0) -> None:
@@ -1136,26 +1138,26 @@ class v60_Placer:
                     continue
                 active_macros += 1
 
-                # Full-eval every candidate on the real proxy (commit + proxy +
-                # revert); keep the best actual improvement.
-                best_new_proxy = cur_proxy
+                # Score every candidate on the real proxy WITHOUT committing,
+                # via the incremental cong scorer (no per-candidate re-smooth,
+                # no commit/revert churn); commit only the winning move. The
+                # per-macro base proxy is exact (cached assembled grids); each
+                # candidate proxy matches a full recompute to float-reorder.
+                cur_wl  = e.compute_wl_cost()
+                cur_den = e.compute_density_cost()
+                base_proxy = (WEIGHT_WL * cur_wl + WEIGHT_DENSITY * cur_den
+                              + WEIGHT_CONG * e.cong_cost())
+                best_new_proxy = base_proxy
                 best_new_xy = None
                 for new_xy in cands:
-                    st = e.delta_for_move(m_i, new_xy, include_cong=False)
-                    e.commit_move(m_i, new_xy, st)
-                    new_proxy = float(e.proxy(include_cong=True))
+                    new_proxy = e.proxy_for_move(m_i, new_xy, cur_wl, cur_den)
                     if new_proxy < best_new_proxy:
                         best_new_proxy = new_proxy
                         best_new_xy = new_xy
-                    # Revert to original. cur_x/cur_y were captured before any
-                    # commits in this macro's evaluation, so the revert is exact.
-                    revert = e.delta_for_move(m_i, (cur_x, cur_y), include_cong=False)
-                    e.commit_move(m_i, (cur_x, cur_y), revert)
 
                 if best_new_xy is not None and \
-                        (cur_proxy - best_new_proxy) >= self.cd_polish_min_improve:
-                    # Commit the best candidate (state recomputed since we
-                    # reverted after each eval).
+                        (base_proxy - best_new_proxy) >= self.cd_polish_min_improve:
+                    # Commit the winning candidate.
                     final_st = e.delta_for_move(m_i, best_new_xy, include_cong=False)
                     e.commit_move(m_i, best_new_xy, final_st)
                     cur_proxy = best_new_proxy

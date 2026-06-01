@@ -555,6 +555,26 @@ class IncrementalEval:
         for m in range(self.nH):
             self._add_macro_blockage(m, self.macro_raw_V, self.macro_raw_H)
 
+        # ── Incremental cong scoring cache ─────────────────────────────────
+        # Assembled (normalised + smoothed-net + macro) grids, kept exact here
+        # and by commit_move(); _cong_cost_for_move() scores candidate moves
+        # against them without a full re-smooth. _cntc/_cntr are the per-column
+        # / per-row box-blur window sizes; _cong_d* are reusable scratch grids
+        # for accumulating per-move routing/blockage deltas.
+        self._cong_Vf, self._cong_Hf = self._build_full_routing_grids()
+        sr = self.smooth_range
+        _cols = np.arange(self.G_cols)
+        self._cntc = (np.minimum(self.G_cols - 1, _cols + sr)
+                      - np.maximum(0, _cols - sr) + 1).astype(np.float64)
+        _rows = np.arange(self.G_rows)
+        self._cntr = (np.minimum(self.G_rows - 1, _rows + sr)
+                      - np.maximum(0, _rows - sr) + 1).astype(np.float64)
+        _G = self.G_rows * self.G_cols
+        self._cong_dV  = np.zeros(_G, dtype=np.float64)
+        self._cong_dH  = np.zeros(_G, dtype=np.float64)
+        self._cong_dMV = np.zeros(_G, dtype=np.float64)
+        self._cong_dMH = np.zeros(_G, dtype=np.float64)
+
     def _refresh_all_pin_positions(self) -> None:
         """Recompute self.pin_xy from current macro_pos and port_pos."""
         for p_idx in range(self.P):
@@ -1055,6 +1075,112 @@ class IncrementalEval:
         flat = np.concatenate([V_final, H_final])
         return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
 
+    # ───────────────────────────────────────────────────────────────────────
+    #  Incremental cong scoring (candidate moves, no commit)
+    # ───────────────────────────────────────────────────────────────────────
+    #  The assembled grids (normalised + box-blurred net demand + un-smoothed
+    #  macro blockage) are cached in _cong_Vf / _cong_Hf and kept exact by
+    #  set_placement() and commit_move(). _cong_cost_for_move() scores a
+    #  candidate move by updating ONLY the cells whose demand changes — the
+    #  box-blur is local (radius smooth_range), so a move's net re-routing and
+    #  macro blockage perturb the assembled grids only near the touched cells.
+    #  Result equals compute_cong_cost_full() up to float-reorder (~1e-15),
+    #  far below the ~1e-7 PLC-validation noise and the run-to-run kernel
+    #  nondeterminism, so move decisions are unaffected. This avoids the full
+    #  O(grid) re-smooth that a per-candidate commit→proxy→revert incurs.
+
+    def cong_cost(self) -> float:
+        """Cong cost of the CURRENT state from the cached assembled grids
+        (no re-smooth). Equals compute_cong_cost_full() up to float-reorder."""
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+
+    def _cong_cost_for_move(self, macro_idx: int,
+                            new_xy: Tuple[float, float]) -> float:
+        """Cong cost if macro_idx moves to new_xy, computed incrementally from
+        the cached assembled grids WITHOUT mutating state."""
+        Gc = self.G_cols; Gr = self.G_rows; sr = self.smooth_range
+        G = Gr * Gc
+        inv_v = (1.0 / self.grid_v_routes) if self.grid_v_routes > 0 else 1.0
+        inv_h = (1.0 / self.grid_h_routes) if self.grid_h_routes > 0 else 1.0
+        nets = self.nets_per_macro[macro_idx]
+        pins = self.pins_per_macro[macro_idx]
+        dV = self._cong_dV; dH = self._cong_dH
+
+        # Net-route delta: subtract old routes, add new routes at the moved pins.
+        for n in nets:
+            self._add_net_to_routing(int(n), dV, dH, sign=-1.0)
+        saved_pins = self.pin_xy[pins].copy()
+        self.pin_xy[pins, 0] = float(new_xy[0]) + self.pin_offset[pins, 0]
+        self.pin_xy[pins, 1] = float(new_xy[1]) + self.pin_offset[pins, 1]
+        for n in nets:
+            self._add_net_to_routing(int(n), dV, dH, sign=+1.0)
+        self.pin_xy[pins] = saved_pins
+
+        # Macro-blockage delta (hard macros only; added un-smoothed).
+        is_hard = macro_idx < self.nH
+        if is_hard:
+            dMV = self._cong_dMV; dMH = self._cong_dMH
+            self._add_macro_blockage(macro_idx, dMV, dMH, sign=-1.0)
+            saved_pos = self.macro_pos[macro_idx].copy()
+            self.macro_pos[macro_idx, 0] = float(new_xy[0])
+            self.macro_pos[macro_idx, 1] = float(new_xy[1])
+            self._add_macro_blockage(macro_idx, dMV, dMH, sign=+1.0)
+            self.macro_pos[macro_idx] = saved_pos
+
+        # Candidate assembled grids = cached + delta at touched cells only.
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        # V net demand smooths across columns (within ±sr); scatter each changed
+        # source cell's normalised value to its output window.
+        nzv = np.flatnonzero(dV)
+        if nzv.size:
+            rv = nzv // Gc; cv = nzv % Gc
+            wv = (dV[nzv] * inv_v) / self._cntc[cv]
+            for off in range(-sr, sr + 1):
+                tc = cv + off
+                ok = (tc >= 0) & (tc < Gc)
+                flat[rv[ok] * Gc + tc[ok]] += wv[ok]
+            dV[nzv] = 0.0   # reset scratch for next call
+        # H net demand smooths across rows.
+        nzh = np.flatnonzero(dH)
+        if nzh.size:
+            rh = nzh // Gc; ch = nzh % Gc
+            wh = (dH[nzh] * inv_h) / self._cntr[rh]
+            for off in range(-sr, sr + 1):
+                tr = rh + off
+                ok = (tr >= 0) & (tr < Gr)
+                flat[G + tr[ok] * Gc + ch[ok]] += wh[ok]
+            dH[nzh] = 0.0
+        if is_hard:
+            nzmv = np.flatnonzero(dMV)
+            if nzmv.size:
+                flat[nzmv] += dMV[nzmv] * inv_v
+                dMV[nzmv] = 0.0
+            nzmh = np.flatnonzero(dMH)
+            if nzmh.size:
+                flat[G + nzmh] += dMH[nzmh] * inv_h
+                dMH[nzmh] = 0.0
+
+        return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+
+    def proxy_for_move(self, macro_idx: int, new_xy: Tuple[float, float],
+                       cur_wl: Optional[float] = None,
+                       cur_den: Optional[float] = None) -> float:
+        """Proxy if macro_idx moves to new_xy, WITHOUT committing. WL/density
+        use the existing incremental deltas; congestion uses the incremental
+        scorer. Pass cur_wl / cur_den (current costs) to avoid recomputing them
+        on every candidate."""
+        if cur_wl is None:
+            cur_wl = self.compute_wl_cost()
+        if cur_den is None:
+            cur_den = self.compute_density_cost()
+        st = self.delta_for_move(macro_idx, new_xy, include_cong=False)
+        new_wl  = cur_wl + st['delta_wl']
+        new_den = cur_den + st['delta_density']
+        new_cong = self._cong_cost_for_move(macro_idx, new_xy)
+        return (WEIGHT_WL * new_wl + WEIGHT_DENSITY * new_den
+                + WEIGHT_CONG * new_cong)
+
     def diff_against_plc_routing(self) -> dict:
         """Diagnostic: rebuild PLC's V/H routing grids and compare cell-by-cell
         to the from-scratch port. Now splits net vs macro vs smoothed parts to
@@ -1454,6 +1580,13 @@ class IncrementalEval:
             self._add_macro_blockage(
                 macro_idx, self.macro_raw_V, self.macro_raw_H, sign=+1.0,
             )
+
+        # Keep the incremental-cong assembled-grid cache exact by rebuilding it
+        # from the updated raw grids. Commits are far rarer than candidate evals
+        # (only accepted moves), so this full re-smooth is cheap relative to the
+        # per-candidate scoring it enables — and avoids any drift.
+        if getattr(self, '_cong_Vf', None) is not None:
+            self._cong_Vf, self._cong_Hf = self._build_full_routing_grids()
 
 
 # ════════════════════════════════════════════════════════════════════════════
