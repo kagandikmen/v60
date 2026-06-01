@@ -574,6 +574,7 @@ class IncrementalEval:
         self._cong_dH  = np.zeros(_G, dtype=np.float64)
         self._cong_dMV = np.zeros(_G, dtype=np.float64)
         self._cong_dMH = np.zeros(_G, dtype=np.float64)
+        self._score_prep_macro = -1   # macro whose old routes are cached (-1 = none)
 
     def _refresh_all_pin_positions(self) -> None:
         """Recompute self.pin_xy from current macro_pos and port_pos."""
@@ -1095,6 +1096,27 @@ class IncrementalEval:
         flat = np.concatenate([self._cong_Vf, self._cong_Hf])
         return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
 
+    def _prep_old_routes(self, macro_idx: int) -> None:
+        """Cache the touched nets' routes (and the macro's blockage) at the
+        CURRENT positions for `macro_idx`, as the negated cell->value pairs that
+        _cong_cost_for_move applies as its "subtract old" term. This term is
+        identical for every candidate of a macro (it's the current placement),
+        so caching it once turns the per-candidate "subtract old" from a full
+        re-route into a cheap array write. Invalidated by commit_move()."""
+        dV = self._cong_dV; dH = self._cong_dH
+        for n in self.nets_per_macro[macro_idx]:
+            self._add_net_to_routing(int(n), dV, dH, sign=+1.0)
+        self._old_v_idx = np.flatnonzero(dV); self._old_v_neg = -dV[self._old_v_idx]
+        self._old_h_idx = np.flatnonzero(dH); self._old_h_neg = -dH[self._old_h_idx]
+        dV[self._old_v_idx] = 0.0; dH[self._old_h_idx] = 0.0
+        if macro_idx < self.nH:
+            dMV = self._cong_dMV; dMH = self._cong_dMH
+            self._add_macro_blockage(macro_idx, dMV, dMH, sign=+1.0)
+            self._old_mv_idx = np.flatnonzero(dMV); self._old_mv_neg = -dMV[self._old_mv_idx]
+            self._old_mh_idx = np.flatnonzero(dMH); self._old_mh_neg = -dMH[self._old_mh_idx]
+            dMV[self._old_mv_idx] = 0.0; dMH[self._old_mh_idx] = 0.0
+        self._score_prep_macro = macro_idx
+
     def _cong_cost_for_move(self, macro_idx: int,
                             new_xy: Tuple[float, float]) -> float:
         """Cong cost if macro_idx moves to new_xy, computed incrementally from
@@ -1106,10 +1128,16 @@ class IncrementalEval:
         nets = self.nets_per_macro[macro_idx]
         pins = self.pins_per_macro[macro_idx]
         dV = self._cong_dV; dH = self._cong_dH
+        is_hard = macro_idx < self.nH
 
-        # Net-route delta: subtract old routes, add new routes at the moved pins.
-        for n in nets:
-            self._add_net_to_routing(int(n), dV, dH, sign=-1.0)
+        # "Subtract old routes" is identical for every candidate of this macro,
+        # so cache it once (per macro) and apply it as a plain array write.
+        if self._score_prep_macro != macro_idx:
+            self._prep_old_routes(macro_idx)
+
+        # Net-route delta: cached -old, then add the new routes at the moved pins.
+        dV[self._old_v_idx] = self._old_v_neg
+        dH[self._old_h_idx] = self._old_h_neg
         saved_pins = self.pin_xy[pins].copy()
         self.pin_xy[pins, 0] = float(new_xy[0]) + self.pin_offset[pins, 0]
         self.pin_xy[pins, 1] = float(new_xy[1]) + self.pin_offset[pins, 1]
@@ -1118,10 +1146,10 @@ class IncrementalEval:
         self.pin_xy[pins] = saved_pins
 
         # Macro-blockage delta (hard macros only; added un-smoothed).
-        is_hard = macro_idx < self.nH
         if is_hard:
             dMV = self._cong_dMV; dMH = self._cong_dMH
-            self._add_macro_blockage(macro_idx, dMV, dMH, sign=-1.0)
+            dMV[self._old_mv_idx] = self._old_mv_neg
+            dMH[self._old_mh_idx] = self._old_mh_neg
             saved_pos = self.macro_pos[macro_idx].copy()
             self.macro_pos[macro_idx, 0] = float(new_xy[0])
             self.macro_pos[macro_idx, 1] = float(new_xy[1])
@@ -1587,6 +1615,9 @@ class IncrementalEval:
         # per-candidate scoring it enables — and avoids any drift.
         if getattr(self, '_cong_Vf', None) is not None:
             self._cong_Vf, self._cong_Hf = self._build_full_routing_grids()
+        # A move changes the touched nets' routes, so the cached "old routes"
+        # for incremental scoring are stale — invalidate them.
+        self._score_prep_macro = -1
 
 
 # ════════════════════════════════════════════════════════════════════════════
