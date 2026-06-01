@@ -1110,7 +1110,12 @@ class v60_Placer:
                 # hard macros, reject any that would overlap another hard macro
                 # (AABB intersection, vectorised). No cheap WL+density filter:
                 # every candidate is full-evaluated on the real proxy below.
+                # Dedup by clipped position: any step large enough to overshoot
+                # the canvas clips to the same corner/edge, so many of the large
+                # multipliers produce identical positions — evaluate each unique
+                # position once (exact: duplicates have identical proxy).
                 cands = []  # list of (new_x, new_y)
+                seen = set()
                 for mult in step_mults:
                     s = base_step * mult
                     for (dx, dy) in dirs:
@@ -1118,6 +1123,10 @@ class v60_Placer:
                         new_y = float(np.clip(cur_y + dy * s, 0.0, ch))
                         if new_x == cur_x and new_y == cur_y:
                             continue
+                        key = (new_x, new_y)
+                        if key in seen:
+                            continue
+                        seen.add(key)
                         tested_this_sweep += 1
                         if is_hard:
                             # Vectorised hard-hard AABB overlap check.
