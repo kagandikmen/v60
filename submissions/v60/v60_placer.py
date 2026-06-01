@@ -180,7 +180,6 @@ class v60_Placer:
         cd_polish_step_frac: float = 0.01,        # candidate offset = step_frac * 0.5 * (W+H)
         cd_polish_step_set: tuple = tuple(2.0**i for i in range(-3, 16)),  # multipliers of base step: 2^-3 .. 2^15
         cd_polish_num_directions: int = 16,       # evenly-spaced unit vectors per macro candidate scan
-        cd_polish_top_k: int = 8,                 # full-eval the top-K WL+density candidates per macro
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
         # Early-stop a CD run once a full sweep reduces the proxy by less than
@@ -300,7 +299,6 @@ class v60_Placer:
         self.cd_polish_step_frac  = float(cd_polish_step_frac)
         self.cd_polish_step_set   = tuple(float(s) for s in cd_polish_step_set)
         self.cd_polish_num_directions = max(1, int(cd_polish_num_directions))
-        self.cd_polish_top_k       = int(cd_polish_top_k)
         self.cd_polish_min_improve = float(cd_polish_min_improve)
         self.cd_polish_patience    = int(cd_polish_patience)
         self.cd_polish_min_sweep_improve_frac = float(cd_polish_min_sweep_improve_frac)
@@ -1001,25 +999,24 @@ class v60_Placer:
         if `cd_polish_include_hard`, hard too) using IncrementalEval.
 
         Strategy per macro:
-          1. For each candidate offset (8 directions × cd_polish_step_set),
-             compute the WL+density delta via `delta_for_move(include_cong=False)`
-             (cheap, ~0.1 ms each). For hard macros, candidates that would
-             cause overlap with another hard macro are rejected via a
+          1. Enumerate candidate offsets (cd_polish_num_directions evenly-spaced
+             directions × cd_polish_step_set step sizes). For hard macros,
+             candidates that would overlap another hard macro are rejected via a
              vectorised AABB intersection check (~5 µs).
-          2. Take the top-K WL+density-improving candidates (most-negative
-             delta_wl + 0.5·delta_density).
-          3. For each of those K, tentatively commit, re-evaluate the *real*
-             proxy (incremental cong cache, ~4 ms), and revert. Track the
-             candidate with the best actual proxy improvement.
-          4. If the best real-proxy improvement exceeds `cd_polish_min_improve`,
-             commit that candidate; else skip the macro this sweep.
+          2. Full-eval EVERY candidate on the real proxy (tentatively commit,
+             read proxy incl. congestion, revert), and track the candidate with
+             the best actual proxy improvement.
+          3. If the best improvement exceeds `cd_polish_min_improve`, commit
+             that candidate; else skip the macro this sweep.
 
-        Why top-K instead of top-1: on cong-sensitive benches, the
-        WL+density-best candidate often has bad cong (and gets rejected).
-        Meanwhile the #2 or #3 WL+density candidate may be slightly worse
-        on WL+density but enough better on cong to be a net improvement.
-        Top-K = 8 catches these without exploding the cost — only candidates
-        with delta_wlden < 0 are eligible, so weak macros stay cheap.
+        No cheap WL+density pre-filter: a measured ceiling test showed the
+        old "top-K by WL+density delta" filter systematically discarded
+        congestion-reducing moves — moves that worsen WL+density but improve
+        the real proxy via congestion never reached the full eval. On the
+        cong-dominated benches that is exactly where the gains are, so every
+        candidate is now evaluated on the real proxy directly. (The full
+        congestion eval is cheap enough after the vectorised IncrementalEval
+        cong path; the cost is bounded by trimming step_set / num_directions.)
 
         Hard-macro inclusion: hard macros have outsize cong impact (their
         blockage shifts whole rows/columns of routing demand) but are also
@@ -1072,7 +1069,7 @@ class v60_Placer:
             f"nS={n_soft_targets} nH={n_hard_targets} (include_hard={self.cd_polish_include_hard})  "
             f"sweeps={self.cd_polish_sweeps}  "
             f"step_frac={self.cd_polish_step_frac:.4f}  "
-            f"step_set={self.cd_polish_step_set}  top_k={self.cd_polish_top_k}"
+            f"step_set={self.cd_polish_step_set}  full-eval (no cheap filter)"
         )
         t0 = time.time()
 
@@ -1096,8 +1093,8 @@ class v60_Placer:
             order = target_idx[rng.permutation(len(target_idx))]
             moved_this_sweep = 0
             tested_this_sweep = 0
-            wl_den_pos = 0    # candidates with delta_wlden <= 0 (worth trying full eval)
-            cong_rejected = 0 # full-eval moves that didn't beat min_improve
+            active_macros = 0   # macros with >= 1 legal candidate this sweep
+            no_improve = 0      # macros whose candidates didn't beat min_improve
             for m_i in order:
                 m_i = int(m_i)
                 cur_x = float(e.macro_pos[m_i, 0])
@@ -1107,11 +1104,11 @@ class v60_Placer:
                     hw_i = float(e.macro_w[m_i]) * 0.5
                     hh_i = float(e.macro_h[m_i]) * 0.5
 
-                # Cheap scan: collect all WL+density-improving candidates.
-                # WL weight is 1.0, density weight is 0.5 in the real proxy.
-                # For hard macros, also reject candidates that would overlap
-                # any other hard macro (AABB intersection, vectorised).
-                cands = []  # list of (d_wlden, (new_x, new_y))
+                # Enumerate candidate positions (directions × step sizes). For
+                # hard macros, reject any that would overlap another hard macro
+                # (AABB intersection, vectorised). No cheap WL+density filter:
+                # every candidate is full-evaluated on the real proxy below.
+                cands = []  # list of (new_x, new_y)
                 for mult in step_mults:
                     s = base_step * mult
                     for (dx, dy) in dirs:
@@ -1133,24 +1130,17 @@ class v60_Placer:
                             no_overlap[m_i] = True  # ignore self
                             if not np.all(no_overlap):
                                 continue
-                        st = e.delta_for_move(m_i, (new_x, new_y), include_cong=False)
-                        d_wlden = st['delta_wl'] + 0.5 * st['delta_density']
-                        if d_wlden < 0.0:
-                            cands.append((d_wlden, (new_x, new_y)))
+                        cands.append((new_x, new_y))
 
                 if not cands:
                     continue
-                wl_den_pos += 1
+                active_macros += 1
 
-                # Top-K by WL+density delta, ascending (most negative first).
-                cands.sort(key=lambda t: t[0])
-                cands = cands[: max(1, self.cd_polish_top_k)]
-
-                # Full-eval each candidate by commit + proxy + revert.
-                # Track the one with the best real-proxy improvement.
+                # Full-eval every candidate on the real proxy (commit + proxy +
+                # revert); keep the best actual improvement.
                 best_new_proxy = cur_proxy
                 best_new_xy = None
-                for (_dw, new_xy) in cands:
+                for new_xy in cands:
                     st = e.delta_for_move(m_i, new_xy, include_cong=False)
                     e.commit_move(m_i, new_xy, st)
                     new_proxy = float(e.proxy(include_cong=True))
@@ -1178,15 +1168,15 @@ class v60_Placer:
                         hard_aabb[m_i, 2] = best_new_xy[1] - hh_i
                         hard_aabb[m_i, 3] = best_new_xy[1] + hh_i
                 else:
-                    cong_rejected += 1
+                    no_improve += 1
 
             total_moved += moved_this_sweep
             sweep_rel_improve = ((proxy_before_sweep - cur_proxy)
                                  / max(abs(proxy_before_sweep), 1e-12))
             self._cd_log(
                 f"  CD sweep {sweep+1}/{self.cd_polish_sweeps}: "
-                f"tested={tested_this_sweep} wlden_neg={wl_den_pos} "
-                f"moved={moved_this_sweep} cong_rej={cong_rejected} "
+                f"tested={tested_this_sweep} active={active_macros} "
+                f"moved={moved_this_sweep} no_improve={no_improve} "
                 f"proxy={cur_proxy:.6f} sweep_improve={sweep_rel_improve*100:.3f}%  "
                 f"elapsed={time.time()-t0:.1f}s"
             )
