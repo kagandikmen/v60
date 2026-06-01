@@ -14,8 +14,8 @@ The code lives in [`submissions/v60/`](submissions/v60/) (the directory layout i
 
 ```bash
 # Clone the repository
-git clone https://github.com/partcleda/macro-place-challenge-2026.git
-cd macro-place-challenge-2026
+git clone https://github.com/kagandikmen/v60.git
+cd v60
 
 # Initialize TILOS MacroPlacement submodule (required for evaluation)
 git submodule update --init external/MacroPlacement
