@@ -575,6 +575,11 @@ class IncrementalEval:
         self._cong_dMV = np.zeros(_G, dtype=np.float64)
         self._cong_dMH = np.zeros(_G, dtype=np.float64)
         self._score_prep_macro = -1   # macro whose old routes are cached (-1 = none)
+        # Per-macro soft-cong memo: {gcell-signature -> cong cost}. A soft macro
+        # has no blockage, so its candidate cong depends ONLY on where its pins
+        # land in gcells; candidates sharing a signature share a bit-identical
+        # cong. Reset per macro by _prep_old_routes (see _cong_cost_for_move).
+        self._cong_sig_cache = {}
 
     def _refresh_all_pin_positions(self) -> None:
         """Recompute self.pin_xy from current macro_pos and port_pos."""
@@ -1116,6 +1121,25 @@ class IncrementalEval:
             self._old_mh_idx = np.flatnonzero(dMH); self._old_mh_neg = -dMH[self._old_mh_idx]
             dMV[self._old_mv_idx] = 0.0; dMH[self._old_mh_idx] = 0.0
         self._score_prep_macro = macro_idx
+        # New macro (or post-commit re-prep): the soft-cong memo is now stale.
+        self._cong_sig_cache.clear()
+
+    def _move_gcell_sig(self, macro_idx: int, new_xy: Tuple[float, float]) -> bytes:
+        """Signature = the gcell each of macro_idx's pins lands in at new_xy.
+
+        Computed with the SAME float32 narrowing as _add_net_to_routing
+        (`clamp(floor(f32(f32(pin_xy) / grid)))`), so two candidate positions
+        sharing a signature produce bit-identical routes — hence bit-identical
+        cong for a soft macro (no blockage). Returned as a bytes key for fast
+        hashing."""
+        pins = self.pins_per_macro[macro_idx]
+        px = (float(new_xy[0]) + self.pin_offset[pins, 0]).astype(np.float32)
+        py = (float(new_xy[1]) + self.pin_offset[pins, 1]).astype(np.float32)
+        cols = np.floor(np.float32(px / self.grid_w)).astype(np.int32)
+        rows = np.floor(np.float32(py / self.grid_h)).astype(np.int32)
+        np.clip(cols, 0, self.G_cols - 1, out=cols)
+        np.clip(rows, 0, self.G_rows - 1, out=rows)
+        return rows.tobytes() + b'|' + cols.tobytes()
 
     def _cong_cost_for_move(self, macro_idx: int,
                             new_xy: Tuple[float, float]) -> float:
@@ -1134,6 +1158,18 @@ class IncrementalEval:
         # so cache it once (per macro) and apply it as a plain array write.
         if self._score_prep_macro != macro_idx:
             self._prep_old_routes(macro_idx)
+
+        # Soft-macro gcell memo: a soft macro has no blockage, so its candidate
+        # cong is a pure function of where its pins land in gcells. Candidates
+        # sharing a signature are bit-identical (same routes -> same assembled
+        # flat -> same ABU), so each unique signature is computed once. Hard
+        # macros have area-weighted (sub-cell) blockage, so they are NOT memoized.
+        sig = None
+        if not is_hard:
+            sig = self._move_gcell_sig(macro_idx, new_xy)
+            hit = self._cong_sig_cache.get(sig)
+            if hit is not None:
+                return hit
 
         # Net-route delta: cached -old, then add the new routes at the moved pins.
         dV[self._old_v_idx] = self._old_v_neg
@@ -1189,7 +1225,10 @@ class IncrementalEval:
                 flat[G + nzmh] += dMH[nzmh] * inv_h
                 dMH[nzmh] = 0.0
 
-        return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+        cong = self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+        if sig is not None:
+            self._cong_sig_cache[sig] = cong
+        return cong
 
     def proxy_for_move(self, macro_idx: int, new_xy: Tuple[float, float],
                        cur_wl: Optional[float] = None,
