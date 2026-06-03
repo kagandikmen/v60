@@ -580,6 +580,13 @@ class IncrementalEval:
         # land in gcells; candidates sharing a signature share a bit-identical
         # cong. Reset per macro by _prep_old_routes (see _cong_cost_for_move).
         self._cong_sig_cache = {}
+        # Per-macro pin-gcell cache for the cached candidate re-route: {pin ->
+        # (row, col)}. Filled per macro by _prep_old_routes with the FIXED pins'
+        # gcells (constant across the macro's candidates); the moving macro's own
+        # pins are overwritten per candidate in _cong_cost_for_move. Lets
+        # _add_net_to_routing_cached skip the per-pin gcell recompute (~70% of
+        # per-candidate pin lookups are non-moving).
+        self._cong_gcell = {}
 
     def _refresh_all_pin_positions(self) -> None:
         """Recompute self.pin_xy from current macro_pos and port_pos."""
@@ -1123,23 +1130,63 @@ class IncrementalEval:
         self._score_prep_macro = macro_idx
         # New macro (or post-commit re-prep): the soft-cong memo is now stale.
         self._cong_sig_cache.clear()
+        # Cache the FIXED pins' gcells (pins on this macro's nets that the macro
+        # does NOT own — other macros' pins + ports). They sit at fixed positions
+        # for the whole candidate scan, so compute each once here and reuse in
+        # the cached re-route. The macro's own pins are filled per candidate.
+        gc = self._cong_gcell
+        gc.clear()
+        moving = set(int(p) for p in self.pins_per_macro[macro_idx])
+        for n in self.nets_per_macro[macro_idx]:
+            for p in self.net_pins[n]:
+                pi = int(p)
+                if pi not in moving:
+                    gc[pi] = self._grid_cell_for_pos_f32(
+                        np.float32(self.pin_xy[pi, 0]),
+                        np.float32(self.pin_xy[pi, 1]))
 
-    def _move_gcell_sig(self, macro_idx: int, new_xy: Tuple[float, float]) -> bytes:
-        """Signature = the gcell each of macro_idx's pins lands in at new_xy.
+    def _moving_pin_gcells(self, pins, new_xy: Tuple[float, float]):
+        """Vectorised gcell (row, col) of `pins` if their owner moves to new_xy.
 
-        Computed with the SAME float32 narrowing as _add_net_to_routing
-        (`clamp(floor(f32(f32(pin_xy) / grid)))`), so two candidate positions
-        sharing a signature produce bit-identical routes — hence bit-identical
-        cong for a soft macro (no blockage). Returned as a bytes key for fast
-        hashing."""
-        pins = self.pins_per_macro[macro_idx]
+        Reproduces _add_net_to_routing's float32 narrowing
+        (`clamp(floor(f32(f32(pin_xy) / grid)))`) exactly. Returned as int32
+        row/col arrays; the soft-cong signature is their bytes, and the cached
+        re-route reads them per moving pin."""
         px = (float(new_xy[0]) + self.pin_offset[pins, 0]).astype(np.float32)
         py = (float(new_xy[1]) + self.pin_offset[pins, 1]).astype(np.float32)
         cols = np.floor(np.float32(px / self.grid_w)).astype(np.int32)
         rows = np.floor(np.float32(py / self.grid_h)).astype(np.int32)
         np.clip(cols, 0, self.G_cols - 1, out=cols)
         np.clip(rows, 0, self.G_rows - 1, out=rows)
-        return rows.tobytes() + b'|' + cols.tobytes()
+        return rows, cols
+
+    def _add_net_to_routing_cached(self, net_idx: int, V_arr: np.ndarray,
+                                   H_arr: np.ndarray, sign: float, gc: dict) -> None:
+        """Same as _add_net_to_routing but reads each pin's gcell from `gc`
+        (the per-macro cache: fixed pins pre-filled, moving pins set per
+        candidate) instead of recomputing it. Bit-identical: the gcell SET and
+        source_rc are the same, the segment routines are the same, and every
+        segment adds the same per-net weight so the cross-segment += order is
+        irrelevant."""
+        pis = self.net_pins[net_idx]
+        if pis.size < 2:
+            return
+        weight = float(self.net_weight[net_idx]) * sign
+        source_rc = gc[int(pis[0])]
+        gcells = {source_rc}
+        for p in pis[1:]:
+            gcells.add(gc[int(p)])
+        n = len(gcells)
+        if n == 2:
+            others = [g for g in gcells if g != source_rc]
+            if others:
+                self._add_two_pin_segment(source_rc, others[0], weight, V_arr, H_arr)
+        elif n == 3:
+            self._add_three_pin_segment(list(gcells), weight, V_arr, H_arr)
+        elif n > 3:
+            for g in gcells:
+                if g != source_rc:
+                    self._add_two_pin_segment(source_rc, g, weight, V_arr, H_arr)
 
     def _cong_cost_for_move(self, macro_idx: int,
                             new_xy: Tuple[float, float]) -> float:
@@ -1164,22 +1211,30 @@ class IncrementalEval:
         # sharing a signature are bit-identical (same routes -> same assembled
         # flat -> same ABU), so each unique signature is computed once. Hard
         # macros have area-weighted (sub-cell) blockage, so they are NOT memoized.
+        # Moving macro's pin gcells (vectorised, once) — reused for the soft-cong
+        # signature and the cached re-route below.
+        mov_rows, mov_cols = self._moving_pin_gcells(pins, new_xy)
         sig = None
         if not is_hard:
-            sig = self._move_gcell_sig(macro_idx, new_xy)
+            sig = mov_rows.tobytes() + b'|' + mov_cols.tobytes()
             hit = self._cong_sig_cache.get(sig)
             if hit is not None:
                 return hit
 
-        # Net-route delta: cached -old, then add the new routes at the moved pins.
+        # Write the moving pins into the per-pin gcell cache (fixed pins already
+        # filled by _prep_old_routes), then re-route from the cache. No per-pin
+        # gcell recompute, and no pin_xy mutation (the cached router reads gc).
+        gc = self._cong_gcell
+        pins_l = pins.tolist() if hasattr(pins, 'tolist') else list(pins)
+        rows_l = mov_rows.tolist(); cols_l = mov_cols.tolist()
+        for i in range(len(pins_l)):
+            gc[pins_l[i]] = (rows_l[i], cols_l[i])
+
+        # Net-route delta: cached -old, then add the new routes from the cache.
         dV[self._old_v_idx] = self._old_v_neg
         dH[self._old_h_idx] = self._old_h_neg
-        saved_pins = self.pin_xy[pins].copy()
-        self.pin_xy[pins, 0] = float(new_xy[0]) + self.pin_offset[pins, 0]
-        self.pin_xy[pins, 1] = float(new_xy[1]) + self.pin_offset[pins, 1]
         for n in nets:
-            self._add_net_to_routing(int(n), dV, dH, sign=+1.0)
-        self.pin_xy[pins] = saved_pins
+            self._add_net_to_routing_cached(int(n), dV, dH, +1.0, gc)
 
         # Macro-blockage delta (hard macros only; added un-smoothed).
         if is_hard:
