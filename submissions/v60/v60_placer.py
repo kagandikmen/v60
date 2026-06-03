@@ -21,6 +21,8 @@ Usage:
     uv run evaluate submissions/v60/v60_placer.py --all
 """
 
+import contextlib
+import io
 import math
 import multiprocessing as mp
 import os
@@ -50,7 +52,7 @@ from macro_place.objective import compute_proxy_cost
 from v60_engine import v60_Engine
 from v60_kernels   import (
     _basin_hop, _congestion_work_tier,
-    _extract_raw, _parse_plc_routing_params, _run_batch,
+    _extract_raw, _parse_plc_routing_params, _quiet_plc, _run_batch,
 )
 from v60_incremental_eval import (
     IncrementalEval, WEIGHT_WL, WEIGHT_DENSITY, WEIGHT_CONG,
@@ -602,9 +604,10 @@ class v60_Placer:
                     return pos
             return None
 
-        plc = PlacementCost(netlist)
-        if osp.exists(init_plc):
-            plc.restore_placement(init_plc, ifInital=True, ifReadComment=True)
+        with _quiet_plc():
+            plc = PlacementCost(netlist)
+            if osp.exists(init_plc):
+                plc.restore_placement(init_plc, ifInital=True, ifReadComment=True)
 
         scored = []
         for tag, pos in all_results:
@@ -648,13 +651,32 @@ class v60_Placer:
                 f"n_cpu={self.post_stage2_n_cpu}  (engine seed pool={len(seed_pool)})"
             )
 
-            # GPU side: build the legal candidate pool across the top-n_gpu seeds.
-            cand_pool = []
+            # GPU side: basin-hop every top-n_gpu seed, then soft-polish every
+            # one. With more than one seed this is grouped by stage and labelled
+            # per seed (the same way the phased CPU side reads); with a single
+            # seed the headers are skipped so the output is unchanged.
+            multi = n_gpu > 1
+            if multi:
+                self._log(f"[v60 {benchmark.name}] === basin-hop · {n_gpu} seeds ===")
+            incumbents = []
             for gi in range(n_gpu):
-                seed = seed_pool[gi]
-                cand_pool += self._gpu_side(
-                    seed['pos'], seed['proxy'], benchmark, plc, winner_cohort,
-                    mov_idx, scale, t0, label=f"{best_tag}#{gi}")
+                if multi:
+                    self._log(f"[v60 {benchmark.name}] --- basin-hop · seed {gi} ---")
+                incumbents.append(self._gpu_basinhop(
+                    seed_pool[gi]['pos'], seed_pool[gi]['proxy'], benchmark, plc,
+                    winner_cohort, mov_idx, scale, label=f"{best_tag}#{gi}"))
+
+            cand_pool = []
+            if multi and self.soft_polish_enabled:
+                self._log(f"[v60 {benchmark.name}] === soft polish · {n_gpu} seeds ===")
+            for gi in range(n_gpu):
+                inc = incumbents[gi]
+                cand_pool.append(inc)   # the basin-hop incumbent is a candidate
+                if self.soft_polish_enabled and math.isfinite(inc['proxy']):
+                    if multi:
+                        self._log(f"[v60 {benchmark.name}] --- soft polish · seed {gi} ---")
+                    cand_pool += self._gpu_softpolish(
+                        inc['pos'], inc['proxy'], inc['tag'], benchmark, plc)
 
             # Rank best-first, dedup by proxy, take top-n_cpu for the CPU side.
             cand_pool.sort(key=lambda c: c['proxy'])
@@ -681,14 +703,11 @@ class v60_Placer:
 
         return best_pos
 
-    def _gpu_side(self, seed_pos_np, seed_proxy, benchmark, plc, winner_cohort,
-                  mov_idx, scale, t0, label):
-        """GPU-side refinement (basin-hop + soft polish) from one engine seed.
-
-        Returns a list of legal candidate dicts {pos: tensor, proxy: float,
-        tag: str}: the basin-hop incumbent plus the top soft-polish legal
-        restarts. These feed the pooled top-n_cpu selection for the CPU side.
-        """
+    def _gpu_basinhop(self, seed_pos_np, seed_proxy, benchmark, plc, winner_cohort,
+                      mov_idx, scale, label):
+        """Basin-hop from one engine seed (GPU). Returns the incumbent candidate
+        dict {pos tensor, proxy, tag}: the best placement basin-hopping reaches
+        from this seed (or the seed itself if no hop improved)."""
         nM = int(benchmark.num_macros)
         cur_t = benchmark.macro_positions.clone()
         cur_t[:nM] = torch.tensor(seed_pos_np, dtype=cur_t.dtype)
@@ -756,25 +775,28 @@ class v60_Placer:
                 cur_proxy  = float(bh['proxy'])
                 cur_tag    = f"{label}+bh"
 
-        candidates = [{'pos': cur_t, 'proxy': cur_proxy, 'tag': cur_tag}]
+        return {'pos': cur_t, 'proxy': cur_proxy, 'tag': cur_tag}
 
-        # ── Soft polish; pull its top legal restarts into the pool ───────
-        if self.soft_polish_enabled and math.isfinite(cur_proxy):
-            base_costs = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
-            self._soft_log(
-                f"[v60 {benchmark.name}] soft polish ({cur_tag}) start: "
-                f"proxy={base_costs['proxy_cost']:.4f}"
-            )
-            self._last_soft_pool = []
-            _polished, _pc = self._soft_only_polish(cur_t, benchmark, plc)
-            pool = getattr(self, '_last_soft_pool', []) or []
-            for (pr, pos_np) in pool[: self.post_stage2_n_cpu]:
-                cand_t = benchmark.macro_positions.clone()
-                cand_t[:nM] = torch.tensor(pos_np, dtype=cand_t.dtype)
-                candidates.append({'pos': cand_t, 'proxy': float(pr),
-                                   'tag': f"{cur_tag}+soft"})
-
-        return candidates
+    def _gpu_softpolish(self, cur_t, cur_proxy, cur_tag, benchmark, plc):
+        """Soft-only polish from a (basin-hopped) placement. Returns its top
+        legal soft-polish restarts as candidate dicts; the input placement
+        itself is added to the pool separately by the caller."""
+        nM = int(benchmark.num_macros)
+        out = []
+        base_costs = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
+        self._soft_log(
+            f"[v60 {benchmark.name}] soft polish ({cur_tag}) start: "
+            f"proxy={base_costs['proxy_cost']:.4f}"
+        )
+        self._last_soft_pool = []
+        _polished, _pc = self._soft_only_polish(cur_t, benchmark, plc)
+        pool = getattr(self, '_last_soft_pool', []) or []
+        for (pr, pos_np) in pool[: self.post_stage2_n_cpu]:
+            cand_t = benchmark.macro_positions.clone()
+            cand_t[:nM] = torch.tensor(pos_np, dtype=cand_t.dtype)
+            out.append({'pos': cand_t, 'proxy': float(pr),
+                        'tag': f"{cur_tag}+soft"})
+        return out
 
     def _cpu_side(self, cand_pos, cand_proxy, cand_tag, benchmark, plc, t0=None,
                   cd_max_workers=1):
@@ -816,20 +838,22 @@ class v60_Placer:
         return best_pos, best_proxy, best_tag
 
     def _run_cpu_side(self, cpu_cands, benchmark, plc):
-        """Run the CPU downstream on each candidate; return a list of
-        (pos tensor, proxy, tag).
+        """Run the CPU refinement (CD polish -> hard pair-swap -> soft pair-swap)
+        over the candidates; return a list of (pos tensor, proxy, tag).
 
-        Parallelism uses a *fork*-context multiprocessing.Process per candidate
-        (not ProcessPoolExecutor): with fork the target closure and all inputs
-        (self, benchmark, plc) are inherited through the fork — never pickled —
-        which sidesteps the module-identity pickling failure that ProcessPool
-        hits under the path-loaded submission. Only the numpy result returns
-        over the Queue. Children are CPU-only (CD/swap stages don't touch CUDA),
-        so the parent's CUDA context is irrelevant to them. A child that raises
-        reports it (sends a None result) and that candidate is re-run
-        sequentially in the parent. There is no wall-clock guard: the parent
-        blocks until every child of a wave reports."""
-        nM = int(benchmark.num_macros)
+        The stages run as PHASES: every candidate does CD, then every candidate
+        does the hard swap, then the soft swap. Within a phase the candidates run
+        concurrently in fork-context processes (each inherits all inputs — self,
+        benchmark, plc — through the fork, never pickled; only the result + its
+        captured log return over a Queue). The FIRST candidate streams its log
+        live; the others capture theirs and the parent prints them in candidate
+        order right after the phase barrier. So every candidate's evolution is
+        shown, grouped by stage, with a stable candidate index across stages,
+        and nothing is held back to the very end. The per-candidate result is
+        identical to running the three stages back-to-back per candidate (same
+        improvement gating between stages); only the print interleaving changes.
+        Works the same for any number of upstream GPU seeds — the candidate pool
+        is already flattened before it reaches here."""
         if not cpu_cands:
             return []
 
@@ -841,82 +865,145 @@ class v60_Placer:
         else:
             max_workers = max(1, min(int(self.post_stage2_cpu_max_workers), len(cpu_cands)))
 
-        # Each concurrent outer fork (one candidate) gets its own inner CD pool
-        # of `cd_workers` synced copies. Cap the product (outer wave × inner) at
-        # the core count so we never oversubscribe (the 8×16=128 attempt thrashed
-        # and timed out). cd_workers==1 => no inner pool => outer forks stay
-        # daemon (clean-kill, old behaviour); cd_workers>1 => outer forks must be
-        # NON-daemon to be allowed to spawn the inner pool.
+        # Each concurrent candidate fork can itself spawn a CD scoring pool of
+        # `cd_workers`; cap outer × inner at the core count so we never
+        # oversubscribe. cd_workers==1 => no inner pool => forks can stay daemon.
         if par > 1:
             cd_workers = max(1, min(int(par), cpu_count // max(1, max_workers)))
         else:
             cd_workers = 1
 
-        def _seq_one(c):
-            # Lone candidate in this (main) process: give it the full inner pool.
-            return self._cpu_side(c['pos'], c['proxy'], c['tag'], benchmark, plc,
-                                  cd_max_workers=max(1, int(par)))
-
+        # Sequential fallback (single candidate or parallelism off): run the full
+        # chain per candidate in this process; logs stream in order.
         if (not self.post_stage2_cpu_parallel) or len(cpu_cands) == 1:
-            return [_seq_one(c) for c in cpu_cands]
+            return [self._cpu_side(c['pos'], c['proxy'], c['tag'], benchmark, plc,
+                                   cd_max_workers=max(1, int(par)))
+                    for c in cpu_cands]
+
+        n = len(cpu_cands)
+        states = [{'pos': c['pos'], 'proxy': float(c['proxy']), 'tag': c['tag']}
+                  for c in cpu_cands]
+        self._log(
+            f"[v60 {benchmark.name}] CPU side: {n} candidates  "
+            f"max_workers={max_workers} cd_workers={cd_workers}  "
+            f"(per stage: candidate 0 streams live, then candidates 1..{n - 1} "
+            f"print in order)"
+        )
+
+        # (label, stage fn(pos)->(out_pos, costs), tag suffix, enabled,
+        #  spawns-an-inner-CD-pool)
+        stages = [
+            ('CD polish',
+             lambda pos: self._cd_polish(pos, benchmark, plc, max_workers=cd_workers),
+             '+cd', self.cd_polish_enabled, cd_workers > 1),
+            ('pair-swap',
+             lambda pos: self._pair_swap_polish(pos, benchmark, plc),
+             '+swap', self.pair_swap_enabled, False),
+            ('soft-pair-swap',
+             lambda pos: self._pair_swap_polish_soft(pos, benchmark, plc),
+             '+softswap', self.soft_pair_swap_enabled, False),
+        ]
+        for label, fn, suffix, enabled, inner_pool in stages:
+            if enabled:
+                self._run_cpu_stage(label, fn, suffix, states, benchmark,
+                                    max_workers, inner_pool)
+
+        return [(s['pos'], s['proxy'], s['tag']) for s in states]
+
+    def _run_cpu_stage(self, label, fn, suffix, states, benchmark,
+                       max_workers, inner_pool):
+        """Run one refinement stage over every candidate, concurrently. Candidate
+        0 streams its log live; candidates 1..n-1 capture theirs and the parent
+        prints them in candidate order right after the barrier. Updates `states`
+        in place (each candidate's running best, gated by improvement)."""
+        nM = int(benchmark.num_macros)
+        n = len(states)
+        self._log(f"[v60 {benchmark.name}] === {label} · {n} candidates ===")
+
+        def _run_stage(pos):
+            out_pos, costs = fn(pos)
+            return out_pos, (float(costs['proxy_cost']) if costs else None)
 
         try:
             ctx = mp.get_context('fork')
-        except (ValueError, RuntimeError) as exc:
-            self._log(f"[v60 {benchmark.name}] fork context unavailable ({exc}); "
-                      f"CPU side sequential")
-            return [_seq_one(c) for c in cpu_cands]
+        except (ValueError, RuntimeError):
+            ctx = None
+        if ctx is None:   # no fork: run candidates sequentially (all stream)
+            for idx in range(n):
+                try:
+                    out_pos, pr = _run_stage(states[idx]['pos'])
+                    self._apply_stage_result(states, idx, out_pos, pr, suffix)
+                except Exception as exc:
+                    self._log(f"[v60 {benchmark.name}] {label}: candidate {idx} "
+                              f"failed ({exc!r}); kept as-is")
+            return
 
-        def _child(idx, cand, q):
-            # Inherited via fork; never pickled. Only the result is sent back.
+        def _child(idx, pos, q):
+            # Inherited via fork. idx 0 streams to the terminal; the rest capture
+            # their stdout so the parent can print them in candidate order.
+            buf = io.StringIO() if idx != 0 else None
             try:
-                pos, proxy, tag = self._cpu_side(
-                    cand['pos'], cand['proxy'], cand['tag'], benchmark, plc,
-                    cd_max_workers=cd_workers)
-                q.put((idx, pos[:nM].detach().cpu().numpy().astype(np.float64),
-                       float(proxy), tag))
-            except Exception as exc:  # report; parent re-runs this idx
-                q.put((idx, None, None, repr(exc)))
+                cm = (contextlib.redirect_stdout(buf) if buf is not None
+                      else contextlib.nullcontext())
+                with cm:
+                    out_pos, pr = _run_stage(pos)
+                q.put((idx, out_pos[:nM].detach().cpu().numpy().astype(np.float64),
+                       pr, buf.getvalue() if buf is not None else ''))
+            except Exception as exc:
+                q.put((idx, None, None, f"__ERR__ {exc!r}"))
 
-        results = [None] * len(cpu_cands)
+        # An inner CD pool needs a non-daemon parent (daemon procs can't fork);
+        # swap stages spawn no inner pool, so they stay daemon (clean-kill).
+        outer_daemon = not inner_pool
         failed = []
-        n = len(cpu_cands)
-        # Non-daemon only when each fork spawns an inner CD pool (daemon
-        # processes can't have children); else keep the old daemon forks.
-        outer_daemon = (cd_workers <= 1)
-        self._log(
-            f"[v60 {benchmark.name}] CPU side: {n} candidate(s), "
-            f"fork pool max_workers={max_workers}  cd_workers={cd_workers}"
-            f"{'' if outer_daemon else '  (non-daemon, nested CD pools)'}"
-        )
         for ws in range(0, n, max_workers):
             wave = list(range(ws, min(ws + max_workers, n)))
+            if 0 in wave:
+                self._log(f"[v60 {benchmark.name}] --- {label} · candidate 0 (live) ---")
             q = ctx.Queue()
             procs = {}
             for idx in wave:
-                p = ctx.Process(target=_child, args=(idx, cpu_cands[idx], q),
+                p = ctx.Process(target=_child, args=(idx, states[idx]['pos'], q),
                                 daemon=outer_daemon)
-                p.start()
-                procs[idx] = p
-            # Each child sends exactly one message (result or error sentinel),
-            # so block for exactly len(wave) messages — no wall-clock guard.
-            for _ in wave:
-                idx, pos_np, proxy, tag = q.get()
-                if pos_np is None:
-                    self._log(f"[v60 {benchmark.name}] CPU child {idx} errored: {tag}")
-                    failed.append(idx)
-                else:
-                    t = benchmark.macro_positions.clone()
-                    t[:nM] = torch.tensor(pos_np, dtype=t.dtype)
-                    results[idx] = (t, float(proxy), tag)
+                p.start(); procs[idx] = p
+            got = {}
+            for _ in wave:               # exactly one message per child
+                idx, pos_np, pr, log = q.get()
+                got[idx] = (pos_np, pr, log)
             for p in procs.values():
                 p.join()
+            # Print captured logs in candidate order (idx 0 already streamed live).
+            for idx in wave:
+                pos_np, pr, log = got[idx]
+                if pos_np is None:
+                    self._log(f"[v60 {benchmark.name}] {label}: candidate {idx} "
+                              f"errored ({log}); re-running in parent")
+                    failed.append(idx)
+                    continue
+                if idx != 0:
+                    self._log(f"[v60 {benchmark.name}] --- {label} · candidate {idx} ---")
+                    if log:
+                        sys.stdout.write(log); sys.stdout.flush()
+                out_pos = benchmark.macro_positions.clone()
+                out_pos[:nM] = torch.tensor(pos_np, dtype=out_pos.dtype)
+                self._apply_stage_result(states, idx, out_pos, pr, suffix)
 
-        # Re-run any errored candidates sequentially in the parent.
+        # Re-run any errored candidates' stage sequentially in the parent.
         for idx in failed:
-            results[idx] = _seq_one(cpu_cands[idx])
+            try:
+                out_pos, pr = _run_stage(states[idx]['pos'])
+                self._apply_stage_result(states, idx, out_pos, pr, suffix)
+            except Exception as exc:
+                self._log(f"[v60 {benchmark.name}] {label}: candidate {idx} "
+                          f"re-run failed ({exc!r}); kept as-is")
 
-        return [r for r in results if r is not None]
+    @staticmethod
+    def _apply_stage_result(states, idx, out_pos, pr, suffix):
+        """Commit a stage's output for candidate idx iff it improved the proxy."""
+        if pr is not None and pr < states[idx]['proxy'] - 1e-9:
+            states[idx]['pos'] = out_pos
+            states[idx]['proxy'] = pr
+            states[idx]['tag'] = states[idx]['tag'] + suffix
 
     @staticmethod
     def _canvas_L(benchmark: Benchmark) -> float:

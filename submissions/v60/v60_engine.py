@@ -47,6 +47,7 @@ from v60_kernels import (
     _total_overlap,
     _extract_raw,
     _parse_plc_routing_params,
+    _quiet_plc,
     _run_batch,
     _congestion_work_tier,
     _build_macro_macro_adjacency,
@@ -622,10 +623,11 @@ class v60_Engine:
         seed_pool = []
 
         if osp.exists(netlist):
-            plc      = PlacementCost(netlist)
             init_plc = osp.join(self.plc_root, benchmark.name, "initial.plc")
-            if osp.exists(init_plc):
-                plc.restore_placement(init_plc, ifInital=True, ifReadComment=True)
+            with _quiet_plc():
+                plc = PlacementCost(netlist)
+                if osp.exists(init_plc):
+                    plc.restore_placement(init_plc, ifInital=True, ifReadComment=True)
 
             for i, pos_np in enumerate(all_pos):
                 ovlp = _total_overlap(pos_np, raw['nH'],

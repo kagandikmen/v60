@@ -18,6 +18,7 @@ and place().
 Not directly runnable — import via v60_engine.py / v60_placer.py.
 """
 
+import contextlib
 import os
 import os.path as osp
 import random
@@ -45,6 +46,20 @@ from macro_place.objective import compute_proxy_cost
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32        = True
+
+
+@contextlib.contextmanager
+def _quiet_plc():
+    """Silence the TILOS PlacementCost banner (the `#[INFO] Reading...`,
+    `#[PLACEMENT GRID]`, ... lines it prints to stdout on construction). Scope
+    this around `PlacementCost(...)` / `restore_placement(...)` only — it
+    redirects stdout, not stderr, so real exceptions and tracebacks still
+    surface. We construct PlacementCost many times (engine restarts, basin-hop,
+    per-candidate refinement forks), so without this the banner repeats dozens
+    of times per benchmark."""
+    with open(os.devnull, 'w') as _devnull:
+        with contextlib.redirect_stdout(_devnull):
+            yield
 
 
 def _congestion_work_tier(benchmark) -> int:

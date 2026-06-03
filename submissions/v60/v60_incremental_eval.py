@@ -264,12 +264,6 @@ class IncrementalEval:
         self.plc_net_cnt    = max(1, plc_net_cnt)
         self.wl_denominator = (self.canvas_w + self.canvas_h) * self.plc_net_cnt
 
-        # Sanity log so the user can spot empty-pin-table bugs immediately.
-        n_nonempty_nets = sum(1 for pis in self.net_pins if pis.size > 0)
-        print(f"[IncrementalEval] N={self.N}  P={self.P}  "
-              f"nets_with_pins={n_nonempty_nets}  "
-              f"plc.net_cnt={self.plc_net_cnt}  "
-              f"macros={self.nM} (hard={self.nH}, ports={self.nP})")
 
     # ───────────────────────────────────────────────────────────────────────
     #  Setup
