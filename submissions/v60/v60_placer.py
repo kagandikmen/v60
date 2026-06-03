@@ -1639,30 +1639,22 @@ class v60_Placer:
                     continue
                 aabb_pass += 1
 
-                # Full real-proxy evaluation of each AABB-legal swap. Commit
-                # both moves, evaluate, then revert both — order of revert
-                # doesn't matter for final state since the moves are disjoint.
+                # Full real-proxy evaluation of each AABB-legal swap, via the
+                # incremental two-macro scorer (no commit, no full re-smooth).
+                # Bit-identical to the old commit-both / proxy / revert-both path.
                 best_new_proxy = cur_proxy
                 best_j = None
                 best_pos_j = None
+                cur_wl = e.compute_wl_cost()
+                pi = (float(pos_i[0]), float(pos_i[1]))
                 for (m_j, pos_j) in cands:
                     full_evals += 1
                     pj = (float(pos_j[0]), float(pos_j[1]))
-                    pi = (float(pos_i[0]), float(pos_i[1]))
-                    st_i = e.delta_for_move(m_i, pj, include_cong=False)
-                    e.commit_move(m_i, pj, st_i)
-                    st_j = e.delta_for_move(m_j, pi, include_cong=False)
-                    e.commit_move(m_j, pi, st_j)
-                    new_proxy = float(e.proxy(include_cong=True))
+                    new_proxy = e.proxy_for_swap(m_i, m_j, pj, pi, cur_wl)
                     if new_proxy < best_new_proxy:
                         best_new_proxy = new_proxy
                         best_j = m_j
                         best_pos_j = pos_j
-                    # Revert.
-                    rev_j = e.delta_for_move(m_j, pj, include_cong=False)
-                    e.commit_move(m_j, pj, rev_j)
-                    rev_i = e.delta_for_move(m_i, pi, include_cong=False)
-                    e.commit_move(m_i, pi, rev_i)
 
                 if best_j is not None and \
                         (cur_proxy - best_new_proxy) >= self.pair_swap_min_improve:
@@ -1867,25 +1859,19 @@ class v60_Placer:
                     continue
                 aabb_pass += 1
 
-                # Full real-proxy eval of every AABB-legal partner.
+                # Full real-proxy eval of every AABB-legal partner, via the
+                # incremental two-macro scorer (no commit, no full re-smooth).
                 best_new_proxy = cur_proxy
                 best = None  # (m_j, pos_j, is_hard_j)
+                cur_wl = e.compute_wl_cost()
+                pi = (float(pos_i[0]), float(pos_i[1]))
                 for (m_j, pos_j, is_hard_j) in cands:
                     full_evals += 1
                     pj = (float(pos_j[0]), float(pos_j[1]))
-                    pi = (float(pos_i[0]), float(pos_i[1]))
-                    st_i = e.delta_for_move(m_i, pj, include_cong=False)
-                    e.commit_move(m_i, pj, st_i)
-                    st_j = e.delta_for_move(m_j, pi, include_cong=False)
-                    e.commit_move(m_j, pi, st_j)
-                    new_proxy = float(e.proxy(include_cong=True))
+                    new_proxy = e.proxy_for_swap(m_i, m_j, pj, pi, cur_wl)
                     if new_proxy < best_new_proxy:
                         best_new_proxy = new_proxy
                         best = (m_j, pos_j, is_hard_j)
-                    rev_j = e.delta_for_move(m_j, pj, include_cong=False)
-                    e.commit_move(m_j, pj, rev_j)
-                    rev_i = e.delta_for_move(m_i, pi, include_cong=False)
-                    e.commit_move(m_i, pi, rev_i)
 
                 if best is not None and \
                         (cur_proxy - best_new_proxy) >= self.soft_pair_swap_min_improve:

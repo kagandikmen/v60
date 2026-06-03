@@ -1192,10 +1192,6 @@ class IncrementalEval:
                             new_xy: Tuple[float, float]) -> float:
         """Cong cost if macro_idx moves to new_xy, computed incrementally from
         the cached assembled grids WITHOUT mutating state."""
-        Gc = self.G_cols; Gr = self.G_rows; sr = self.smooth_range
-        G = Gr * Gc
-        inv_v = (1.0 / self.grid_v_routes) if self.grid_v_routes > 0 else 1.0
-        inv_h = (1.0 / self.grid_h_routes) if self.grid_h_routes > 0 else 1.0
         nets = self.nets_per_macro[macro_idx]
         pins = self.pins_per_macro[macro_idx]
         dV = self._cong_dV; dH = self._cong_dH
@@ -1247,40 +1243,8 @@ class IncrementalEval:
             self._add_macro_blockage(macro_idx, dMV, dMH, sign=+1.0)
             self.macro_pos[macro_idx] = saved_pos
 
-        # Candidate assembled grids = cached + delta at touched cells only.
-        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
-        # V net demand smooths across columns (within ±sr); scatter each changed
-        # source cell's normalised value to its output window.
-        nzv = np.flatnonzero(dV)
-        if nzv.size:
-            rv = nzv // Gc; cv = nzv % Gc
-            wv = (dV[nzv] * inv_v) / self._cntc[cv]
-            for off in range(-sr, sr + 1):
-                tc = cv + off
-                ok = (tc >= 0) & (tc < Gc)
-                flat[rv[ok] * Gc + tc[ok]] += wv[ok]
-            dV[nzv] = 0.0   # reset scratch for next call
-        # H net demand smooths across rows.
-        nzh = np.flatnonzero(dH)
-        if nzh.size:
-            rh = nzh // Gc; ch = nzh % Gc
-            wh = (dH[nzh] * inv_h) / self._cntr[rh]
-            for off in range(-sr, sr + 1):
-                tr = rh + off
-                ok = (tr >= 0) & (tr < Gr)
-                flat[G + tr[ok] * Gc + ch[ok]] += wh[ok]
-            dH[nzh] = 0.0
-        if is_hard:
-            nzmv = np.flatnonzero(dMV)
-            if nzmv.size:
-                flat[nzmv] += dMV[nzmv] * inv_v
-                dMV[nzmv] = 0.0
-            nzmh = np.flatnonzero(dMH)
-            if nzmh.size:
-                flat[G + nzmh] += dMH[nzmh] * inv_h
-                dMH[nzmh] = 0.0
-
-        cong = self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+        # Assemble cached grids + the route/blockage deltas and ABU top-5%.
+        cong = self._scatter_delta_and_abu(is_hard)
         if sig is not None:
             self._cong_sig_cache[sig] = cong
         return cong
@@ -1300,6 +1264,186 @@ class IncrementalEval:
         new_wl  = cur_wl + st['delta_wl']
         new_den = cur_den + st['delta_density']
         new_cong = self._cong_cost_for_move(macro_idx, new_xy)
+        return (WEIGHT_WL * new_wl + WEIGHT_DENSITY * new_den
+                + WEIGHT_CONG * new_cong)
+
+    # ───────────────────────────────────────────────────────────────────────
+    #  Incremental PAIR-SWAP scoring (two macros swap, no commit / no re-smooth)
+    # ───────────────────────────────────────────────────────────────────────
+    #  A swap moves i -> new_i_xy and j -> new_j_xy simultaneously. The proxy of
+    #  the swapped state is scored exactly like proxy_for_move but over BOTH
+    #  macros, with shared nets (nets touching both i and j) handled ONCE so
+    #  their bbox/route reflects both moves. Bit-identical to the old
+    #  commit-i → commit-j → proxy → revert path (validated), but with no
+    #  commit_move churn and no full congestion re-smooth.
+
+    def _scatter_delta_and_abu(self, has_blockage: bool) -> float:
+        """Assemble the candidate congestion grid = cached _cong_Vf/_cong_Hf +
+        the deltas in _cong_dV/_cong_dH (net demand, box-blurred) and
+        _cong_dMV/_cong_dMH (macro blockage, un-smoothed), then ABU top-5%.
+        Resets the delta scratch to zero. Shared by _cong_cost_for_move and
+        _cong_cost_for_swap."""
+        Gc = self.G_cols; Gr = self.G_rows; sr = self.smooth_range
+        G = Gr * Gc
+        inv_v = (1.0 / self.grid_v_routes) if self.grid_v_routes > 0 else 1.0
+        inv_h = (1.0 / self.grid_h_routes) if self.grid_h_routes > 0 else 1.0
+        dV = self._cong_dV; dH = self._cong_dH
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        nzv = np.flatnonzero(dV)
+        if nzv.size:
+            rv = nzv // Gc; cv = nzv % Gc
+            wv = (dV[nzv] * inv_v) / self._cntc[cv]
+            for off in range(-sr, sr + 1):
+                tc = cv + off
+                ok = (tc >= 0) & (tc < Gc)
+                flat[rv[ok] * Gc + tc[ok]] += wv[ok]
+            dV[nzv] = 0.0
+        nzh = np.flatnonzero(dH)
+        if nzh.size:
+            rh = nzh // Gc; ch = nzh % Gc
+            wh = (dH[nzh] * inv_h) / self._cntr[rh]
+            for off in range(-sr, sr + 1):
+                tr = rh + off
+                ok = (tr >= 0) & (tr < Gr)
+                flat[G + tr[ok] * Gc + ch[ok]] += wh[ok]
+            dH[nzh] = 0.0
+        if has_blockage:
+            dMV = self._cong_dMV; dMH = self._cong_dMH
+            nzmv = np.flatnonzero(dMV)
+            if nzmv.size:
+                flat[nzmv] += dMV[nzmv] * inv_v
+                dMV[nzmv] = 0.0
+            nzmh = np.flatnonzero(dMH)
+            if nzmh.size:
+                flat[G + nzmh] += dMH[nzmh] * inv_h
+                dMH[nzmh] = 0.0
+        return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+
+    def _swap_affected_nets(self, i: int, j: int) -> np.ndarray:
+        """Union of i's and j's nets (shared nets appear once)."""
+        return np.union1d(np.asarray(self.nets_per_macro[i]),
+                          np.asarray(self.nets_per_macro[j]))
+
+    def _cong_cost_for_swap(self, i: int, j: int,
+                            new_i_xy: Tuple[float, float],
+                            new_j_xy: Tuple[float, float]) -> float:
+        """Cong cost if macros i and j move to new_i_xy / new_j_xy, computed
+        incrementally (no full re-smooth, no commit)."""
+        dV = self._cong_dV; dH = self._cong_dH
+        affected = self._swap_affected_nets(i, j)
+        # Per-pin gcell cache for the cached re-route: compute each affected
+        # pin's gcell at its CURRENT position ONCE (the old path recomputed every
+        # pin twice — for subtract-old and add-new). Only i's and j's pins change
+        # between the two, so they're overwritten with their swapped gcells in
+        # between. No pin_xy mutation (the cached router reads gc).
+        gc = self._cong_gcell
+        gc.clear()
+        for n in affected:
+            for p in self.net_pins[int(n)]:
+                pi = int(p)
+                if pi not in gc:
+                    gc[pi] = self._grid_cell_for_pos_f32(
+                        np.float32(self.pin_xy[pi, 0]), np.float32(self.pin_xy[pi, 1]))
+        # Subtract OLD routes (current gcells).
+        for n in affected:
+            self._add_net_to_routing_cached(int(n), dV, dH, -1.0, gc)
+        # Overwrite i's and j's pins with their SWAPPED gcells (vectorised).
+        for (m, new_xy) in ((i, new_i_xy), (j, new_j_xy)):
+            pins_m = self.pins_per_macro[m]
+            rows, cols = self._moving_pin_gcells(pins_m, new_xy)
+            pl = pins_m.tolist() if hasattr(pins_m, 'tolist') else list(pins_m)
+            rl = rows.tolist(); cl = cols.tolist()
+            for k in range(len(pl)):
+                gc[pl[k]] = (rl[k], cl[k])
+        # Add NEW routes (swapped gcells).
+        for n in affected:
+            self._add_net_to_routing_cached(int(n), dV, dH, +1.0, gc)
+        # Macro-blockage delta (each hard macro: subtract old, add new).
+        i_hard = i < self.nH; j_hard = j < self.nH
+        has_block = i_hard or j_hard
+        if has_block:
+            dMV = self._cong_dMV; dMH = self._cong_dMH
+            if i_hard:
+                self._add_macro_blockage(i, dMV, dMH, sign=-1.0)
+            if j_hard:
+                self._add_macro_blockage(j, dMV, dMH, sign=-1.0)
+            saved_pi = self.macro_pos[i].copy(); saved_pj = self.macro_pos[j].copy()
+            self.macro_pos[i, 0] = float(new_i_xy[0]); self.macro_pos[i, 1] = float(new_i_xy[1])
+            self.macro_pos[j, 0] = float(new_j_xy[0]); self.macro_pos[j, 1] = float(new_j_xy[1])
+            if i_hard:
+                self._add_macro_blockage(i, dMV, dMH, sign=+1.0)
+            if j_hard:
+                self._add_macro_blockage(j, dMV, dMH, sign=+1.0)
+            self.macro_pos[i] = saved_pi; self.macro_pos[j] = saved_pj
+        return self._scatter_delta_and_abu(has_block)
+
+    def _delta_wl_for_swap(self, i: int, j: int,
+                           new_i_xy: Tuple[float, float],
+                           new_j_xy: Tuple[float, float]) -> float:
+        """Un-normalised total_hpwl delta if i,j swap. Shared nets are counted
+        once with BOTH macros' pins moved (min/max over a net's pins is
+        order-independent, so this matches commit-i-then-commit-j exactly)."""
+        new_pos = {}
+        nix, niy = float(new_i_xy[0]), float(new_i_xy[1])
+        for p in self.pins_per_macro[i]:
+            pi = int(p)
+            new_pos[pi] = (nix + self.pin_offset[pi, 0], niy + self.pin_offset[pi, 1])
+        njx, njy = float(new_j_xy[0]), float(new_j_xy[1])
+        for p in self.pins_per_macro[j]:
+            pj = int(p)
+            new_pos[pj] = (njx + self.pin_offset[pj, 0], njy + self.pin_offset[pj, 1])
+        delta = 0.0
+        for net_idx in self._swap_affected_nets(i, j):
+            net_idx = int(net_idx)
+            pis = self.net_pins[net_idx]
+            if pis.size == 0:
+                continue
+            mnx = math.inf; mxx = -math.inf; mny = math.inf; mxy = -math.inf
+            for p in pis:
+                p_int = int(p)
+                if p_int in new_pos:
+                    px, py = new_pos[p_int]
+                else:
+                    px = float(self.pin_xy[p_int, 0]); py = float(self.pin_xy[p_int, 1])
+                if px < mnx: mnx = px
+                if px > mxx: mxx = px
+                if py < mny: mny = py
+                if py > mxy: mxy = py
+            new_hpwl = self.net_weight[net_idx] * ((mxx - mnx) + (mxy - mny))
+            delta += new_hpwl - self.net_hpwl[net_idx]
+        return delta
+
+    def _density_cost_for_swap(self, i: int, j: int,
+                               new_i_xy: Tuple[float, float],
+                               new_j_xy: Tuple[float, float]) -> float:
+        """Density cost if i,j swap. Applies both macros' footprint deltas to a
+        scratch copy of grid_occupied (same per-cell `+= d` as committing both
+        moves), then scores it — bit-identical to compute_density_cost on the
+        committed swapped grid."""
+        Gc = self.G_cols
+        gflat = self.grid_occupied.reshape(-1)
+        s = getattr(self, '_swap_dens_scratch', None)
+        if s is None or s.shape[0] != gflat.shape[0]:
+            s = self._swap_dens_scratch = np.empty(gflat.shape[0], dtype=np.float64)
+        np.copyto(s, gflat)
+        for (m, new_xy) in ((i, new_i_xy), (j, new_j_xy)):
+            den_state = self._delta_density_for_move(m, new_xy)
+            for (r, c), d in den_state['cells_delta'].items():
+                s[r * Gc + c] += d
+        return self.compute_density_cost(
+            grid_occupied=s.reshape(self.G_rows, self.G_cols))
+
+    def proxy_for_swap(self, i: int, j: int,
+                       new_i_xy: Tuple[float, float],
+                       new_j_xy: Tuple[float, float],
+                       cur_wl: Optional[float] = None) -> float:
+        """Proxy if macros i and j swap to new_i_xy / new_j_xy, WITHOUT
+        committing. Pass cur_wl (current WL cost) to skip recomputing it."""
+        if cur_wl is None:
+            cur_wl = self.compute_wl_cost()
+        new_wl = cur_wl + self._delta_wl_for_swap(i, j, new_i_xy, new_j_xy) / self.wl_denominator
+        new_den = self._density_cost_for_swap(i, j, new_i_xy, new_j_xy)
+        new_cong = self._cong_cost_for_swap(i, j, new_i_xy, new_j_xy)
         return (WEIGHT_WL * new_wl + WEIGHT_DENSITY * new_den
                 + WEIGHT_CONG * new_cong)
 
