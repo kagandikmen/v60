@@ -57,6 +57,122 @@ from v60_incremental_eval import (
 )
 
 
+def _chunk_contiguous(seq, k):
+    """Split `seq` into <=k contiguous chunks, sizes balanced (extras go to the
+    earliest chunks, so any empty chunks are trailing — concatenating the chunk
+    results back preserves the original order)."""
+    n = len(seq)
+    k = max(1, min(k, n)) if n else 1
+    base, rem = divmod(n, k)
+    out, i = [], 0
+    for j in range(k):
+        sz = base + (1 if j < rem else 0)
+        out.append(seq[i:i + sz]); i += sz
+    return out
+
+
+def _cd_score_worker(conn, e):
+    """CD candidate-scoring worker. Owns a forked copy of the IncrementalEval
+    `e`, kept in sync with the parent by replaying every committed move.
+
+    Protocol (parent -> worker):
+      ('s', m_i, [xy...], cur_wl, cur_den) -> sends back [proxy...] for the slice
+      ('c', m_i, xy)                       -> commit_move on the local copy (no reply)
+      ('x',)                               -> exit
+    The scorer (proxy_for_move) is read-only except for `e`'s private scratch,
+    so each worker's copy stays bit-identical to the parent's as long as the
+    same move stream is applied."""
+    try:
+        while True:
+            msg = conn.recv()
+            tag = msg[0]
+            if tag == 's':
+                _, m_i, cands, cur_wl, cur_den = msg
+                conn.send([e.proxy_for_move(m_i, xy, cur_wl, cur_den) for xy in cands])
+            elif tag == 'c':
+                _, m_i, xy = msg
+                st = e.delta_for_move(m_i, xy, include_cong=False)
+                e.commit_move(m_i, xy, st)
+            else:  # 'x' or anything unexpected
+                break
+    except (EOFError, KeyboardInterrupt, BrokenPipeError):
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+class _CDScorePool:
+    """Fork-based pool that scores CD candidates across cores. Each worker holds
+    a copy of the parent's IncrementalEval (inherited at fork) and is kept in
+    sync by replaying committed moves. The parent participates as one scorer, so
+    `n_workers` child processes + the parent give `n_workers + 1` scorers.
+
+    Must be created from a non-daemon process (daemon processes can't fork
+    children). Bit-identical to sequential scoring: every worker computes the
+    same proxy the parent would, and the parent does the argmin/tie-break."""
+
+    def __init__(self, n_workers, e):
+        self.n = max(0, int(n_workers))
+        self.conns = []
+        self.procs = []
+        if self.n == 0:
+            return
+        ctx = mp.get_context('fork')
+        for _ in range(self.n):
+            parent_conn, child_conn = ctx.Pipe()
+            p = ctx.Process(target=_cd_score_worker, args=(child_conn, e),
+                            daemon=True)
+            p.start()
+            child_conn.close()   # parent keeps only its end
+            self.conns.append(parent_conn)
+            self.procs.append(p)
+
+    @property
+    def active(self):
+        return self.n > 0
+
+    def score(self, m_i, cands, cur_wl, cur_den, e):
+        """Return proxies for `cands` (in order). Parent scores the first chunk
+        while the workers score the rest, then results are concatenated."""
+        chunks = _chunk_contiguous(cands, self.n + 1)
+        sent = []
+        for conn, ch in zip(self.conns, chunks[1:]):
+            if ch:
+                conn.send(('s', m_i, ch, cur_wl, cur_den))
+                sent.append(conn)
+        out = [e.proxy_for_move(m_i, xy, cur_wl, cur_den) for xy in chunks[0]]
+        for conn in sent:
+            out.extend(conn.recv())
+        return out
+
+    def commit(self, m_i, xy):
+        """Broadcast a committed move so every worker's copy stays in sync."""
+        for conn in self.conns:
+            conn.send(('c', m_i, xy))
+
+    def close(self):
+        for conn in self.conns:
+            try:
+                conn.send(('x',))
+            except Exception:
+                pass
+        for p in self.procs:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.terminate()
+        for conn in self.conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.conns = []
+        self.procs = []
+        self.n = 0
+
+
 def _set_deterministic(seed: int = 0) -> None:
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
     random.seed(seed)
@@ -190,6 +306,16 @@ class v60_Placer:
         cd_polish_min_sweep_improve_frac: float = 0.001,   # 0.1% relative
         cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
         cd_polish_verbose: bool = True,
+        # CD per-macro candidate scoring is parallelised across a fork pool of
+        # synced IncrementalEval copies (bit-identical to sequential; see
+        # _CDScorePool). This value is the inner pool size PER post-Stage-2
+        # candidate: all candidates stay concurrent (quality preserved — same set
+        # polished as before), and each gets its own `cd_polish_parallel_workers`
+        # workers. _run_cpu_side caps outer_wave × inner at cpu_count so it never
+        # oversubscribes. 'auto' -> min(4, cpu_count) (8 candidates × 4 = 32
+        # cores, comfortably parallel without the thrash the 8×16=128 attempt
+        # hit). 1 disables it (old single-thread daemon forks).
+        cd_polish_parallel_workers='auto',
         # -- v60 pair-swap polish (hard-hard position swaps after CD polish) ---
         # Coordinate descent over PAIRS of hard macros: for each hard macro
         # m_i, consider swapping positions with each of its k-nearest hard
@@ -306,6 +432,10 @@ class v60_Placer:
         self.cd_polish_min_sweep_improve_frac = float(cd_polish_min_sweep_improve_frac)
         self.cd_polish_include_hard = bool(cd_polish_include_hard)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
+        if cd_polish_parallel_workers == 'auto':
+            self.cd_polish_parallel_workers = min(4, os.cpu_count() or 1)
+        else:
+            self.cd_polish_parallel_workers = max(1, int(cd_polish_parallel_workers))
         self.pair_swap_enabled       = bool(pair_swap_enabled)
         self.pair_swap_sweeps        = int(pair_swap_sweeps)
         self.pair_swap_k_neighbors   = max(1, int(pair_swap_k_neighbors))
@@ -540,7 +670,6 @@ class v60_Placer:
                 f"[v60 {benchmark.name}] CPU side: polishing {len(cpu_cands)} "
                 f"candidate(s)  (gpu pool={len(cand_pool)})  total {time.time()-t0:.1f}s"
             )
-
             results = self._run_cpu_side(cpu_cands, benchmark, plc)
             for (rpos, rproxy, rtag) in results:
                 if rproxy < best_proxy - 1e-9:
@@ -647,10 +776,12 @@ class v60_Placer:
 
         return candidates
 
-    def _cpu_side(self, cand_pos, cand_proxy, cand_tag, benchmark, plc, t0=None):
+    def _cpu_side(self, cand_pos, cand_proxy, cand_tag, benchmark, plc, t0=None,
+                  cd_max_workers=1):
         """CPU-side refinement (CD polish -> hard pair-swap -> soft pair-swap)
         from one candidate. Returns (pos tensor, proxy, tag). Self-contained so
-        it can run in a worker process."""
+        it can run in a worker process. `cd_max_workers > 1` parallelises CD's
+        candidate scoring (only valid when this runs in a non-daemon process)."""
         if t0 is None:
             t0 = time.time()
         best_pos   = cand_pos
@@ -659,7 +790,8 @@ class v60_Placer:
 
         if (self.cd_polish_enabled and best_pos is not None
                 and math.isfinite(best_proxy) and plc is not None):
-            cd_out, cd_costs = self._cd_polish(best_pos, benchmark, plc)
+            cd_out, cd_costs = self._cd_polish(best_pos, benchmark, plc,
+                                               max_workers=cd_max_workers)
             if cd_costs is not None and float(cd_costs['proxy_cost']) < best_proxy - 1e-9:
                 best_pos   = cd_out
                 best_proxy = float(cd_costs['proxy_cost'])
@@ -701,16 +833,32 @@ class v60_Placer:
         if not cpu_cands:
             return []
 
+        cpu_count = os.cpu_count() or 1
+        par = self.cd_polish_parallel_workers   # inner CD workers PER candidate (1=off)
+
+        if self.post_stage2_cpu_max_workers == 'auto':
+            max_workers = min(len(cpu_cands), cpu_count)
+        else:
+            max_workers = max(1, min(int(self.post_stage2_cpu_max_workers), len(cpu_cands)))
+
+        # Each concurrent outer fork (one candidate) gets its own inner CD pool
+        # of `cd_workers` synced copies. Cap the product (outer wave × inner) at
+        # the core count so we never oversubscribe (the 8×16=128 attempt thrashed
+        # and timed out). cd_workers==1 => no inner pool => outer forks stay
+        # daemon (clean-kill, old behaviour); cd_workers>1 => outer forks must be
+        # NON-daemon to be allowed to spawn the inner pool.
+        if par > 1:
+            cd_workers = max(1, min(int(par), cpu_count // max(1, max_workers)))
+        else:
+            cd_workers = 1
+
         def _seq_one(c):
-            return self._cpu_side(c['pos'], c['proxy'], c['tag'], benchmark, plc)
+            # Lone candidate in this (main) process: give it the full inner pool.
+            return self._cpu_side(c['pos'], c['proxy'], c['tag'], benchmark, plc,
+                                  cd_max_workers=max(1, int(par)))
 
         if (not self.post_stage2_cpu_parallel) or len(cpu_cands) == 1:
             return [_seq_one(c) for c in cpu_cands]
-
-        if self.post_stage2_cpu_max_workers == 'auto':
-            max_workers = min(len(cpu_cands), os.cpu_count() or 1)
-        else:
-            max_workers = max(1, min(int(self.post_stage2_cpu_max_workers), len(cpu_cands)))
 
         try:
             ctx = mp.get_context('fork')
@@ -723,7 +871,8 @@ class v60_Placer:
             # Inherited via fork; never pickled. Only the result is sent back.
             try:
                 pos, proxy, tag = self._cpu_side(
-                    cand['pos'], cand['proxy'], cand['tag'], benchmark, plc)
+                    cand['pos'], cand['proxy'], cand['tag'], benchmark, plc,
+                    cd_max_workers=cd_workers)
                 q.put((idx, pos[:nM].detach().cpu().numpy().astype(np.float64),
                        float(proxy), tag))
             except Exception as exc:  # report; parent re-runs this idx
@@ -732,9 +881,13 @@ class v60_Placer:
         results = [None] * len(cpu_cands)
         failed = []
         n = len(cpu_cands)
+        # Non-daemon only when each fork spawns an inner CD pool (daemon
+        # processes can't have children); else keep the old daemon forks.
+        outer_daemon = (cd_workers <= 1)
         self._log(
             f"[v60 {benchmark.name}] CPU side: {n} candidate(s), "
-            f"fork pool max_workers={max_workers}"
+            f"fork pool max_workers={max_workers}  cd_workers={cd_workers}"
+            f"{'' if outer_daemon else '  (non-daemon, nested CD pools)'}"
         )
         for ws in range(0, n, max_workers):
             wave = list(range(ws, min(ws + max_workers, n)))
@@ -742,7 +895,7 @@ class v60_Placer:
             procs = {}
             for idx in wave:
                 p = ctx.Process(target=_child, args=(idx, cpu_cands[idx], q),
-                                daemon=True)
+                                daemon=outer_daemon)
                 p.start()
                 procs[idx] = p
             # Each child sends exactly one message (result or error sentinel),
@@ -996,9 +1149,16 @@ class v60_Placer:
         placement: torch.Tensor,
         benchmark: Benchmark,
         plc: PlacementCost,
+        max_workers: int = 1,
     ):
         """Single-macro coordinate descent over movable macros (soft and,
         if `cd_polish_include_hard`, hard too) using IncrementalEval.
+
+        `max_workers > 1` parallelises the per-macro candidate scoring across a
+        fork pool of synced IncrementalEval copies (see _CDScorePool). Results
+        are bit-identical to the sequential path (the parent still does the
+        argmin/tie-break and the same commit stream is replayed to every
+        worker). Must be called from a non-daemon process.
 
         Strategy per macro:
           1. Enumerate candidate offsets (cd_polish_num_directions evenly-spaced
@@ -1087,8 +1247,60 @@ class v60_Placer:
             hard_aabb[m, 3] = cy + hh
 
         rng = np.random.default_rng(self.seed if self.deterministic else None)
+
+        # Parallel candidate scoring: fork a pool of synced IncrementalEval
+        # copies; the parent + (max_workers-1) workers share the per-macro
+        # candidate scan. Bit-identical to sequential (argmin + commit stream are
+        # parent-driven). Only parallelise macros with enough candidates to
+        # amortise the per-macro IPC round-trip.
+        pool = None
+        if max_workers > 1:
+            try:
+                pool = _CDScorePool(int(max_workers) - 1, e)
+                self._cd_log(
+                    f"[v60 {benchmark.name}] CD parallel scoring: "
+                    f"{max_workers} scorers ({pool.n} workers + parent)"
+                )
+            except Exception as exc:
+                self._cd_log(f"[v60 {benchmark.name}] CD pool init failed "
+                             f"({exc}); scoring sequentially")
+                pool = None
+        par_threshold = max(8, 2 * max_workers)   # min candidates to go parallel
+
+        try:
+            cur_proxy, total_moved = self._cd_run_sweeps(
+                e, benchmark, target_idx, nH, cw, ch, base_step, dirs, step_mults,
+                hard_aabb, rng, cur_proxy, pool, par_threshold, t0)
+        finally:
+            if pool is not None:
+                pool.close()
+
+        # Return polished placement.
+        out = placement.clone()
+        out[:nM] = torch.tensor(e.macro_pos, dtype=out.dtype)
+        br = e.proxy_breakdown(include_cong=True)
+        costs = {
+            'proxy_cost':      br['proxy_cost'],
+            'wirelength_cost': br['wirelength_cost'],
+            'density_cost':    br['density_cost'],
+            'congestion_cost': br['congestion_cost'],
+        }
+        self._cd_log(
+            f"[v60 {benchmark.name}] CD polish done: "
+            f"total_moved={total_moved} proxy={cur_proxy:.6f}  "
+            f"wl={costs['wirelength_cost']:.3f} den={costs['density_cost']:.3f} "
+            f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
+        )
+        return out, costs
+
+    def _cd_run_sweeps(self, e, benchmark, target_idx, nH, cw, ch, base_step,
+                       dirs, step_mults, hard_aabb, rng, cur_proxy, pool,
+                       par_threshold, t0):
+        """The CD sweep loop, factored out so _cd_polish can wrap it in a
+        try/finally that guarantees the score pool is torn down. Returns the
+        final cur_proxy; mutates `e` in place (committed moves)."""
         total_moved = 0
-        zero_streak = 0   # consecutive zero-move sweeps for patience-based stop
+        zero_streak = 0
 
         for sweep in range(self.cd_polish_sweeps):
             proxy_before_sweep = cur_proxy
@@ -1156,19 +1368,32 @@ class v60_Placer:
                 cur_den = e.compute_density_cost()
                 base_proxy = (WEIGHT_WL * cur_wl + WEIGHT_DENSITY * cur_den
                               + WEIGHT_CONG * e.cong_cost())
+                # Score candidates: parallel across the pool when there are
+                # enough to amortise the IPC, else sequentially in this process.
+                # Either way the proxies come back in `cands` order, and the
+                # argmin below uses the same strict-< / first-index tie-break as
+                # the original sequential loop -> bit-identical move selection.
+                if pool is not None and len(cands) >= par_threshold:
+                    proxies = pool.score(m_i, cands, cur_wl, cur_den, e)
+                else:
+                    proxies = [e.proxy_for_move(m_i, xy, cur_wl, cur_den)
+                               for xy in cands]
                 best_new_proxy = base_proxy
                 best_new_xy = None
-                for new_xy in cands:
-                    new_proxy = e.proxy_for_move(m_i, new_xy, cur_wl, cur_den)
+                for new_xy, new_proxy in zip(cands, proxies):
                     if new_proxy < best_new_proxy:
                         best_new_proxy = new_proxy
                         best_new_xy = new_xy
 
                 if best_new_xy is not None and \
                         (base_proxy - best_new_proxy) >= self.cd_polish_min_improve:
-                    # Commit the winning candidate.
+                    # Commit the winning candidate (parent), then replay it to
+                    # the pool workers so their IncrementalEval copies stay in
+                    # sync for the next macro's scoring.
                     final_st = e.delta_for_move(m_i, best_new_xy, include_cong=False)
                     e.commit_move(m_i, best_new_xy, final_st)
+                    if pool is not None:
+                        pool.commit(m_i, best_new_xy)
                     cur_proxy = best_new_proxy
                     moved_this_sweep += 1
                     # Refresh the AABB so subsequent overlap checks see the new
@@ -1216,25 +1441,7 @@ class v60_Placer:
             else:
                 zero_streak = 0
 
-        # Return polished placement.
-        out = placement.clone()
-        out[:nM] = torch.tensor(e.macro_pos, dtype=out.dtype)
-        # Also return a dict resembling compute_proxy_cost's output, computed
-        # from the IncrementalEval caches we already have populated.
-        br = e.proxy_breakdown(include_cong=True)
-        costs = {
-            'proxy_cost':      br['proxy_cost'],
-            'wirelength_cost': br['wirelength_cost'],
-            'density_cost':    br['density_cost'],
-            'congestion_cost': br['congestion_cost'],
-        }
-        self._cd_log(
-            f"[v60 {benchmark.name}] CD polish done: "
-            f"total_moved={total_moved} proxy={cur_proxy:.6f}  "
-            f"wl={costs['wirelength_cost']:.3f} den={costs['density_cost']:.3f} "
-            f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
-        )
-        return out, costs
+        return cur_proxy, total_moved
 
     def _pair_swap_polish(
         self,
