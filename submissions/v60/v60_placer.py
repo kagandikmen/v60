@@ -687,6 +687,18 @@ class v60_Placer:
                 seen.add(key)
                 deduped.append(c)
             cpu_cands = deduped[: self.post_stage2_n_cpu]
+            # Optional: dump the pre-refinement candidate pool to disk so the
+            # CPU refinement stages can be developed/A-B'd in isolation without
+            # re-running the (expensive) engine. Off by default — only active
+            # when `refine_cache_dir` is set (see refine_bench.py). With
+            # `refine_dump_only` we stop here and skip refinement entirely.
+            if getattr(self, 'refine_cache_dir', None):
+                self._dump_refine_cache(cpu_cands, benchmark, t0)
+                if getattr(self, 'refine_dump_only', False):
+                    self._log(
+                        f"[v60 {benchmark.name}] refine-cache: dump-only, "
+                        f"skipping refinement.")
+                    return best_pos
             results = self._run_cpu_side(
                 cpu_cands, benchmark, plc, gpu_pool=len(cand_pool), t0=t0)
             for (rpos, rproxy, rtag) in results:
@@ -698,6 +710,35 @@ class v60_Placer:
             )
 
         return best_pos
+
+    def _dump_refine_cache(self, cpu_cands, benchmark, t0):
+        """Dump the pre-refinement candidate pool (full placement tensors +
+        metadata) to `self.refine_cache_dir`. Used by refine_bench.py to test
+        the CPU refinement stages from a fixed input without paying the engine
+        cost each time. Each candidate's positions are saved as float64 .npy;
+        a JSON sidecar records benchmark dims, tags, and starting proxies."""
+        import json
+        d = self.refine_cache_dir
+        os.makedirs(d, exist_ok=True)
+        meta = {
+            'benchmark':       benchmark.name,
+            'num_macros':      int(benchmark.num_macros),
+            'num_hard_macros': int(benchmark.num_hard_macros),
+            'candidates':      [],
+        }
+        for i, c in enumerate(cpu_cands):
+            pos_np = c['pos'].detach().cpu().numpy().astype(np.float64)
+            fname = f"{benchmark.name}_cand{i}.npy"
+            np.save(osp.join(d, fname), pos_np)
+            meta['candidates'].append({
+                'index': i, 'tag': c['tag'],
+                'proxy': float(c['proxy']), 'file': fname,
+            })
+        with open(osp.join(d, f"{benchmark.name}_meta.json"), 'w') as f:
+            json.dump(meta, f, indent=2)
+        self._log(
+            f"[v60 {benchmark.name}] refine-cache: dumped {len(cpu_cands)} "
+            f"candidate(s) to {d}  total {time.time()-t0:.1f}s")
 
     def _gpu_basinhop(self, seed_pos_np, seed_proxy, benchmark, plc, winner_cohort,
                       mov_idx, scale, label):
