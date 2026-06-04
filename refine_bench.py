@@ -98,7 +98,11 @@ def cmd_run(args):
         sys.exit(f"[bench] candidate {args.cand} out of range "
                  f"(cache has {len(cands)})")
     cand = cands[args.cand]
-    pos_np = np.load(osp.join(args.cache_dir, cand["file"]))
+    if args.load_pos:
+        pos_np = np.load(args.load_pos)
+        print(f"[bench] starting from {args.load_pos} (overrides cached cand)")
+    else:
+        pos_np = np.load(osp.join(args.cache_dir, cand["file"]))
     pos_t = torch.tensor(pos_np, dtype=torch.float64)
 
     # Fresh placer with defaults. deterministic=True only seeds the refinement
@@ -155,6 +159,11 @@ def cmd_run(args):
           f"Δ={start_bd['proxy_cost']-final['proxy_cost']:+.6f})  "
           f"total {time.time()-t_all:.1f}s")
 
+    if args.save_out:
+        nM = int(benchmark.num_macros)
+        np.save(args.save_out, cur[:nM].detach().cpu().numpy().astype(np.float64))
+        print(f"[bench] saved final placement -> {args.save_out}")
+
 
 def main():
     p = argparse.ArgumentParser(
@@ -178,6 +187,11 @@ def main():
                     default="cd")
     pr.add_argument("--cand", type=int, default=0,
                     help="which cached candidate (0 = best)")
+    pr.add_argument("--load-pos", default=None,
+                    help="start from this .npy placement instead of the cache "
+                         "(e.g. a saved post-CD placement to A/B a later stage)")
+    pr.add_argument("--save-out", default=None,
+                    help="save the final placement to this .npy")
     pr.add_argument("--sweeps", type=int, default=None,
                     help="override sweeps for all stages (fast-signal A/B)")
     pr.add_argument("--workers", type=int, default=1,
