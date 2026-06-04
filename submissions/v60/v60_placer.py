@@ -623,10 +623,9 @@ class v60_Placer:
             legal if legal else scored, key=lambda c: c[1]
         )
 
-        proxy_str = '  '.join(f'{tag}={p:.4f}' for tag, p, _, _ in scored)
         self._log(
-            f"[v60 {benchmark.name}] {proxy_str}  winner={best_tag}  "
-            f"best={best_proxy:.4f}  total {time.time()-t0:.1f}s"
+            f"[v60 {benchmark.name}] engine best={best_proxy:.4f}  "
+            f"total {time.time()-t0:.1f}s"
         )
 
         # ── Multi-candidate post-Stage-2 refinement ──────────────────────
@@ -688,11 +687,8 @@ class v60_Placer:
                 seen.add(key)
                 deduped.append(c)
             cpu_cands = deduped[: self.post_stage2_n_cpu]
-            self._log(
-                f"[v60 {benchmark.name}] CPU side: polishing {len(cpu_cands)} "
-                f"candidate(s)  (gpu pool={len(cand_pool)})  total {time.time()-t0:.1f}s"
-            )
-            results = self._run_cpu_side(cpu_cands, benchmark, plc)
+            results = self._run_cpu_side(
+                cpu_cands, benchmark, plc, gpu_pool=len(cand_pool), t0=t0)
             for (rpos, rproxy, rtag) in results:
                 if rproxy < best_proxy - 1e-9:
                     best_pos, best_proxy, best_tag = rpos, rproxy, rtag
@@ -837,7 +833,7 @@ class v60_Placer:
 
         return best_pos, best_proxy, best_tag
 
-    def _run_cpu_side(self, cpu_cands, benchmark, plc):
+    def _run_cpu_side(self, cpu_cands, benchmark, plc, gpu_pool=None, t0=None):
         """Run the CPU refinement (CD polish -> hard pair-swap -> soft pair-swap)
         over the candidates; return a list of (pos tensor, proxy, tag).
 
@@ -873,19 +869,26 @@ class v60_Placer:
         else:
             cd_workers = 1
 
+        n = len(cpu_cands)
+        pool_str = f"  (gpu pool={gpu_pool})" if gpu_pool is not None else ""
+        tot_str  = f"  total {time.time()-t0:.1f}s" if t0 is not None else ""
+
         # Sequential fallback (single candidate or parallelism off): run the full
         # chain per candidate in this process; logs stream in order.
         if (not self.post_stage2_cpu_parallel) or len(cpu_cands) == 1:
+            self._log(
+                f"[v60 {benchmark.name}] CPU side: polishing {n} candidate(s)"
+                f"{pool_str}{tot_str}  (sequential)"
+            )
             return [self._cpu_side(c['pos'], c['proxy'], c['tag'], benchmark, plc,
                                    cd_max_workers=max(1, int(par)))
                     for c in cpu_cands]
 
-        n = len(cpu_cands)
         states = [{'pos': c['pos'], 'proxy': float(c['proxy']), 'tag': c['tag']}
                   for c in cpu_cands]
         self._log(
-            f"[v60 {benchmark.name}] CPU side: {n} candidates  "
-            f"max_workers={max_workers} cd_workers={cd_workers}  "
+            f"[v60 {benchmark.name}] CPU side: polishing {n} candidate(s)"
+            f"{pool_str}{tot_str}  max_workers={max_workers} cd_workers={cd_workers}  "
             f"(per stage: candidate 0 streams live, then candidates 1..{n - 1} "
             f"print in order)"
         )
@@ -1318,7 +1321,7 @@ class v60_Placer:
             f"nS={n_soft_targets} nH={n_hard_targets} (include_hard={self.cd_polish_include_hard})  "
             f"sweeps={self.cd_polish_sweeps}  "
             f"step_frac={self.cd_polish_step_frac:.4f}  "
-            f"step_set={self.cd_polish_step_set}  full-eval (no cheap filter)"
+            f"step_set={self.cd_polish_step_set}"
         )
         t0 = time.time()
 
@@ -1581,8 +1584,7 @@ class v60_Placer:
         self._swap_log(
             f"[v60 {benchmark.name}] pair-swap start: proxy={cur_proxy:.6f}  "
             f"nT={int(target_idx.size)}  sweeps={self.pair_swap_sweeps}  "
-            f"k_neighbors={self.pair_swap_k_neighbors}  k_co_net={self.pair_swap_k_co_net}  "
-            f"multi_swap=on"
+            f"k_neighbors={self.pair_swap_k_neighbors}  k_co_net={self.pair_swap_k_co_net}"
         )
         t0 = time.time()
 
@@ -1845,7 +1847,7 @@ class v60_Placer:
         self._soft_swap_log(
             f"[v60 {benchmark.name}] soft-pair-swap start: proxy={cur_proxy:.6f}  "
             f"nT={int(target_idx.size)}  sweeps={self.soft_pair_swap_sweeps}  "
-            f"k_co_net={self.soft_pair_swap_k_co_net}  multi_swap=on  filter=real-proxy"
+            f"k_co_net={self.soft_pair_swap_k_co_net}"
         )
         t0 = time.time()
 
