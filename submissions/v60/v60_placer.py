@@ -1,26 +1,30 @@
 """
-Analytical Placer v60 — v59 set plus soft-only polish
+Analytical Placer v60 — orchestrator.
 
-This is the file to run. v60_placer.py is the orchestrator: it drives the
-v60 engine (v60_engine.py), then a basin-hop wrapper and a soft-only
-Stage 2 polish on top.
+This is the file to run. v60_placer.py drives the placement engine
+(v60_engine.py, which clusters hard macros via K-means on the 2D Fiedler
+embedding and runs the three-stage gradient descent), then layers several
+refinement stages on top of the engine's best seeds:
 
-v60 starts from the v59 single-cohort orchestrator, then freezes hard macros
-and re-optimizes only soft macros from the base placement. The engine
-clusters hard macros via K-means on the 2D Fiedler embedding.
+  - a basin-hopping wrapper (perturb-and-reminimize),
+  - a soft-only Stage 2 polish (hard macros frozen),
+  - real-proxy coordinate-descent (CD) polish, and
+  - hard-hard and soft-soft pair-swap polish.
 
-Wall-time savings vs v57: ~3x for the base run. v60 adds a local
-soft-only Stage 2 polish after the base placement.
+A multi-candidate path runs the top engine seeds through these stages and
+keeps the best final placement.
 
 The engine lives in v60_engine.py.
-No v60 module imports across version boundaries.
 
 Usage:
-    uv run evaluate submissions/examples/v60_placer.py -b ibm01
-    uv run evaluate submissions/examples/v60_placer.py --all
+    uv run evaluate submissions/v60/v60_placer.py -b ibm01
+    uv run evaluate submissions/v60/v60_placer.py --all
 """
 
+import contextlib
+import io
 import math
+import multiprocessing as mp
 import os
 import os.path as osp
 import random
@@ -47,10 +51,128 @@ from macro_place.objective import compute_proxy_cost
 
 from v60_engine import v60_Engine
 from v60_kernels   import (
-    _DiagLogger, _resolve_log_path, _basin_hop, _congestion_work_tier,
-    _extract_raw, _parse_plc_routing_params, _run_batch,
+    _basin_hop, _congestion_work_tier,
+    _extract_raw, _parse_plc_routing_params, _quiet_plc, _run_batch,
 )
-from v60_incremental_eval import IncrementalEval
+from v60_incremental_eval import (
+    IncrementalEval, WEIGHT_WL, WEIGHT_DENSITY, WEIGHT_CONG,
+)
+
+
+def _chunk_contiguous(seq, k):
+    """Split `seq` into <=k contiguous chunks, sizes balanced (extras go to the
+    earliest chunks, so any empty chunks are trailing — concatenating the chunk
+    results back preserves the original order)."""
+    n = len(seq)
+    k = max(1, min(k, n)) if n else 1
+    base, rem = divmod(n, k)
+    out, i = [], 0
+    for j in range(k):
+        sz = base + (1 if j < rem else 0)
+        out.append(seq[i:i + sz]); i += sz
+    return out
+
+
+def _cd_score_worker(conn, e):
+    """CD candidate-scoring worker. Owns a forked copy of the IncrementalEval
+    `e`, kept in sync with the parent by replaying every committed move.
+
+    Protocol (parent -> worker):
+      ('s', m_i, [xy...], cur_wl, cur_den) -> sends back [proxy...] for the slice
+      ('c', m_i, xy)                       -> commit_move on the local copy (no reply)
+      ('x',)                               -> exit
+    The scorer (proxy_for_move) is read-only except for `e`'s private scratch,
+    so each worker's copy stays bit-identical to the parent's as long as the
+    same move stream is applied."""
+    try:
+        while True:
+            msg = conn.recv()
+            tag = msg[0]
+            if tag == 's':
+                _, m_i, cands, cur_wl, cur_den = msg
+                conn.send([e.proxy_for_move(m_i, xy, cur_wl, cur_den) for xy in cands])
+            elif tag == 'c':
+                _, m_i, xy = msg
+                st = e.delta_for_move(m_i, xy, include_cong=False)
+                e.commit_move(m_i, xy, st)
+            else:  # 'x' or anything unexpected
+                break
+    except (EOFError, KeyboardInterrupt, BrokenPipeError):
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+class _CDScorePool:
+    """Fork-based pool that scores CD candidates across cores. Each worker holds
+    a copy of the parent's IncrementalEval (inherited at fork) and is kept in
+    sync by replaying committed moves. The parent participates as one scorer, so
+    `n_workers` child processes + the parent give `n_workers + 1` scorers.
+
+    Must be created from a non-daemon process (daemon processes can't fork
+    children). Bit-identical to sequential scoring: every worker computes the
+    same proxy the parent would, and the parent does the argmin/tie-break."""
+
+    def __init__(self, n_workers, e):
+        self.n = max(0, int(n_workers))
+        self.conns = []
+        self.procs = []
+        if self.n == 0:
+            return
+        ctx = mp.get_context('fork')
+        for _ in range(self.n):
+            parent_conn, child_conn = ctx.Pipe()
+            p = ctx.Process(target=_cd_score_worker, args=(child_conn, e),
+                            daemon=True)
+            p.start()
+            child_conn.close()   # parent keeps only its end
+            self.conns.append(parent_conn)
+            self.procs.append(p)
+
+    @property
+    def active(self):
+        return self.n > 0
+
+    def score(self, m_i, cands, cur_wl, cur_den, e):
+        """Return proxies for `cands` (in order). Parent scores the first chunk
+        while the workers score the rest, then results are concatenated."""
+        chunks = _chunk_contiguous(cands, self.n + 1)
+        sent = []
+        for conn, ch in zip(self.conns, chunks[1:]):
+            if ch:
+                conn.send(('s', m_i, ch, cur_wl, cur_den))
+                sent.append(conn)
+        out = [e.proxy_for_move(m_i, xy, cur_wl, cur_den) for xy in chunks[0]]
+        for conn in sent:
+            out.extend(conn.recv())
+        return out
+
+    def commit(self, m_i, xy):
+        """Broadcast a committed move so every worker's copy stays in sync."""
+        for conn in self.conns:
+            conn.send(('c', m_i, xy))
+
+    def close(self):
+        for conn in self.conns:
+            try:
+                conn.send(('x',))
+            except Exception:
+                pass
+        for p in self.procs:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.terminate()
+        for conn in self.conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.conns = []
+        self.procs = []
+        self.n = 0
 
 
 def _set_deterministic(seed: int = 0) -> None:
@@ -80,8 +202,8 @@ def _set_fast_nondeterministic() -> None:
 
 class v60_Placer:
     """
-    v60 orchestrator: runs the v60 engine, then the inherited basin-hop
-    wrapper plus a soft-only Stage 2 polish on top.
+    v60 orchestrator: runs the engine, then a basin-hop wrapper, a
+    soft-only Stage 2 polish, real-proxy CD polish, and pair-swap polish.
 
     The engine clusters hard macros via K-means on the 2D Fiedler
     embedding (see v60_engine.py).
@@ -118,16 +240,6 @@ class v60_Placer:
         verbose: bool = True,
         deterministic: bool = False,   # production default: keep TF32 / fast kernels on
         seed: int           = 0,
-        # ── "Logging final boss". When log_dir is set, a single per-benchmark
-        # JSONL is opened by the orchestrator and threaded into the cohort so
-        # every Stage 0/1/2 step, per-seed final position, legalization
-        # delta and per-seed score lands in one trace. Default OFF.
-        log_dir:           str = None,
-        log_every_n_steps: int = 50,
-        # Per-step per-seed full hard-macro positions in the JSONL trace.
-        # Costs ~50MB/run on 24 seeds × 246 macros × 100 sampled steps.
-        # The cheap centroid+spread aggregates always log either way.
-        log_positions_per_step: bool = False,   # v60 debug
         # ── Basin-hopping wrapper (v60). After the cohort run, perturb
         # the running-best placement and re-run Stage 2 from it, with a
         # promising-seed priority queue + visited-basin tabu list (see
@@ -142,28 +254,28 @@ class v60_Placer:
         #     flagged as the same basin and we stop spawning around it.
         #   - improve_quota ends the hop loop after 3 non-improving hops to
         #     hand the freed budget to final_explore.
-        #   - B per hop dropped from inherited 32 to 8; max_hops/final_explore
-        #     bumped to use the freed wall-time on more hop attempts.
+        #   - B per hop is small (8) so the freed wall-time goes to more hop
+        #     attempts (higher max_hops / final_explore).
         basin_hop:                  bool  = True,
         basin_hop_max_hops:         int   = 24,
         basin_hop_final_explore:    int   = 0,
         basin_hop_sigma_set                = (0.015, 0.025, 0.035),  # productive band only
         basin_hop_tabu_eps:         float = 0.01,                    # spatial: mean macro disp / scale
         basin_hop_tabu_proxy_eps:   float = 0.005,                   # cost gate: |Δproxy| (0 to disable)
-        basin_hop_improve_quota:    int   = 2,                       # stop after N non-improving hops (0 = full budget)
+        basin_hop_improve_quota:    int   = 1,                       # stop after N non-improving (under-threshold) hops (0 = full budget)
         # v60: only reductions >= this fraction of the current incumbent count
         # as improvements for the quota / sigma-push logic. Tiny gains are
         # still accepted as the new incumbent but increment no_improve so the
         # loop escalates / ends on time. 0.0 = legacy behaviour.
         basin_hop_min_improve_frac: float = 0.005,                   # 0.5% of current proxy
         basin_hop_stratify:         bool  = False,                   # split B across sigma_set per hop
-        basin_hop_restarts:         int   = 8,                       # was 0 (inherit cohort B); now small B + more hops
+        basin_hop_restarts:         int   = 8,                       # small B per hop + more hops
         # Runtime guard for large/routability-heavy benchmarks. 'auto' keeps
         # ibm01-style behavior but caps expensive Stage-2 reruns on big netlists.
         congestion_runtime_mode: str = 'auto',
         # -- v60 soft-only polish -------------------------------------------------
         soft_polish_enabled: bool = True,
-        soft_polish_restarts: int = 32,
+        soft_polish_restarts: int = 16,
         # The L-driven knobs default to 'auto' -> resolved per-benchmark from the
         # canvas size in _resolve_soft_polish (see the v60 Optuna sweep re-fit).
         # An explicit number/tuple still overrides 'auto' (used by the sweep).
@@ -186,19 +298,84 @@ class v60_Placer:
         cd_polish_enabled: bool = True,
         cd_polish_sweeps: int = 15,
         cd_polish_step_frac: float = 0.01,        # candidate offset = step_frac * 0.5 * (W+H)
-        cd_polish_step_set: tuple = (0.125, 0.25, 0.5, 1.0, 2.0),   # multipliers of base step
-        cd_polish_top_k: int = 8,                 # full-eval the top-K WL+density candidates per macro
+        cd_polish_step_set: tuple = tuple(2.0**i for i in range(-3, 16)),  # multipliers of base step: 2^-3 .. 2^15
+        cd_polish_num_directions: int = 16,       # evenly-spaced unit vectors per macro candidate scan
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
+        # Early-stop a CD run once a full sweep reduces the proxy by less than
+        # this fraction of the pre-sweep proxy. Complements patience: patience
+        # catches "no moves at all", this catches "moves that barely help".
+        cd_polish_min_sweep_improve_frac: float = 0.001,   # 0.1% relative
         cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
         cd_polish_verbose: bool = True,
+        # CD per-macro candidate scoring is parallelised across a fork pool of
+        # synced IncrementalEval copies (bit-identical to sequential; see
+        # _CDScorePool). This value is the inner pool size PER post-Stage-2
+        # candidate: all candidates stay concurrent (quality preserved — same set
+        # polished as before), and each gets its own `cd_polish_parallel_workers`
+        # workers. _run_cpu_side caps outer_wave × inner at cpu_count so it never
+        # oversubscribes. 'auto' -> min(4, cpu_count) (8 candidates × 4 = 32
+        # cores, comfortably parallel without the thrash the 8×16=128 attempt
+        # hit). 1 disables it (old single-thread daemon forks).
+        cd_polish_parallel_workers='auto',
+        # -- v60 pair-swap polish (hard-hard position swaps after CD polish) ---
+        # Coordinate descent over PAIRS of hard macros: for each hard macro
+        # m_i, consider swapping positions with each of its k-nearest hard
+        # macros. The cheap filter is the sum of single-macro WL+density
+        # deltas (approximate — misses interaction on shared nets); the top-K
+        # candidates are then full-eval'd on the real proxy and the best
+        # improving swap (if any) is committed. Catches the moves that
+        # single-macro CD misses: configurations where A and B both want
+        # each other's spot but neither move alone improves.
+        pair_swap_enabled: bool = True,
+        pair_swap_sweeps: int = 30,
+        pair_swap_k_neighbors: int = 24,          # k-nearest hard macros (spatial)
+        pair_swap_k_co_net: int = 8,              # top-K hard macros by shared-net count
+        pair_swap_min_improve: float = 1e-7,
+        pair_swap_patience: int = 3,
+        pair_swap_verbose: bool = True,
+        # -- v60 soft-soft pair-swap polish ------------------------------------
+        # Same algorithm as hard pair-swap, applied to movable soft macros.
+        # No AABB checks for soft sources (soft macros legally overlap in
+        # v60's representation); a hard partner still gets AABB-checked at
+        # the source's old position. Co-net partners only — spatial nearest
+        # scales poorly to thousands of soft macros. Every AABB-legal
+        # partner is full-eval'd on the real proxy (no cheap WL+density
+        # pre-filter), so keep k_co_net small.
+        soft_pair_swap_enabled: bool = True,
+        soft_pair_swap_sweeps:  int  = 5,
+        soft_pair_swap_k_co_net: int = 4,
+        soft_pair_swap_min_improve: float = 1e-7,
+        soft_pair_swap_patience: int = 2,
+        soft_pair_swap_verbose: bool = True,
+        # -- v60 multi-candidate post-Stage-2 refinement -----------------------
+        # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
+        # winner, with separate widths for the (expensive, GPU) and (cheap,
+        # parallelizable, CPU) halves:
+        #   - post_stage2_n_gpu: how many top engine seeds get the GPU side
+        #     (basin-hop + soft polish). Each is runtime-heavy, so keep small.
+        #   - post_stage2_n_cpu: how many legal candidates from the pooled GPU
+        #     output get the CPU side (CD + pair-swap + soft-pair-swap). The
+        #     GPU stages emit their top legal candidates (soft-polish restarts +
+        #     basin-hop incumbents); the global top-n_cpu of that pool are
+        #     polished, and the best final wins. CPU side is ~independent per
+        #     candidate, so this widens cheaply (parallel) for little runtime.
+        # Defaults (1, 1) reproduce the original single-winner pipeline exactly.
+        post_stage2_n_gpu: int = 1,
+        post_stage2_n_cpu: int = 8,
+        # Run the n_cpu CPU-downstream chains in parallel processes (GIL makes
+        # threads useless for the Python-bound CD/swap loops). Falls back to a
+        # sequential loop if the pool can't be created. max_workers caps the
+        # process count ('auto' = min(n_cpu, os.cpu_count())).
+        post_stage2_cpu_parallel: bool = True,
+        post_stage2_cpu_max_workers = 'auto',
         # -- Stage 2 seed picker overlap tolerance ------------------------------
         # Threshold = ratio * median(hard_macro_area), floored at 1e-9.
         # ratio=0 → strict (legal-only). ratio=0.1 lets seeds with up to ~10%
         # of one typical macro's area in cumulative overlap count as "legal"
         # for the lowest-proxy-legal pick. Downstream stages (basin-hop, soft
         # polish, CD) then have a chance to legalize the residual.
-        stage2_overlap_tol_ratio: float = 0.1,
+        stage2_overlap_tol_ratio: float = 0.5,
     ):
         self.num_restarts = int(num_restarts)
         self.num_clusters         = num_clusters
@@ -220,9 +397,6 @@ class v60_Placer:
         self.verbose       = verbose
         self.deterministic = deterministic
         self.seed          = seed
-        self.log_dir                = log_dir
-        self.log_every_n_steps      = int(log_every_n_steps)
-        self.log_positions_per_step = bool(log_positions_per_step)
         self.basin_hop                = bool(basin_hop)
         self.basin_hop_max_hops       = int(basin_hop_max_hops)
         self.basin_hop_final_explore  = int(basin_hop_final_explore)
@@ -254,11 +428,33 @@ class v60_Placer:
         self.cd_polish_sweeps     = int(cd_polish_sweeps)
         self.cd_polish_step_frac  = float(cd_polish_step_frac)
         self.cd_polish_step_set   = tuple(float(s) for s in cd_polish_step_set)
-        self.cd_polish_top_k       = int(cd_polish_top_k)
+        self.cd_polish_num_directions = max(1, int(cd_polish_num_directions))
         self.cd_polish_min_improve = float(cd_polish_min_improve)
         self.cd_polish_patience    = int(cd_polish_patience)
+        self.cd_polish_min_sweep_improve_frac = float(cd_polish_min_sweep_improve_frac)
         self.cd_polish_include_hard = bool(cd_polish_include_hard)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
+        if cd_polish_parallel_workers == 'auto':
+            self.cd_polish_parallel_workers = min(4, os.cpu_count() or 1)
+        else:
+            self.cd_polish_parallel_workers = max(1, int(cd_polish_parallel_workers))
+        self.pair_swap_enabled       = bool(pair_swap_enabled)
+        self.pair_swap_sweeps        = int(pair_swap_sweeps)
+        self.pair_swap_k_neighbors   = max(1, int(pair_swap_k_neighbors))
+        self.pair_swap_k_co_net      = max(0, int(pair_swap_k_co_net))
+        self.pair_swap_min_improve   = float(pair_swap_min_improve)
+        self.pair_swap_patience      = int(pair_swap_patience)
+        self.pair_swap_verbose       = bool(pair_swap_verbose)
+        self.soft_pair_swap_enabled        = bool(soft_pair_swap_enabled)
+        self.soft_pair_swap_sweeps         = int(soft_pair_swap_sweeps)
+        self.soft_pair_swap_k_co_net       = max(1, int(soft_pair_swap_k_co_net))
+        self.soft_pair_swap_min_improve    = float(soft_pair_swap_min_improve)
+        self.soft_pair_swap_patience       = int(soft_pair_swap_patience)
+        self.soft_pair_swap_verbose        = bool(soft_pair_swap_verbose)
+        self.post_stage2_n_gpu = max(1, int(post_stage2_n_gpu))
+        self.post_stage2_n_cpu = max(1, int(post_stage2_n_cpu))
+        self.post_stage2_cpu_parallel = bool(post_stage2_cpu_parallel)
+        self.post_stage2_cpu_max_workers = post_stage2_cpu_max_workers
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
     def _log(self, msg):
@@ -271,6 +467,14 @@ class v60_Placer:
 
     def _cd_log(self, msg):
         if self.cd_polish_verbose:
+            self._log(msg)
+
+    def _swap_log(self, msg):
+        if self.pair_swap_verbose:
+            self._log(msg)
+
+    def _soft_swap_log(self, msg):
+        if self.soft_pair_swap_verbose:
             self._log(msg)
 
     def _resolve_device(self) -> str:
@@ -341,10 +545,6 @@ class v60_Placer:
         return _congestion_work_tier(benchmark) + 2
 
     def _make_cohort(self, cls, num_restarts):
-        # log_dir intentionally NOT passed — the orchestrator owns one logger
-        # for the whole run and threads it into each cohort via place(...,
-        # diag_logger=...). log_every_n_steps still goes through so cohorts
-        # know the cadence.
         return cls(
             num_restarts              = num_restarts,
             num_clusters              = self.num_clusters,
@@ -366,9 +566,6 @@ class v60_Placer:
             verbose                   = self.verbose,
             deterministic             = self.deterministic,
             seed                      = self.seed,
-            log_dir                   = None,
-            log_every_n_steps         = self.log_every_n_steps,
-            log_positions_per_step    = self.log_positions_per_step,
             stage2_overlap_tol_ratio  = self.stage2_overlap_tol_ratio,
         )
 
@@ -388,54 +585,11 @@ class v60_Placer:
             f"s0_steps={self.stage0_steps}  s0_lr={self.stage0_lr:.2f}"
         )
 
-        # ── Diagnostic logger (one file per benchmark per run).
-        # When log_dir is None, logger is no-op.
-        log_path   = _resolve_log_path(self.log_dir, benchmark.name, tag='v60')
-        diag_logger = _DiagLogger(log_path)
-        if diag_logger.active:
-            self._log(f"[v60 {benchmark.name}] diag log: {log_path}")
-            diag_logger.log(
-                'run_start',
-                benchmark=benchmark.name, device=str(device_str),
-                cohort_pick={'tag': 'engine', 'hard_frac': float(hard_frac)},
-                num_restarts={'engine': int(self.num_restarts)},
-                config={
-                    'num_clusters': self.num_clusters,
-                    'cluster_jitter_frac': float(self.cluster_jitter_frac),
-                    'cluster_margin_frac': float(self.cluster_margin_frac),
-                    'cluster_seed':        int(self.cluster_seed),
-                    'stage0_steps':        int(self.stage0_steps),
-                    'stage0_lr':           float(self.stage0_lr),
-                    'stage0_lambda_density': float(self.stage0_lambda_density),
-                    'stage0_lambda_overlap': float(self.stage0_lambda_overlap),
-                    'stage0_gamma_start':    float(self.stage0_gamma_start),
-                    'stage0_gamma_end':      float(self.stage0_gamma_end),
-                    'stage0_target_density': float(self.stage0_target_density),
-                    'use_hh_overlap':            bool(self.use_hh_overlap),
-                    'use_ss_overlap':            bool(self.use_ss_overlap),
-                    'use_soft_degree_inflation': bool(self.use_soft_degree_inflation),
-                    'deterministic':             bool(self.deterministic),
-                    'seed':                      int(self.seed),
-                    'log_every_n_steps':         int(self.log_every_n_steps),
-                    'log_positions_per_step':    bool(self.log_positions_per_step),
-                },
-                benchmark_stats={
-                    'num_macros':      int(benchmark.num_macros),
-                    'num_hard_macros': int(benchmark.num_hard_macros),
-                    'num_soft_macros': int(benchmark.num_macros - benchmark.num_hard_macros),
-                    'num_nets':        int(len(benchmark.net_nodes)),
-                    'canvas_width':    float(benchmark.canvas_width),
-                    'canvas_height':   float(benchmark.canvas_height),
-                    'grid_rows':       int(benchmark.grid_rows),
-                    'grid_cols':       int(benchmark.grid_cols),
-                },
-            )
-
         # v60: single engine run.
         cohort_elapsed = {}
         cohorts = {'engine': self._make_cohort(v60_Engine, self.num_restarts)}
         t = time.time()
-        pos_pick = cohorts['engine'].place(benchmark, diag_logger=diag_logger)
+        pos_pick = cohorts['engine'].place(benchmark)
         cohort_elapsed['engine'] = round(time.time() - t, 3)
 
         netlist  = osp.join(self.plc_root, benchmark.name, "netlist.pb.txt")
@@ -447,23 +601,13 @@ class v60_Placer:
             for tag, pos in all_results:
                 if pos is not None:
                     self._log(f"[v60 {benchmark.name}] no netlist; returning {tag}")
-                    if diag_logger.active:
-                        diag_logger.log('run_end', benchmark=benchmark.name,
-                                        elapsed_s=round(time.time() - t0, 3),
-                                        winner=tag, reason='no_netlist',
-                                        cohort_elapsed=cohort_elapsed)
-                        diag_logger.close()
                     return pos
-            if diag_logger.active:
-                diag_logger.log('run_end', benchmark=benchmark.name,
-                                elapsed_s=round(time.time() - t0, 3),
-                                winner=None, reason='no_results')
-                diag_logger.close()
             return None
 
-        plc = PlacementCost(netlist)
-        if osp.exists(init_plc):
-            plc.restore_placement(init_plc, ifInital=True, ifReadComment=True)
+        with _quiet_plc():
+            plc = PlacementCost(netlist)
+            if osp.exists(init_plc):
+                plc.restore_placement(init_plc, ifInital=True, ifReadComment=True)
 
         scored = []
         for tag, pos in all_results:
@@ -479,41 +623,115 @@ class v60_Placer:
             legal if legal else scored, key=lambda c: c[1]
         )
 
-        proxy_str = '  '.join(f'{tag}={p:.4f}' for tag, p, _, _ in scored)
         self._log(
-            f"[v60 {benchmark.name}] {proxy_str}  winner={best_tag}  "
-            f"best={best_proxy:.4f}  total {time.time()-t0:.1f}s"
+            f"[v60 {benchmark.name}] engine best={best_proxy:.4f}  "
+            f"total {time.time()-t0:.1f}s"
         )
 
-        # ── Basin-hopping: perturb the running best and re-minimise (Stage 2
-        #    only) with a promising-seed priority queue + visited-basin tabu.
-        if (self.basin_hop and best_pos is not None and best_tag in cohorts
-                and math.isfinite(best_proxy)):
-            winner  = cohorts[best_tag]
+        # ── Multi-candidate post-Stage-2 refinement ──────────────────────
+        # GPU side (basin-hop + soft polish) runs for the top-n_gpu engine
+        # seeds and emits a pool of legal candidates; the CPU side (CD +
+        # pair-swap + soft-pair-swap) then polishes the top-n_cpu of that pool
+        # (in parallel processes when enabled), and the best final wins.
+        if (best_pos is not None and math.isfinite(best_proxy)
+                and best_tag in cohorts):
+            winner_cohort = cohorts[best_tag]
             nM      = int(benchmark.num_macros)
             mov_idx = np.where(benchmark.get_movable_mask().numpy())[0]
             scale   = 0.5 * (float(benchmark.canvas_width) + float(benchmark.canvas_height))
-            Bhop    = (self.basin_hop_restarts if self.basin_hop_restarts > 0
-                       else int(getattr(winner, 'num_restarts', 16)))
-            Bhop    = self._cap_for_congestion_runtime(benchmark, Bhop, caps=(5, 6, 7, 8))
-            rng     = np.random.default_rng(self.seed if self.deterministic else None)
+
+            seed_pool = list(getattr(winner_cohort, '_last_seed_pool', None) or [])
+            if not seed_pool:
+                seed_pool = [{'pos': best_pos[:nM].detach().cpu().numpy().astype(np.float64),
+                              'proxy': float(best_proxy), 'overlap_area': 0.0}]
+            n_gpu = min(self.post_stage2_n_gpu, len(seed_pool))
+            self._log(
+                f"[v60 {benchmark.name}] post-Stage-2: n_gpu={n_gpu}  "
+                f"n_cpu={self.post_stage2_n_cpu}  (engine seed pool={len(seed_pool)})"
+            )
+
+            # GPU side: basin-hop every top-n_gpu seed, then soft-polish every
+            # one. With more than one seed this is grouped by stage and labelled
+            # per seed (the same way the phased CPU side reads); with a single
+            # seed the headers are skipped so the output is unchanged.
+            multi = n_gpu > 1
+            if multi:
+                self._log(f"[v60 {benchmark.name}] === basin-hop · {n_gpu} seeds ===")
+            incumbents = []
+            for gi in range(n_gpu):
+                if multi:
+                    self._log(f"[v60 {benchmark.name}] --- basin-hop · seed {gi} ---")
+                incumbents.append(self._gpu_basinhop(
+                    seed_pool[gi]['pos'], seed_pool[gi]['proxy'], benchmark, plc,
+                    winner_cohort, mov_idx, scale, label=f"{best_tag}#{gi}"))
+
+            cand_pool = []
+            if multi and self.soft_polish_enabled:
+                self._log(f"[v60 {benchmark.name}] === soft polish · {n_gpu} seeds ===")
+            for gi in range(n_gpu):
+                inc = incumbents[gi]
+                cand_pool.append(inc)   # the basin-hop incumbent is a candidate
+                if self.soft_polish_enabled and math.isfinite(inc['proxy']):
+                    if multi:
+                        self._log(f"[v60 {benchmark.name}] --- soft polish · seed {gi} ---")
+                    cand_pool += self._gpu_softpolish(
+                        inc['pos'], inc['proxy'], inc['tag'], benchmark, plc)
+
+            # Rank best-first, dedup by proxy, take top-n_cpu for the CPU side.
+            cand_pool.sort(key=lambda c: c['proxy'])
+            seen, deduped = set(), []
+            for c in cand_pool:
+                key = round(c['proxy'], 9)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(c)
+            cpu_cands = deduped[: self.post_stage2_n_cpu]
+            results = self._run_cpu_side(
+                cpu_cands, benchmark, plc, gpu_pool=len(cand_pool), t0=t0)
+            for (rpos, rproxy, rtag) in results:
+                if rproxy < best_proxy - 1e-9:
+                    best_pos, best_proxy, best_tag = rpos, rproxy, rtag
+            self._log(
+                f"[v60 {benchmark.name}] post-Stage-2 done: best={best_proxy:.4f}  "
+                f"tag={best_tag}  total {time.time()-t0:.1f}s"
+            )
+
+        return best_pos
+
+    def _gpu_basinhop(self, seed_pos_np, seed_proxy, benchmark, plc, winner_cohort,
+                      mov_idx, scale, label):
+        """Basin-hop from one engine seed (GPU). Returns the incumbent candidate
+        dict {pos tensor, proxy, tag}: the best placement basin-hopping reaches
+        from this seed (or the seed itself if no hop improved)."""
+        nM = int(benchmark.num_macros)
+        cur_t = benchmark.macro_positions.clone()
+        cur_t[:nM] = torch.tensor(seed_pos_np, dtype=cur_t.dtype)
+        cur_proxy = float(seed_proxy)
+        cur_tag = label
+
+        # ── Basin-hop from this seed ─────────────────────────────────────
+        if (self.basin_hop and winner_cohort is not None
+                and math.isfinite(cur_proxy)):
+            Bhop = (self.basin_hop_restarts if self.basin_hop_restarts > 0
+                    else int(getattr(winner_cohort, 'num_restarts', 16)))
+            Bhop = self._cap_for_congestion_runtime(benchmark, Bhop, caps=(5, 6, 7, 8))
+            rng  = np.random.default_rng(self.seed if self.deterministic else None)
             try:
-                ic      = compute_proxy_cost(best_pos[:nM].to(torch.float32), benchmark, plc)
+                ic      = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
                 init_ov = float(ic.get('total_overlap_area', float('nan')))
             except Exception:
                 init_ov = float('nan')
             initial = {
-                'pos':          best_pos[:nM].detach().cpu().numpy().astype(np.float32),
-                'proxy':        float(best_proxy),
+                'pos':          cur_t[:nM].detach().cpu().numpy().astype(np.float32),
+                'proxy':        cur_proxy,
                 'overlap_area': init_ov,
             }
 
             def run_from_init(init_b_nmov_2):
-                p = winner.place(benchmark, init_positions=init_b_nmov_2, diag_logger=diag_logger)
-                metrics = getattr(winner, '_last_run_metrics', None) or []
+                p = winner_cohort.place(benchmark, init_positions=init_b_nmov_2)
+                metrics = getattr(winner_cohort, '_last_run_metrics', None) or []
                 if metrics:
-                    # match the cohort placer's best-legal pick: lowest proxy
-                    # among overlap-free seeds, else lowest proxy overall
                     legal_m = [m for m in metrics
                                if float(m.get('overlap_area', float('nan'))) <= 1e-9]
                     mm = min(legal_m if legal_m else metrics,
@@ -529,12 +747,8 @@ class v60_Placer:
                         'proxy': pr, 'overlap_area': ov}
 
             self._log(
-                f"[v60 {benchmark.name}] basin-hop: winner={best_tag}  B={Bhop}  "
-                f"max_hops={self.basin_hop_max_hops}  final_explore={self.basin_hop_final_explore}  "
-                f"sigmas={self.basin_hop_sigma_set}  stratify={self.basin_hop_stratify}  "
-                f"tabu_eps={self.basin_hop_tabu_eps}  tabu_proxy_eps={self.basin_hop_tabu_proxy_eps}  "
-                f"improve_quota={self.basin_hop_improve_quota}  "
-                f"min_improve_frac={self.basin_hop_min_improve_frac}"
+                f"[v60 {benchmark.name}] basin-hop ({label}): B={Bhop}  "
+                f"max_hops={self.basin_hop_max_hops}  improve_quota={self.basin_hop_improve_quota}"
             )
             bh = _basin_hop(
                 run_from_init, initial, mov_idx, scale, Bhop, rng,
@@ -548,89 +762,251 @@ class v60_Placer:
                 stratify=self.basin_hop_stratify,
                 log=self._log,
             )
-            if bh['proxy'] < best_proxy - 1e-9:
-                self._log(f"[v60 {benchmark.name}] basin-hop improved "
-                          f"{best_proxy:.4f} -> {bh['proxy']:.4f}")
+            if bh['proxy'] < cur_proxy - 1e-9:
+                self._log(f"[v60 {benchmark.name}] basin-hop ({label}) improved "
+                          f"{cur_proxy:.4f} -> {bh['proxy']:.4f}")
                 out_t      = benchmark.macro_positions.clone()
                 out_t[:nM] = torch.tensor(bh['pos'], dtype=out_t.dtype)
-                best_pos   = out_t
-                best_proxy = float(bh['proxy'])
-                best_tag   = f"{best_tag}+bh"
-            else:
-                self._log(f"[v60 {benchmark.name}] basin-hop: no improvement "
-                          f"over {best_proxy:.4f}")
-            if diag_logger.active:
-                diag_logger.log('basin_hop_end', benchmark=benchmark.name,
-                                winner=best_tag, best_proxy=float(best_proxy),
-                                B=int(Bhop), max_hops=int(self.basin_hop_max_hops),
-                                final_explore=int(self.basin_hop_final_explore))
+                cur_t      = out_t
+                cur_proxy  = float(bh['proxy'])
+                cur_tag    = f"{label}+bh"
 
-        if self.soft_polish_enabled and best_pos is not None and math.isfinite(best_proxy):
-            base_costs = compute_proxy_cost(best_pos[:int(benchmark.num_macros)].to(torch.float32), benchmark, plc)
-            self._soft_log(
-                f"[v60 {benchmark.name}] soft polish start: proxy={base_costs['proxy_cost']:.4f}  "
-                f"wl={base_costs['wirelength_cost']:.3f} den={base_costs['density_cost']:.3f} "
-                f"cong={base_costs['congestion_cost']:.3f}"
-            )
-            polished, polish_costs = self._soft_only_polish(best_pos, benchmark, plc)
-            polished_proxy = float(polish_costs['proxy_cost'])
-            if polished_proxy < best_proxy - 1e-9:
-                self._soft_log(
-                    f"[v60 {benchmark.name}] soft polish done: proxy "
-                    f"{best_proxy:.4f} -> {polished_proxy:.4f}  "
-                    f"wl={polish_costs['wirelength_cost']:.3f} den={polish_costs['density_cost']:.3f} "
-                    f"cong={polish_costs['congestion_cost']:.3f}  total {time.time()-t0:.1f}s"
-                )
-                best_pos = polished
-                best_proxy = polished_proxy
-                best_tag = f"{best_tag}+soft"
-            else:
-                self._soft_log(
-                    f"[v60 {benchmark.name}] soft polish: no improvement over "
-                    f"{best_proxy:.4f} (got {polished_proxy:.4f}) — kept pre-polish result  "
-                    f"total {time.time()-t0:.1f}s"
-                )
+        return {'pos': cur_t, 'proxy': cur_proxy, 'tag': cur_tag}
+
+    def _gpu_softpolish(self, cur_t, cur_proxy, cur_tag, benchmark, plc):
+        """Soft-only polish from a (basin-hopped) placement. Returns its top
+        legal soft-polish restarts as candidate dicts; the input placement
+        itself is added to the pool separately by the caller."""
+        nM = int(benchmark.num_macros)
+        out = []
+        base_costs = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
+        self._soft_log(
+            f"[v60 {benchmark.name}] soft polish ({cur_tag}) start: "
+            f"proxy={base_costs['proxy_cost']:.4f}"
+        )
+        self._last_soft_pool = []
+        _polished, _pc = self._soft_only_polish(cur_t, benchmark, plc)
+        pool = getattr(self, '_last_soft_pool', []) or []
+        for (pr, pos_np) in pool[: self.post_stage2_n_cpu]:
+            cand_t = benchmark.macro_positions.clone()
+            cand_t[:nM] = torch.tensor(pos_np, dtype=cand_t.dtype)
+            out.append({'pos': cand_t, 'proxy': float(pr),
+                        'tag': f"{cur_tag}+soft"})
+        return out
+
+    def _cpu_side(self, cand_pos, cand_proxy, cand_tag, benchmark, plc, t0=None,
+                  cd_max_workers=1):
+        """CPU-side refinement (CD polish -> hard pair-swap -> soft pair-swap)
+        from one candidate. Returns (pos tensor, proxy, tag). Self-contained so
+        it can run in a worker process. `cd_max_workers > 1` parallelises CD's
+        candidate scoring (only valid when this runs in a non-daemon process)."""
+        if t0 is None:
+            t0 = time.time()
+        best_pos   = cand_pos
+        best_proxy = float(cand_proxy)
+        best_tag   = cand_tag
 
         if (self.cd_polish_enabled and best_pos is not None
                 and math.isfinite(best_proxy) and plc is not None):
-            cd_out, cd_costs = self._cd_polish(best_pos, benchmark, plc)
-            if cd_costs is not None:
-                cd_proxy = float(cd_costs['proxy_cost'])
-                if cd_proxy < best_proxy - 1e-9:
-                    self._cd_log(
-                        f"[v60 {benchmark.name}] CD polish improved proxy "
-                        f"{best_proxy:.4f} -> {cd_proxy:.4f}  total {time.time()-t0:.1f}s"
-                    )
-                    best_pos   = cd_out
-                    best_proxy = cd_proxy
-                    best_tag   = f"{best_tag}+cd"
-                else:
-                    self._cd_log(
-                        f"[v60 {benchmark.name}] CD polish: no improvement over "
-                        f"{best_proxy:.4f} (got {cd_proxy:.4f}) — kept pre-CD result  "
-                        f"total {time.time()-t0:.1f}s"
-                    )
+            cd_out, cd_costs = self._cd_polish(best_pos, benchmark, plc,
+                                               max_workers=cd_max_workers)
+            if cd_costs is not None and float(cd_costs['proxy_cost']) < best_proxy - 1e-9:
+                best_pos   = cd_out
+                best_proxy = float(cd_costs['proxy_cost'])
+                best_tag   = f"{best_tag}+cd"
 
-        if diag_logger.active:
-            diag_logger.log(
-                'result',
-                benchmark=benchmark.name,
-                scores={tag: (None if p == float('inf') else float(p))
-                        for tag, p, _, _ in scored},
-                winner=best_tag,
-                best_proxy=float(best_proxy) if best_proxy != float('inf') else None,
-                cohort_elapsed=cohort_elapsed,
-            )
-            diag_logger.log(
-                'run_end',
-                benchmark=benchmark.name,
-                elapsed_s=round(time.time() - t0, 3),
-                winner=best_tag,
-                best_proxy=float(best_proxy) if best_proxy != float('inf') else None,
-            )
-            diag_logger.close()
-        return best_pos
+        if (self.pair_swap_enabled and best_pos is not None
+                and math.isfinite(best_proxy) and plc is not None):
+            ps_out, ps_costs = self._pair_swap_polish(best_pos, benchmark, plc)
+            if ps_costs is not None and float(ps_costs['proxy_cost']) < best_proxy - 1e-9:
+                best_pos   = ps_out
+                best_proxy = float(ps_costs['proxy_cost'])
+                best_tag   = f"{best_tag}+swap"
 
+        if (self.soft_pair_swap_enabled and best_pos is not None
+                and math.isfinite(best_proxy) and plc is not None):
+            sps_out, sps_costs = self._pair_swap_polish_soft(best_pos, benchmark, plc)
+            if sps_costs is not None and float(sps_costs['proxy_cost']) < best_proxy - 1e-9:
+                best_pos   = sps_out
+                best_proxy = float(sps_costs['proxy_cost'])
+                best_tag   = f"{best_tag}+softswap"
+
+        return best_pos, best_proxy, best_tag
+
+    def _run_cpu_side(self, cpu_cands, benchmark, plc, gpu_pool=None, t0=None):
+        """Run the CPU refinement (CD polish -> hard pair-swap -> soft pair-swap)
+        over the candidates; return a list of (pos tensor, proxy, tag).
+
+        The stages run as PHASES: every candidate does CD, then every candidate
+        does the hard swap, then the soft swap. Within a phase the candidates run
+        concurrently in fork-context processes (each inherits all inputs — self,
+        benchmark, plc — through the fork, never pickled; only the result + its
+        captured log return over a Queue). The FIRST candidate streams its log
+        live; the others capture theirs and the parent prints them in candidate
+        order right after the phase barrier. So every candidate's evolution is
+        shown, grouped by stage, with a stable candidate index across stages,
+        and nothing is held back to the very end. The per-candidate result is
+        identical to running the three stages back-to-back per candidate (same
+        improvement gating between stages); only the print interleaving changes.
+        Works the same for any number of upstream GPU seeds — the candidate pool
+        is already flattened before it reaches here."""
+        if not cpu_cands:
+            return []
+
+        cpu_count = os.cpu_count() or 1
+        par = self.cd_polish_parallel_workers   # inner CD workers PER candidate (1=off)
+
+        if self.post_stage2_cpu_max_workers == 'auto':
+            max_workers = min(len(cpu_cands), cpu_count)
+        else:
+            max_workers = max(1, min(int(self.post_stage2_cpu_max_workers), len(cpu_cands)))
+
+        # Each concurrent candidate fork can itself spawn a CD scoring pool of
+        # `cd_workers`; cap outer × inner at the core count so we never
+        # oversubscribe. cd_workers==1 => no inner pool => forks can stay daemon.
+        if par > 1:
+            cd_workers = max(1, min(int(par), cpu_count // max(1, max_workers)))
+        else:
+            cd_workers = 1
+
+        n = len(cpu_cands)
+        pool_str = f"  (gpu pool={gpu_pool})" if gpu_pool is not None else ""
+        tot_str  = f"  total {time.time()-t0:.1f}s" if t0 is not None else ""
+
+        # Sequential fallback (single candidate or parallelism off): run the full
+        # chain per candidate in this process; logs stream in order.
+        if (not self.post_stage2_cpu_parallel) or len(cpu_cands) == 1:
+            self._log(
+                f"[v60 {benchmark.name}] CPU side: polishing {n} candidate(s)"
+                f"{pool_str}{tot_str}  (sequential)"
+            )
+            return [self._cpu_side(c['pos'], c['proxy'], c['tag'], benchmark, plc,
+                                   cd_max_workers=max(1, int(par)))
+                    for c in cpu_cands]
+
+        states = [{'pos': c['pos'], 'proxy': float(c['proxy']), 'tag': c['tag']}
+                  for c in cpu_cands]
+        self._log(
+            f"[v60 {benchmark.name}] CPU side: polishing {n} candidate(s)"
+            f"{pool_str}{tot_str}  max_workers={max_workers} cd_workers={cd_workers}  "
+            f"(per stage: candidate 0 streams live, then candidates 1..{n - 1} "
+            f"print in order)"
+        )
+
+        # (label, stage fn(pos)->(out_pos, costs), tag suffix, enabled,
+        #  spawns-an-inner-CD-pool)
+        stages = [
+            ('CD polish',
+             lambda pos: self._cd_polish(pos, benchmark, plc, max_workers=cd_workers),
+             '+cd', self.cd_polish_enabled, cd_workers > 1),
+            ('pair-swap',
+             lambda pos: self._pair_swap_polish(pos, benchmark, plc),
+             '+swap', self.pair_swap_enabled, False),
+            ('soft-pair-swap',
+             lambda pos: self._pair_swap_polish_soft(pos, benchmark, plc),
+             '+softswap', self.soft_pair_swap_enabled, False),
+        ]
+        for label, fn, suffix, enabled, inner_pool in stages:
+            if enabled:
+                self._run_cpu_stage(label, fn, suffix, states, benchmark,
+                                    max_workers, inner_pool)
+
+        return [(s['pos'], s['proxy'], s['tag']) for s in states]
+
+    def _run_cpu_stage(self, label, fn, suffix, states, benchmark,
+                       max_workers, inner_pool):
+        """Run one refinement stage over every candidate, concurrently. Candidate
+        0 streams its log live; candidates 1..n-1 capture theirs and the parent
+        prints them in candidate order right after the barrier. Updates `states`
+        in place (each candidate's running best, gated by improvement)."""
+        nM = int(benchmark.num_macros)
+        n = len(states)
+        self._log(f"[v60 {benchmark.name}] === {label} · {n} candidates ===")
+
+        def _run_stage(pos):
+            out_pos, costs = fn(pos)
+            return out_pos, (float(costs['proxy_cost']) if costs else None)
+
+        try:
+            ctx = mp.get_context('fork')
+        except (ValueError, RuntimeError):
+            ctx = None
+        if ctx is None:   # no fork: run candidates sequentially (all stream)
+            for idx in range(n):
+                try:
+                    out_pos, pr = _run_stage(states[idx]['pos'])
+                    self._apply_stage_result(states, idx, out_pos, pr, suffix)
+                except Exception as exc:
+                    self._log(f"[v60 {benchmark.name}] {label}: candidate {idx} "
+                              f"failed ({exc!r}); kept as-is")
+            return
+
+        def _child(idx, pos, q):
+            # Inherited via fork. idx 0 streams to the terminal; the rest capture
+            # their stdout so the parent can print them in candidate order.
+            buf = io.StringIO() if idx != 0 else None
+            try:
+                cm = (contextlib.redirect_stdout(buf) if buf is not None
+                      else contextlib.nullcontext())
+                with cm:
+                    out_pos, pr = _run_stage(pos)
+                q.put((idx, out_pos[:nM].detach().cpu().numpy().astype(np.float64),
+                       pr, buf.getvalue() if buf is not None else ''))
+            except Exception as exc:
+                q.put((idx, None, None, f"__ERR__ {exc!r}"))
+
+        # An inner CD pool needs a non-daemon parent (daemon procs can't fork);
+        # swap stages spawn no inner pool, so they stay daemon (clean-kill).
+        outer_daemon = not inner_pool
+        failed = []
+        for ws in range(0, n, max_workers):
+            wave = list(range(ws, min(ws + max_workers, n)))
+            if 0 in wave:
+                self._log(f"[v60 {benchmark.name}] --- {label} · candidate 0 (live) ---")
+            q = ctx.Queue()
+            procs = {}
+            for idx in wave:
+                p = ctx.Process(target=_child, args=(idx, states[idx]['pos'], q),
+                                daemon=outer_daemon)
+                p.start(); procs[idx] = p
+            got = {}
+            for _ in wave:               # exactly one message per child
+                idx, pos_np, pr, log = q.get()
+                got[idx] = (pos_np, pr, log)
+            for p in procs.values():
+                p.join()
+            # Print captured logs in candidate order (idx 0 already streamed live).
+            for idx in wave:
+                pos_np, pr, log = got[idx]
+                if pos_np is None:
+                    self._log(f"[v60 {benchmark.name}] {label}: candidate {idx} "
+                              f"errored ({log}); re-running in parent")
+                    failed.append(idx)
+                    continue
+                if idx != 0:
+                    self._log(f"[v60 {benchmark.name}] --- {label} · candidate {idx} ---")
+                    if log:
+                        sys.stdout.write(log); sys.stdout.flush()
+                out_pos = benchmark.macro_positions.clone()
+                out_pos[:nM] = torch.tensor(pos_np, dtype=out_pos.dtype)
+                self._apply_stage_result(states, idx, out_pos, pr, suffix)
+
+        # Re-run any errored candidates' stage sequentially in the parent.
+        for idx in failed:
+            try:
+                out_pos, pr = _run_stage(states[idx]['pos'])
+                self._apply_stage_result(states, idx, out_pos, pr, suffix)
+            except Exception as exc:
+                self._log(f"[v60 {benchmark.name}] {label}: candidate {idx} "
+                          f"re-run failed ({exc!r}); kept as-is")
+
+    @staticmethod
+    def _apply_stage_result(states, idx, out_pos, pr, suffix):
+        """Commit a stage's output for candidate idx iff it improved the proxy."""
+        if pr is not None and pr < states[idx]['proxy'] - 1e-9:
+            states[idx]['pos'] = out_pos
+            states[idx]['proxy'] = pr
+            states[idx]['tag'] = states[idx]['tag'] + suffix
 
     @staticmethod
     def _canvas_L(benchmark: Benchmark) -> float:
@@ -745,8 +1121,6 @@ class v60_Placer:
             'inflation_factor': 1.0,
             'target_density': 0.7,
             'cluster_jitter_frac': 0.0,
-            'log_every_n_steps': 10**9,
-            'log_positions_per_step': False,
         }
         params.update(_parse_plc_routing_params(
             osp.join(self.plc_root, benchmark.name, 'initial.plc')
@@ -780,7 +1154,6 @@ class v60_Placer:
             return placement, costs
 
         B = max(1, self.soft_polish_restarts)
-        B = self._cap_for_congestion_runtime(benchmark, B, caps=(12, 16, 20, 24))
         rng = np.random.default_rng(self.seed if self.deterministic else None)
         scale = 0.5 * (float(benchmark.canvas_width) + float(benchmark.canvas_height))
         jitter_fracs = self._resolve_soft_polish(benchmark)['jitter_fracs']
@@ -808,8 +1181,6 @@ class v60_Placer:
             raw, params, B, device,
             init_positions=init,
             cluster_data=None,
-            diag_logger=None,
-            cohort_tag='soft_polish',
         )
 
         best_pos = None
@@ -818,6 +1189,7 @@ class v60_Placer:
         best_legal_pos = None
         best_legal_costs = None
         best_legal_proxy = float('inf')
+        legal_restarts = []   # (proxy, pos_np) for overlap-free restarts
         for i, pos_np in enumerate(all_pos):
             costs = compute_proxy_cost(torch.tensor(pos_np, dtype=torch.float32), benchmark, plc)
             proxy = float(costs['proxy_cost'])
@@ -832,10 +1204,17 @@ class v60_Placer:
                 best_pos = pos_np
                 best_costs = costs
             # v60: track the best *legal* (overlap-free) soft restart too
-            if ovlp <= 1e-9 and proxy < best_legal_proxy:
-                best_legal_proxy = proxy
-                best_legal_pos = pos_np
-                best_legal_costs = costs
+            if ovlp <= 1e-9:
+                legal_restarts.append((proxy, pos_np))
+                if proxy < best_legal_proxy:
+                    best_legal_proxy = proxy
+                    best_legal_pos = pos_np
+                    best_legal_costs = costs
+
+        # Stash the ranked legal-restart pool (best-first) so the multi-candidate
+        # post-Stage-2 path can pull the top-K, not just the single best.
+        legal_restarts.sort(key=lambda t: t[0])
+        self._last_soft_pool = legal_restarts
 
         # prefer the best legal restart; fall back to best-proxy if none legal
         if best_legal_pos is not None:
@@ -860,30 +1239,36 @@ class v60_Placer:
         placement: torch.Tensor,
         benchmark: Benchmark,
         plc: PlacementCost,
+        max_workers: int = 1,
     ):
         """Single-macro coordinate descent over movable macros (soft and,
         if `cd_polish_include_hard`, hard too) using IncrementalEval.
 
-        Strategy per macro:
-          1. For each candidate offset (8 directions × cd_polish_step_set),
-             compute the WL+density delta via `delta_for_move(include_cong=False)`
-             (cheap, ~0.1 ms each). For hard macros, candidates that would
-             cause overlap with another hard macro are rejected via a
-             vectorised AABB intersection check (~5 µs).
-          2. Take the top-K WL+density-improving candidates (most-negative
-             delta_wl + 0.5·delta_density).
-          3. For each of those K, tentatively commit, re-evaluate the *real*
-             proxy (incremental cong cache, ~4 ms), and revert. Track the
-             candidate with the best actual proxy improvement.
-          4. If the best real-proxy improvement exceeds `cd_polish_min_improve`,
-             commit that candidate; else skip the macro this sweep.
+        `max_workers > 1` parallelises the per-macro candidate scoring across a
+        fork pool of synced IncrementalEval copies (see _CDScorePool). Results
+        are bit-identical to the sequential path (the parent still does the
+        argmin/tie-break and the same commit stream is replayed to every
+        worker). Must be called from a non-daemon process.
 
-        Why top-K instead of top-1: on cong-sensitive benches, the
-        WL+density-best candidate often has bad cong (and gets rejected).
-        Meanwhile the #2 or #3 WL+density candidate may be slightly worse
-        on WL+density but enough better on cong to be a net improvement.
-        Top-K = 8 catches these without exploding the cost — only candidates
-        with delta_wlden < 0 are eligible, so weak macros stay cheap.
+        Strategy per macro:
+          1. Enumerate candidate offsets (cd_polish_num_directions evenly-spaced
+             directions × cd_polish_step_set step sizes). For hard macros,
+             candidates that would overlap another hard macro are rejected via a
+             vectorised AABB intersection check (~5 µs).
+          2. Full-eval EVERY candidate on the real proxy (tentatively commit,
+             read proxy incl. congestion, revert), and track the candidate with
+             the best actual proxy improvement.
+          3. If the best improvement exceeds `cd_polish_min_improve`, commit
+             that candidate; else skip the macro this sweep.
+
+        No cheap WL+density pre-filter: a measured ceiling test showed the
+        old "top-K by WL+density delta" filter systematically discarded
+        congestion-reducing moves — moves that worsen WL+density but improve
+        the real proxy via congestion never reached the full eval. On the
+        cong-dominated benches that is exactly where the gains are, so every
+        candidate is now evaluated on the real proxy directly. (The full
+        congestion eval is cheap enough after the vectorised IncrementalEval
+        cong path; the cost is bounded by trimming step_set / num_directions.)
 
         Hard-macro inclusion: hard macros have outsize cong impact (their
         blockage shifts whole rows/columns of routing demand) but are also
@@ -912,14 +1297,13 @@ class v60_Placer:
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
         base_step = self.cd_polish_step_frac * 0.5 * (cw + ch)
-        # 8-direction offsets per step multiplier. Diagonals normalized so the
-        # diagonal step has the same Euclidean length as an axis step (×1/√2).
-        dirs = []
-        diag = 1.0 / math.sqrt(2.0)
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1),
-                         (-diag, -diag), (-diag, diag),
-                         ( diag, -diag), ( diag, diag)]:
-            dirs.append((dx, dy))
+        # N evenly-spaced unit vectors around the circle (N = cd_polish_num_directions).
+        # Unit-length so each candidate has the same Euclidean step magnitude
+        # regardless of angle.
+        N_dirs = self.cd_polish_num_directions
+        dirs = [(math.cos(2.0 * k * math.pi / N_dirs),
+                 math.sin(2.0 * k * math.pi / N_dirs))
+                for k in range(N_dirs)]
         step_mults = self.cd_polish_step_set if self.cd_polish_step_set else (1.0,)
 
         # Build IncrementalEval from current placement.
@@ -937,7 +1321,7 @@ class v60_Placer:
             f"nS={n_soft_targets} nH={n_hard_targets} (include_hard={self.cd_polish_include_hard})  "
             f"sweeps={self.cd_polish_sweeps}  "
             f"step_frac={self.cd_polish_step_frac:.4f}  "
-            f"step_set={self.cd_polish_step_set}  top_k={self.cd_polish_top_k}"
+            f"step_set={self.cd_polish_step_set}"
         )
         t0 = time.time()
 
@@ -953,15 +1337,68 @@ class v60_Placer:
             hard_aabb[m, 3] = cy + hh
 
         rng = np.random.default_rng(self.seed if self.deterministic else None)
+
+        # Parallel candidate scoring: fork a pool of synced IncrementalEval
+        # copies; the parent + (max_workers-1) workers share the per-macro
+        # candidate scan. Bit-identical to sequential (argmin + commit stream are
+        # parent-driven). Only parallelise macros with enough candidates to
+        # amortise the per-macro IPC round-trip.
+        pool = None
+        if max_workers > 1:
+            try:
+                pool = _CDScorePool(int(max_workers) - 1, e)
+                self._cd_log(
+                    f"[v60 {benchmark.name}] CD parallel scoring: "
+                    f"{max_workers} scorers ({pool.n} workers + parent)"
+                )
+            except Exception as exc:
+                self._cd_log(f"[v60 {benchmark.name}] CD pool init failed "
+                             f"({exc}); scoring sequentially")
+                pool = None
+        par_threshold = max(8, 2 * max_workers)   # min candidates to go parallel
+
+        try:
+            cur_proxy, total_moved = self._cd_run_sweeps(
+                e, benchmark, target_idx, nH, cw, ch, base_step, dirs, step_mults,
+                hard_aabb, rng, cur_proxy, pool, par_threshold, t0)
+        finally:
+            if pool is not None:
+                pool.close()
+
+        # Return polished placement.
+        out = placement.clone()
+        out[:nM] = torch.tensor(e.macro_pos, dtype=out.dtype)
+        br = e.proxy_breakdown(include_cong=True)
+        costs = {
+            'proxy_cost':      br['proxy_cost'],
+            'wirelength_cost': br['wirelength_cost'],
+            'density_cost':    br['density_cost'],
+            'congestion_cost': br['congestion_cost'],
+        }
+        self._cd_log(
+            f"[v60 {benchmark.name}] CD polish done: "
+            f"total_moved={total_moved} proxy={cur_proxy:.6f}  "
+            f"wl={costs['wirelength_cost']:.3f} den={costs['density_cost']:.3f} "
+            f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
+        )
+        return out, costs
+
+    def _cd_run_sweeps(self, e, benchmark, target_idx, nH, cw, ch, base_step,
+                       dirs, step_mults, hard_aabb, rng, cur_proxy, pool,
+                       par_threshold, t0):
+        """The CD sweep loop, factored out so _cd_polish can wrap it in a
+        try/finally that guarantees the score pool is torn down. Returns the
+        final cur_proxy; mutates `e` in place (committed moves)."""
         total_moved = 0
-        zero_streak = 0   # consecutive zero-move sweeps for patience-based stop
+        zero_streak = 0
 
         for sweep in range(self.cd_polish_sweeps):
+            proxy_before_sweep = cur_proxy
             order = target_idx[rng.permutation(len(target_idx))]
             moved_this_sweep = 0
             tested_this_sweep = 0
-            wl_den_pos = 0    # candidates with delta_wlden <= 0 (worth trying full eval)
-            cong_rejected = 0 # full-eval moves that didn't beat min_improve
+            active_macros = 0   # macros with >= 1 legal candidate this sweep
+            no_improve = 0      # macros whose candidates didn't beat min_improve
             for m_i in order:
                 m_i = int(m_i)
                 cur_x = float(e.macro_pos[m_i, 0])
@@ -971,11 +1408,16 @@ class v60_Placer:
                     hw_i = float(e.macro_w[m_i]) * 0.5
                     hh_i = float(e.macro_h[m_i]) * 0.5
 
-                # Cheap scan: collect all WL+density-improving candidates.
-                # WL weight is 1.0, density weight is 0.5 in the real proxy.
-                # For hard macros, also reject candidates that would overlap
-                # any other hard macro (AABB intersection, vectorised).
-                cands = []  # list of (d_wlden, (new_x, new_y))
+                # Enumerate candidate positions (directions × step sizes). For
+                # hard macros, reject any that would overlap another hard macro
+                # (AABB intersection, vectorised). No cheap WL+density filter:
+                # every candidate is full-evaluated on the real proxy below.
+                # Dedup by clipped position: any step large enough to overshoot
+                # the canvas clips to the same corner/edge, so many of the large
+                # multipliers produce identical positions — evaluate each unique
+                # position once (exact: duplicates have identical proxy).
+                cands = []  # list of (new_x, new_y)
+                seen = set()
                 for mult in step_mults:
                     s = base_step * mult
                     for (dx, dy) in dirs:
@@ -983,6 +1425,10 @@ class v60_Placer:
                         new_y = float(np.clip(cur_y + dy * s, 0.0, ch))
                         if new_x == cur_x and new_y == cur_y:
                             continue
+                        key = (new_x, new_y)
+                        if key in seen:
+                            continue
+                        seen.add(key)
                         tested_this_sweep += 1
                         if is_hard:
                             # Vectorised hard-hard AABB overlap check.
@@ -997,41 +1443,47 @@ class v60_Placer:
                             no_overlap[m_i] = True  # ignore self
                             if not np.all(no_overlap):
                                 continue
-                        st = e.delta_for_move(m_i, (new_x, new_y), include_cong=False)
-                        d_wlden = st['delta_wl'] + 0.5 * st['delta_density']
-                        if d_wlden < 0.0:
-                            cands.append((d_wlden, (new_x, new_y)))
+                        cands.append((new_x, new_y))
 
                 if not cands:
                     continue
-                wl_den_pos += 1
+                active_macros += 1
 
-                # Top-K by WL+density delta, ascending (most negative first).
-                cands.sort(key=lambda t: t[0])
-                cands = cands[: max(1, self.cd_polish_top_k)]
-
-                # Full-eval each candidate by commit + proxy + revert.
-                # Track the one with the best real-proxy improvement.
-                best_new_proxy = cur_proxy
+                # Score every candidate on the real proxy WITHOUT committing,
+                # via the incremental cong scorer (no per-candidate re-smooth,
+                # no commit/revert churn); commit only the winning move. The
+                # per-macro base proxy is exact (cached assembled grids); each
+                # candidate proxy matches a full recompute to float-reorder.
+                cur_wl  = e.compute_wl_cost()
+                cur_den = e.compute_density_cost()
+                base_proxy = (WEIGHT_WL * cur_wl + WEIGHT_DENSITY * cur_den
+                              + WEIGHT_CONG * e.cong_cost())
+                # Score candidates: parallel across the pool when there are
+                # enough to amortise the IPC, else sequentially in this process.
+                # Either way the proxies come back in `cands` order, and the
+                # argmin below uses the same strict-< / first-index tie-break as
+                # the original sequential loop -> bit-identical move selection.
+                if pool is not None and len(cands) >= par_threshold:
+                    proxies = pool.score(m_i, cands, cur_wl, cur_den, e)
+                else:
+                    proxies = [e.proxy_for_move(m_i, xy, cur_wl, cur_den)
+                               for xy in cands]
+                best_new_proxy = base_proxy
                 best_new_xy = None
-                for (_dw, new_xy) in cands:
-                    st = e.delta_for_move(m_i, new_xy, include_cong=False)
-                    e.commit_move(m_i, new_xy, st)
-                    new_proxy = float(e.proxy(include_cong=True))
+                for new_xy, new_proxy in zip(cands, proxies):
                     if new_proxy < best_new_proxy:
                         best_new_proxy = new_proxy
                         best_new_xy = new_xy
-                    # Revert to original. cur_x/cur_y were captured before any
-                    # commits in this macro's evaluation, so the revert is exact.
-                    revert = e.delta_for_move(m_i, (cur_x, cur_y), include_cong=False)
-                    e.commit_move(m_i, (cur_x, cur_y), revert)
 
                 if best_new_xy is not None and \
-                        (cur_proxy - best_new_proxy) >= self.cd_polish_min_improve:
-                    # Commit the best candidate (state recomputed since we
-                    # reverted after each eval).
+                        (base_proxy - best_new_proxy) >= self.cd_polish_min_improve:
+                    # Commit the winning candidate (parent), then replay it to
+                    # the pool workers so their IncrementalEval copies stay in
+                    # sync for the next macro's scoring.
                     final_st = e.delta_for_move(m_i, best_new_xy, include_cong=False)
                     e.commit_move(m_i, best_new_xy, final_st)
+                    if pool is not None:
+                        pool.commit(m_i, best_new_xy)
                     cur_proxy = best_new_proxy
                     moved_this_sweep += 1
                     # Refresh the AABB so subsequent overlap checks see the new
@@ -1042,15 +1494,27 @@ class v60_Placer:
                         hard_aabb[m_i, 2] = best_new_xy[1] - hh_i
                         hard_aabb[m_i, 3] = best_new_xy[1] + hh_i
                 else:
-                    cong_rejected += 1
+                    no_improve += 1
 
             total_moved += moved_this_sweep
+            sweep_rel_improve = ((proxy_before_sweep - cur_proxy)
+                                 / max(abs(proxy_before_sweep), 1e-12))
             self._cd_log(
                 f"  CD sweep {sweep+1}/{self.cd_polish_sweeps}: "
-                f"tested={tested_this_sweep} wlden_neg={wl_den_pos} "
-                f"moved={moved_this_sweep} cong_rej={cong_rejected} "
-                f"proxy={cur_proxy:.6f}  elapsed={time.time()-t0:.1f}s"
+                f"tested={tested_this_sweep} active={active_macros} "
+                f"moved={moved_this_sweep} no_improve={no_improve} "
+                f"proxy={cur_proxy:.6f} sweep_improve={sweep_rel_improve*100:.3f}%  "
+                f"elapsed={time.time()-t0:.1f}s"
             )
+            # Early stop: this sweep reduced the proxy by less than the
+            # required fraction. Catches the long tail of marginal sweeps
+            # (the zero-move patience check below only fires on no moves at all).
+            if sweep_rel_improve < self.cd_polish_min_sweep_improve_frac:
+                self._cd_log(
+                    f"  CD: sweep improvement {sweep_rel_improve*100:.3f}% < "
+                    f"{self.cd_polish_min_sweep_improve_frac*100:.3f}% threshold, ending."
+                )
+                break
             if moved_this_sweep == 0:
                 zero_streak += 1
                 if zero_streak >= max(1, self.cd_polish_patience):
@@ -1067,11 +1531,262 @@ class v60_Placer:
             else:
                 zero_streak = 0
 
-        # Return polished placement.
+        return cur_proxy, total_moved
+
+    def _pair_swap_polish(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        plc: PlacementCost,
+    ):
+        """Pair-swap coordinate descent over hard macros.
+
+        For each movable hard macro m_i, consider swapping positions with
+        each of its k-nearest hard-macro neighbors. The cheap filter is
+        the sum of the two single-macro WL+density deltas — approximate,
+        since it ignores the interaction on nets that touch BOTH macros
+        (their shared-net bbox changes are double-counted, not composed),
+        but cheap enough to use as a candidate ranker. The top-K cheap
+        candidates are then fully re-evaluated against the real proxy
+        (commit both moves, eval, revert both moves), and the best
+        improving swap (if any) is committed.
+
+        Why this complements single-macro CD: single-macro CD misses
+        configurations where macro A is at the spot B 'wants' and vice
+        versa — neither move alone is an improvement, but swapping is.
+        Restricting to hard-hard swaps keeps the legality check tractable:
+        the swap is gated by AABB checks ensuring each macro at its new
+        position doesn't collide with any OTHER hard macro (the swap
+        partner is excluded from the check since it has moved out of the
+        way).
+
+        Sweeps stop after `pair_swap_patience` consecutive zero-swap
+        sweeps, or after `pair_swap_sweeps` complete. Within a sweep, a
+        macro that has already participated in a committed swap is
+        skipped for the rest of that sweep.
+        """
+        nM = int(benchmark.num_macros)
+        nH = int(benchmark.num_hard_macros)
+        if nH < 2 or not self.pair_swap_enabled:
+            return placement, None
+
+        movable = benchmark.get_movable_mask().cpu().numpy().astype(bool)
+        target_idx = np.where(movable[:nH])[0]
+        if target_idx.size < 2:
+            return placement, None
+
+        # Build IncrementalEval from current placement.
+        e = IncrementalEval(benchmark, plc=plc)
+        base_pos = placement[:nM].detach().cpu().numpy().astype(np.float64)
+        e.set_placement(base_pos)
+        cur_proxy = float(e.proxy(include_cong=True))
+
+        self._swap_log(
+            f"[v60 {benchmark.name}] pair-swap start: proxy={cur_proxy:.6f}  "
+            f"nT={int(target_idx.size)}  sweeps={self.pair_swap_sweeps}  "
+            f"k_neighbors={self.pair_swap_k_neighbors}  k_co_net={self.pair_swap_k_co_net}"
+        )
+        t0 = time.time()
+
+        # Hard-macro AABB cache (xlo, xhi, ylo, yhi).
+        hard_aabb = np.zeros((nH, 4), dtype=np.float64)
+        for m in range(nH):
+            cx = float(e.macro_pos[m, 0]); cy = float(e.macro_pos[m, 1])
+            hw = float(e.macro_w[m]) * 0.5; hh = float(e.macro_h[m]) * 0.5
+            hard_aabb[m, 0] = cx - hw
+            hard_aabb[m, 1] = cx + hw
+            hard_aabb[m, 2] = cy - hh
+            hard_aabb[m, 3] = cy + hh
+
+        # Co-net partner counts: co_net_count[i, j] is the number of nets
+        # whose pin set covers both hard macros i and j. Used as a second
+        # partner-selection axis alongside spatial proximity — many pairs
+        # that are net-coupled are spatially distant and would never be
+        # considered by k-nearest alone.
+        co_net_count = None
+        if self.pair_swap_k_co_net > 0:
+            co_net_count = np.zeros((nH, nH), dtype=np.int32)
+            pin_owner = e.pin_owner
+            for pin_idxs in e.net_pins:
+                pin_idxs = np.asarray(pin_idxs)
+                if pin_idxs.size < 2:
+                    continue
+                owners = pin_owner[pin_idxs]
+                hard_on_net = np.unique(owners[owners < nH])
+                if hard_on_net.size < 2:
+                    continue
+                for ii in range(hard_on_net.size):
+                    for jj in range(ii + 1, hard_on_net.size):
+                        i = int(hard_on_net[ii]); j = int(hard_on_net[jj])
+                        co_net_count[i, j] += 1
+                        co_net_count[j, i] += 1
+            nonzero_pairs = int(np.count_nonzero(co_net_count) // 2)
+            self._swap_log(
+                f"  pair-swap co-net precomp: {nonzero_pairs} hard-hard pairs "
+                f"share ≥1 net (k_co_net={self.pair_swap_k_co_net})"
+            )
+        all_others_base = np.array(
+            [j for j in target_idx], dtype=int,
+        )
+
+        rng = np.random.default_rng(self.seed if self.deterministic else None)
+        total_swaps = 0
+        zero_streak = 0
+
+        for sweep in range(self.pair_swap_sweeps):
+            order = target_idx[rng.permutation(len(target_idx))]
+            swaps_this_sweep = 0
+            cands_evaluated  = 0
+            aabb_pass        = 0
+            full_evals       = 0
+
+            for m_i in order:
+                m_i = int(m_i)
+                pos_i = e.macro_pos[m_i].copy()
+                hw_i = float(e.macro_w[m_i]) * 0.5
+                hh_i = float(e.macro_h[m_i]) * 0.5
+
+                # Partner pool: union of (a) k-nearest spatial neighbors and
+                # (b) top-K macros by shared-net count. The once-per-sweep
+                # lockout is intentionally absent — a macro can participate
+                # in multiple committed swaps per sweep, with min_improve > 0
+                # preventing oscillation.
+                avail = all_others_base[all_others_base != m_i]
+                if avail.size == 0:
+                    continue
+                other_pos = e.macro_pos[avail]
+                dists = np.linalg.norm(other_pos - pos_i, axis=1)
+                k = min(self.pair_swap_k_neighbors, avail.size)
+                if k < avail.size:
+                    spatial = avail[np.argpartition(dists, k - 1)[:k]]
+                else:
+                    spatial = avail
+                if co_net_count is not None and self.pair_swap_k_co_net > 0:
+                    row = co_net_count[m_i]
+                    if row.max() > 0:
+                        K_co = min(self.pair_swap_k_co_net, nH - 1)
+                        top_idx = np.argpartition(row, -K_co)[-K_co:]
+                        co_partners = top_idx[row[top_idx] > 0]
+                        nearest = np.unique(np.concatenate([spatial, co_partners]))
+                        nearest = nearest[nearest != m_i]
+                    else:
+                        nearest = spatial
+                else:
+                    nearest = spatial
+
+                # Collect AABB-legal swap candidates. The WL+density cheap
+                # filter was dropped after empirical evidence on ibm06: cong
+                # is the dominant cost term, and cong-improving swaps with
+                # neutral-or-positive WL+density were being rejected before
+                # full-eval. We now full-eval every legal swap with one of
+                # the k-nearest hard macros.
+                cands = []  # list of (m_j, pos_j)
+                for m_j in nearest:
+                    m_j = int(m_j)
+                    pos_j = e.macro_pos[m_j].copy()
+                    hw_j = float(e.macro_w[m_j]) * 0.5
+                    hh_j = float(e.macro_h[m_j]) * 0.5
+                    cands_evaluated += 1
+
+                    # AABB legality: i at pos_j and j at pos_i must not
+                    # overlap any OTHER hard macro. Exclude {i, j} since
+                    # they swap out of each other's way.
+                    xlo_i = pos_j[0] - hw_i; xhi_i = pos_j[0] + hw_i
+                    ylo_i = pos_j[1] - hh_i; yhi_i = pos_j[1] + hh_i
+                    no_ov_i = (
+                        (xhi_i <= hard_aabb[:, 0]) |
+                        (xlo_i >= hard_aabb[:, 1]) |
+                        (yhi_i <= hard_aabb[:, 2]) |
+                        (ylo_i >= hard_aabb[:, 3])
+                    )
+                    no_ov_i[m_i] = True; no_ov_i[m_j] = True
+                    if not np.all(no_ov_i):
+                        continue
+                    xlo_j = pos_i[0] - hw_j; xhi_j = pos_i[0] + hw_j
+                    ylo_j = pos_i[1] - hh_j; yhi_j = pos_i[1] + hh_j
+                    no_ov_j = (
+                        (xhi_j <= hard_aabb[:, 0]) |
+                        (xlo_j >= hard_aabb[:, 1]) |
+                        (yhi_j <= hard_aabb[:, 2]) |
+                        (ylo_j >= hard_aabb[:, 3])
+                    )
+                    no_ov_j[m_i] = True; no_ov_j[m_j] = True
+                    if not np.all(no_ov_j):
+                        continue
+                    # The pair themselves can't overlap each other at their
+                    # new positions either.
+                    pair_ok = (
+                        (xhi_i <= xlo_j) or (xlo_i >= xhi_j) or
+                        (yhi_i <= ylo_j) or (ylo_i >= yhi_j)
+                    )
+                    if not pair_ok:
+                        continue
+
+                    cands.append((m_j, pos_j))
+
+                if not cands:
+                    continue
+                aabb_pass += 1
+
+                # Full real-proxy evaluation of each AABB-legal swap, via the
+                # incremental two-macro scorer (no commit, no full re-smooth).
+                # Bit-identical to the old commit-both / proxy / revert-both path.
+                best_new_proxy = cur_proxy
+                best_j = None
+                best_pos_j = None
+                cur_wl = e.compute_wl_cost()
+                pi = (float(pos_i[0]), float(pos_i[1]))
+                for (m_j, pos_j) in cands:
+                    full_evals += 1
+                    pj = (float(pos_j[0]), float(pos_j[1]))
+                    new_proxy = e.proxy_for_swap(m_i, m_j, pj, pi, cur_wl)
+                    if new_proxy < best_new_proxy:
+                        best_new_proxy = new_proxy
+                        best_j = m_j
+                        best_pos_j = pos_j
+
+                if best_j is not None and \
+                        (cur_proxy - best_new_proxy) >= self.pair_swap_min_improve:
+                    pj = (float(best_pos_j[0]), float(best_pos_j[1]))
+                    pi = (float(pos_i[0]), float(pos_i[1]))
+                    st_i = e.delta_for_move(m_i, pj, include_cong=False)
+                    e.commit_move(m_i, pj, st_i)
+                    st_j = e.delta_for_move(best_j, pi, include_cong=False)
+                    e.commit_move(best_j, pi, st_j)
+                    cur_proxy = best_new_proxy
+                    swaps_this_sweep += 1
+                    # Refresh AABB for both swapped macros.
+                    hw_b = float(e.macro_w[best_j]) * 0.5
+                    hh_b = float(e.macro_h[best_j]) * 0.5
+                    hard_aabb[m_i, 0] = pj[0] - hw_i
+                    hard_aabb[m_i, 1] = pj[0] + hw_i
+                    hard_aabb[m_i, 2] = pj[1] - hh_i
+                    hard_aabb[m_i, 3] = pj[1] + hh_i
+                    hard_aabb[best_j, 0] = pi[0] - hw_b
+                    hard_aabb[best_j, 1] = pi[0] + hw_b
+                    hard_aabb[best_j, 2] = pi[1] - hh_b
+                    hard_aabb[best_j, 3] = pi[1] + hh_b
+
+            total_swaps += swaps_this_sweep
+            self._swap_log(
+                f"  pair-swap sweep {sweep+1}/{self.pair_swap_sweeps}: "
+                f"cands={cands_evaluated} aabb_pass={aabb_pass} "
+                f"full_evals={full_evals} swaps={swaps_this_sweep} "
+                f"proxy={cur_proxy:.6f}  elapsed={time.time()-t0:.1f}s"
+            )
+            if swaps_this_sweep == 0:
+                zero_streak += 1
+                if zero_streak >= max(1, self.pair_swap_patience):
+                    self._swap_log(
+                        f"  pair-swap: {zero_streak} consecutive zero-swap sweep(s); "
+                        f"patience={self.pair_swap_patience} hit, ending."
+                    )
+                    break
+            else:
+                zero_streak = 0
+
         out = placement.clone()
         out[:nM] = torch.tensor(e.macro_pos, dtype=out.dtype)
-        # Also return a dict resembling compute_proxy_cost's output, computed
-        # from the IncrementalEval caches we already have populated.
         br = e.proxy_breakdown(include_cong=True)
         costs = {
             'proxy_cost':      br['proxy_cost'],
@@ -1079,9 +1794,224 @@ class v60_Placer:
             'density_cost':    br['density_cost'],
             'congestion_cost': br['congestion_cost'],
         }
-        self._cd_log(
-            f"[v60 {benchmark.name}] CD polish done: "
-            f"total_moved={total_moved} proxy={cur_proxy:.6f}  "
+        self._swap_log(
+            f"[v60 {benchmark.name}] pair-swap done: total_swaps={total_swaps} "
+            f"proxy={cur_proxy:.6f}  "
+            f"wl={costs['wirelength_cost']:.3f} den={costs['density_cost']:.3f} "
+            f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
+        )
+        return out, costs
+
+    def _pair_swap_polish_soft(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        plc: PlacementCost,
+    ):
+        """Pair-swap coordinate descent over SOFT macros.
+
+        Mirrors `_pair_swap_polish` for hard macros but with two key
+        differences:
+          1. No AABB legality check. Soft macros are cluster proxies that
+             legally overlap in v60's representation; any swap is
+             geometrically valid.
+          2. Co-net partners only — spatial k-nearest scales poorly to
+             the thousands of soft macros typical of these benchmarks.
+             For each source soft macro i, partners are the top-K macros
+             (soft or hard) that share the most nets with i.
+          3. No cheap WL+density pre-filter: every AABB-legal partner is
+             full-eval'd on the real proxy. This catches cong-affecting
+             swaps that a WL+density filter would reject (most swaps
+             don't move cong much, but the ones that do are exactly the
+             ones we don't want to throw away on a cheap heuristic).
+             Cost grows linearly with k_co_net, so keep that small.
+
+        Multi-swap-per-sweep is on; min_improve > 0 blocks oscillation.
+        """
+        nM = int(benchmark.num_macros)
+        nH = int(benchmark.num_hard_macros)
+        nS = nM - nH
+        if nS < 2 or not self.soft_pair_swap_enabled:
+            return placement, None
+
+        movable = benchmark.get_movable_mask().cpu().numpy().astype(bool)
+        target_idx = np.where(movable[:nM] & (np.arange(nM) >= nH))[0]
+        if target_idx.size < 2:
+            return placement, None
+
+        e = IncrementalEval(benchmark, plc=plc)
+        base_pos = placement[:nM].detach().cpu().numpy().astype(np.float64)
+        e.set_placement(base_pos)
+        cur_proxy = float(e.proxy(include_cong=True))
+
+        self._soft_swap_log(
+            f"[v60 {benchmark.name}] soft-pair-swap start: proxy={cur_proxy:.6f}  "
+            f"nT={int(target_idx.size)}  sweeps={self.soft_pair_swap_sweeps}  "
+            f"k_co_net={self.soft_pair_swap_k_co_net}"
+        )
+        t0 = time.time()
+
+        # Co-net counts over ALL macros (soft can be net-coupled to hard or
+        # other soft; partners can be either). [nM, nM] symmetric.
+        co_net_count = np.zeros((nM, nM), dtype=np.int32)
+        pin_owner = e.pin_owner
+        for pin_idxs in e.net_pins:
+            pin_idxs = np.asarray(pin_idxs)
+            if pin_idxs.size < 2:
+                continue
+            owners = pin_owner[pin_idxs]
+            macros_on_net = np.unique(owners[owners < nM])
+            if macros_on_net.size < 2:
+                continue
+            for ii in range(macros_on_net.size):
+                for jj in range(ii + 1, macros_on_net.size):
+                    a = int(macros_on_net[ii]); b = int(macros_on_net[jj])
+                    co_net_count[a, b] += 1
+                    co_net_count[b, a] += 1
+        nonzero_pairs = int(np.count_nonzero(co_net_count) // 2)
+        self._soft_swap_log(
+            f"  soft-pair-swap co-net precomp: {nonzero_pairs} macro-macro pairs "
+            f"share ≥1 net"
+        )
+
+        # Hard-macro AABB cache — needed for safety check when a soft source's
+        # partner is a hard macro. The hard macro must not overlap any OTHER
+        # hard macro at its new (= soft source's old) position. Soft source
+        # at hard's old position is free since soft has no overlap restriction.
+        hard_aabb = np.zeros((nH, 4), dtype=np.float64) if nH > 0 else None
+        if hard_aabb is not None:
+            for m in range(nH):
+                cx = float(e.macro_pos[m, 0]); cy = float(e.macro_pos[m, 1])
+                hw = float(e.macro_w[m]) * 0.5; hh = float(e.macro_h[m]) * 0.5
+                hard_aabb[m, 0] = cx - hw
+                hard_aabb[m, 1] = cx + hw
+                hard_aabb[m, 2] = cy - hh
+                hard_aabb[m, 3] = cy + hh
+
+        K_co  = self.soft_pair_swap_k_co_net
+        rng   = np.random.default_rng(self.seed if self.deterministic else None)
+        total_swaps = 0
+        zero_streak = 0
+
+        for sweep in range(self.soft_pair_swap_sweeps):
+            order = target_idx[rng.permutation(len(target_idx))]
+            swaps_this_sweep = 0
+            cands_evaluated  = 0
+            aabb_pass        = 0
+            full_evals       = 0
+
+            for m_i in order:
+                m_i = int(m_i)
+                pos_i = e.macro_pos[m_i].copy()
+
+                # Top-K co-net partners (any macro, soft or hard).
+                row = co_net_count[m_i]
+                if row.max() == 0:
+                    continue
+                K = min(K_co, nM - 1)
+                top = np.argpartition(row, -K)[-K:]
+                partners = top[row[top] > 0]
+                partners = partners[partners != m_i]
+                if partners.size == 0:
+                    continue
+
+                # Collect AABB-legal partners (no cheap filter — every legal
+                # candidate is full-eval'd below).
+                cands = []  # (m_j, pos_j, is_hard_j)
+                for m_j in partners:
+                    m_j = int(m_j)
+                    pos_j = e.macro_pos[m_j].copy()
+                    is_hard_j = (m_j < nH)
+                    cands_evaluated += 1
+
+                    # If partner is hard, AABB-check the hard macro at the
+                    # soft source's position against every other hard macro.
+                    # The soft at the hard's old position is unconstrained.
+                    if is_hard_j and hard_aabb is not None:
+                        hw_j = float(e.macro_w[m_j]) * 0.5
+                        hh_j = float(e.macro_h[m_j]) * 0.5
+                        xlo = pos_i[0] - hw_j; xhi = pos_i[0] + hw_j
+                        ylo = pos_i[1] - hh_j; yhi = pos_i[1] + hh_j
+                        no_ov = (
+                            (xhi <= hard_aabb[:, 0]) |
+                            (xlo >= hard_aabb[:, 1]) |
+                            (yhi <= hard_aabb[:, 2]) |
+                            (ylo >= hard_aabb[:, 3])
+                        )
+                        no_ov[m_j] = True  # self
+                        if not np.all(no_ov):
+                            continue
+
+                    cands.append((m_j, pos_j, is_hard_j))
+
+                if not cands:
+                    continue
+                aabb_pass += 1
+
+                # Full real-proxy eval of every AABB-legal partner, via the
+                # incremental two-macro scorer (no commit, no full re-smooth).
+                best_new_proxy = cur_proxy
+                best = None  # (m_j, pos_j, is_hard_j)
+                cur_wl = e.compute_wl_cost()
+                pi = (float(pos_i[0]), float(pos_i[1]))
+                for (m_j, pos_j, is_hard_j) in cands:
+                    full_evals += 1
+                    pj = (float(pos_j[0]), float(pos_j[1]))
+                    new_proxy = e.proxy_for_swap(m_i, m_j, pj, pi, cur_wl)
+                    if new_proxy < best_new_proxy:
+                        best_new_proxy = new_proxy
+                        best = (m_j, pos_j, is_hard_j)
+
+                if best is not None and \
+                        (cur_proxy - best_new_proxy) >= self.soft_pair_swap_min_improve:
+                    m_j, pos_j, is_hard_j = best
+                    pj = (float(pos_j[0]), float(pos_j[1]))
+                    pi = (float(pos_i[0]), float(pos_i[1]))
+                    st_i = e.delta_for_move(m_i, pj, include_cong=False)
+                    e.commit_move(m_i, pj, st_i)
+                    st_j = e.delta_for_move(m_j, pi, include_cong=False)
+                    e.commit_move(m_j, pi, st_j)
+                    cur_proxy = best_new_proxy
+                    swaps_this_sweep += 1
+                    # If the partner was a hard macro, refresh its AABB row.
+                    if is_hard_j and hard_aabb is not None:
+                        hw_j = float(e.macro_w[m_j]) * 0.5
+                        hh_j = float(e.macro_h[m_j]) * 0.5
+                        hard_aabb[m_j, 0] = pi[0] - hw_j
+                        hard_aabb[m_j, 1] = pi[0] + hw_j
+                        hard_aabb[m_j, 2] = pi[1] - hh_j
+                        hard_aabb[m_j, 3] = pi[1] + hh_j
+
+            total_swaps += swaps_this_sweep
+            self._soft_swap_log(
+                f"  soft-pair-swap sweep {sweep+1}/{self.soft_pair_swap_sweeps}: "
+                f"cands={cands_evaluated} aabb_pass={aabb_pass} "
+                f"full_evals={full_evals} swaps={swaps_this_sweep} "
+                f"proxy={cur_proxy:.6f}  elapsed={time.time()-t0:.1f}s"
+            )
+            if swaps_this_sweep == 0:
+                zero_streak += 1
+                if zero_streak >= max(1, self.soft_pair_swap_patience):
+                    self._soft_swap_log(
+                        f"  soft-pair-swap: {zero_streak} consecutive zero-swap sweep(s); "
+                        f"patience={self.soft_pair_swap_patience} hit, ending."
+                    )
+                    break
+            else:
+                zero_streak = 0
+
+        out = placement.clone()
+        out[:nM] = torch.tensor(e.macro_pos, dtype=out.dtype)
+        br = e.proxy_breakdown(include_cong=True)
+        costs = {
+            'proxy_cost':      br['proxy_cost'],
+            'wirelength_cost': br['wirelength_cost'],
+            'density_cost':    br['density_cost'],
+            'congestion_cost': br['congestion_cost'],
+        }
+        self._soft_swap_log(
+            f"[v60 {benchmark.name}] soft-pair-swap done: total_swaps={total_swaps} "
+            f"proxy={cur_proxy:.6f}  "
             f"wl={costs['wirelength_cost']:.3f} den={costs['density_cost']:.3f} "
             f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
         )

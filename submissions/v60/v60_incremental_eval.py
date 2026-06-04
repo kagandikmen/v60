@@ -76,6 +76,11 @@ DENSITY_HALF     = 0.5    # PLC: returns 0.5 * mean(top-10%)
 
 ABU_FRAC_CONG    = 0.05   # PLC get_congestion_cost: top-5% of (V + H)
 
+# Per-net pin count at/above which _add_net_to_routing vectorizes the grid-cell
+# lookup. Below it the scalar path is faster (numpy setup overhead dominates on
+# the 2-4 pin nets that make up most of a netlist); the two paths are bit-identical.
+_NET_VECTORIZE_MIN = 8
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  IncrementalEval
@@ -105,8 +110,11 @@ class IncrementalEval:
         macro_overlap[m]        dict {(row, col) -> overlap_area} — what macro m contributes per cell
                                 (rebuilt incrementally; used for O(1) undo of contribution)
 
-      Cong caches (partial):
-        TODO
+      Cong caches:
+        raw_V, raw_H       [G_r*G_c] float — flat per-cell net routing
+                                             demand (V/H), updated per move
+        macro_raw_V, macro_raw_H [G_r*G_c] float — flat per-cell hard-macro
+                                             blockage demand (V/H)
 
       Misc:
         macro_pos   [nM, 2]
@@ -256,12 +264,6 @@ class IncrementalEval:
         self.plc_net_cnt    = max(1, plc_net_cnt)
         self.wl_denominator = (self.canvas_w + self.canvas_h) * self.plc_net_cnt
 
-        # Sanity log so the user can spot empty-pin-table bugs immediately.
-        n_nonempty_nets = sum(1 for pis in self.net_pins if pis.size > 0)
-        print(f"[IncrementalEval] N={self.N}  P={self.P}  "
-              f"nets_with_pins={n_nonempty_nets}  "
-              f"plc.net_cnt={self.plc_net_cnt}  "
-              f"macros={self.nM} (hard={self.nH}, ports={self.nP})")
 
     # ───────────────────────────────────────────────────────────────────────
     #  Setup
@@ -547,6 +549,39 @@ class IncrementalEval:
         for m in range(self.nH):
             self._add_macro_blockage(m, self.macro_raw_V, self.macro_raw_H)
 
+        # ── Incremental cong scoring cache ─────────────────────────────────
+        # Assembled (normalised + smoothed-net + macro) grids, kept exact here
+        # and by commit_move(); _cong_cost_for_move() scores candidate moves
+        # against them without a full re-smooth. _cntc/_cntr are the per-column
+        # / per-row box-blur window sizes; _cong_d* are reusable scratch grids
+        # for accumulating per-move routing/blockage deltas.
+        self._cong_Vf, self._cong_Hf = self._build_full_routing_grids()
+        sr = self.smooth_range
+        _cols = np.arange(self.G_cols)
+        self._cntc = (np.minimum(self.G_cols - 1, _cols + sr)
+                      - np.maximum(0, _cols - sr) + 1).astype(np.float64)
+        _rows = np.arange(self.G_rows)
+        self._cntr = (np.minimum(self.G_rows - 1, _rows + sr)
+                      - np.maximum(0, _rows - sr) + 1).astype(np.float64)
+        _G = self.G_rows * self.G_cols
+        self._cong_dV  = np.zeros(_G, dtype=np.float64)
+        self._cong_dH  = np.zeros(_G, dtype=np.float64)
+        self._cong_dMV = np.zeros(_G, dtype=np.float64)
+        self._cong_dMH = np.zeros(_G, dtype=np.float64)
+        self._score_prep_macro = -1   # macro whose old routes are cached (-1 = none)
+        # Per-macro soft-cong memo: {gcell-signature -> cong cost}. A soft macro
+        # has no blockage, so its candidate cong depends ONLY on where its pins
+        # land in gcells; candidates sharing a signature share a bit-identical
+        # cong. Reset per macro by _prep_old_routes (see _cong_cost_for_move).
+        self._cong_sig_cache = {}
+        # Per-macro pin-gcell cache for the cached candidate re-route: {pin ->
+        # (row, col)}. Filled per macro by _prep_old_routes with the FIXED pins'
+        # gcells (constant across the macro's candidates); the moving macro's own
+        # pins are overwritten per candidate in _cong_cost_for_move. Lets
+        # _add_net_to_routing_cached skip the per-pin gcell recompute (~70% of
+        # per-candidate pin lookups are non-moving).
+        self._cong_gcell = {}
+
     def _refresh_all_pin_positions(self) -> None:
         """Recompute self.pin_xy from current macro_pos and port_pos."""
         for p_idx in range(self.P):
@@ -669,12 +704,11 @@ class IncrementalEval:
         tr, tc = sink_rc
         row_min = min(tr, sr); row_max = max(tr, sr)
         col_min = min(tc, sc); col_max = max(tc, sc)
-        # H routing along source row, columns [col_min, col_max)
-        for c in range(col_min, col_max):
-            H_arr[sr * self.G_cols + c] += weight
-        # V routing along sink column, rows [row_min, row_max)
-        for r in range(row_min, row_max):
-            V_arr[r * self.G_cols + tc] += weight
+        Gc = self.G_cols
+        # H routing along source row, columns [col_min, col_max) — contiguous.
+        H_arr[sr * Gc + col_min: sr * Gc + col_max] += weight
+        # V routing along sink column, rows [row_min, row_max) — strided by Gc.
+        V_arr[row_min * Gc + tc: row_max * Gc + tc: Gc] += weight
 
     def _add_three_pin_segment(self, node_gcells_list, weight: float,
                                  V_arr: np.ndarray, H_arr: np.ndarray) -> None:
@@ -685,30 +719,31 @@ class IncrementalEval:
         y2, x2 = temp[1]
         y3, x3 = temp[2]
 
+        Gc = self.G_cols
+        # Each scalar loop below maps to ONE basic slice add (contiguous along
+        # a row for H; strided by Gc along a column for V). Within a single
+        # loop all indices are distinct, and keeping one slice per original
+        # loop in the same sequence preserves the cross-loop += order into any
+        # shared cell — bit-identical to the per-cell version.
         if x1 < x2 and x2 < x3 and min(y1, y3) < y2 and max(y1, y3) > y2:
             # L-route: see PLC __l_routing.
-            for c in range(x1, x2):
-                H_arr[y1 * self.G_cols + c] += weight
-            for c in range(x2, x3):
-                H_arr[y2 * self.G_cols + c] += weight
-            for r in range(min(y1, y2), max(y1, y2)):
-                V_arr[r * self.G_cols + x2] += weight
-            for r in range(min(y2, y3), max(y2, y3)):
-                V_arr[r * self.G_cols + x3] += weight
+            H_arr[y1 * Gc + x1: y1 * Gc + x2] += weight
+            H_arr[y2 * Gc + x2: y2 * Gc + x3] += weight
+            lo = min(y1, y2); hi = max(y1, y2)
+            V_arr[lo * Gc + x2: hi * Gc + x2: Gc] += weight
+            lo = min(y2, y3); hi = max(y2, y3)
+            V_arr[lo * Gc + x3: hi * Gc + x3: Gc] += weight
         elif x2 == x3 and x1 < x2 and y1 < min(y2, y3):
             # Special case: two pins share x, third is to the left + below.
-            for c in range(x1, x2):
-                H_arr[y1 * self.G_cols + c] += weight
-            for r in range(y1, max(y2, y3)):
-                V_arr[r * self.G_cols + x2] += weight
+            H_arr[y1 * Gc + x1: y1 * Gc + x2] += weight
+            hi = max(y2, y3)
+            V_arr[y1 * Gc + x2: hi * Gc + x2: Gc] += weight
         elif y2 == y3:
             # Special case: two pins share y.
-            for c in range(x1, x2):
-                H_arr[y1 * self.G_cols + c] += weight
-            for c in range(x2, x3):
-                H_arr[y2 * self.G_cols + c] += weight
-            for r in range(min(y2, y1), max(y2, y1)):
-                V_arr[r * self.G_cols + x2] += weight
+            H_arr[y1 * Gc + x1: y1 * Gc + x2] += weight
+            H_arr[y2 * Gc + x2: y2 * Gc + x3] += weight
+            lo = min(y2, y1); hi = max(y2, y1)
+            V_arr[lo * Gc + x2: hi * Gc + x2: Gc] += weight
         else:
             # T-route: PLC __t_routing.
             # PLC: node_gcells.sort() — default tuple sort, i.e. by (row, col).
@@ -717,12 +752,11 @@ class IncrementalEval:
             y2t, x2t = t2[1]
             y3t, x3t = t2[2]
             xmin = min(x1t, x2t, x3t); xmax = max(x1t, x2t, x3t)
-            for c in range(xmin, xmax):
-                H_arr[y2t * self.G_cols + c] += weight
-            for r in range(min(y1t, y2t), max(y1t, y2t)):
-                V_arr[r * self.G_cols + x1t] += weight
-            for r in range(min(y2t, y3t), max(y2t, y3t)):
-                V_arr[r * self.G_cols + x3t] += weight
+            H_arr[y2t * Gc + xmin: y2t * Gc + xmax] += weight
+            lo = min(y1t, y2t); hi = max(y1t, y2t)
+            V_arr[lo * Gc + x1t: hi * Gc + x1t: Gc] += weight
+            lo = min(y2t, y3t); hi = max(y2t, y3t)
+            V_arr[lo * Gc + x3t: hi * Gc + x3t: Gc] += weight
 
     def _add_net_to_routing(self, net_idx: int,
                               V_arr: np.ndarray, H_arr: np.ndarray,
@@ -739,21 +773,36 @@ class IncrementalEval:
         if pis.size < 2:
             return
         weight = float(self.net_weight[net_idx]) * sign
-        # Driver pin = first.
-        drv = int(pis[0])
-        source_rc = self._grid_cell_for_pos_f32(
-            np.float32(self.pin_xy[drv, 0]),
-            np.float32(self.pin_xy[drv, 1]),
-        )
-        # Build unique gcells across all pins.
-        gcells = {source_rc}
-        for p in pis:
-            p_int = int(p)
-            rc = self._grid_cell_for_pos_f32(
-                np.float32(self.pin_xy[p_int, 0]),
-                np.float32(self.pin_xy[p_int, 1]),
+        # Per-pin grid-cell lookup. Driver pin = pis[0], so source_rc is its
+        # cell. Small nets use the scalar path (numpy setup overhead dominates);
+        # larger nets vectorize. Both reproduce _grid_cell_for_pos_f32 exactly:
+        # float32-narrow the position, then np.float32(x / grid_w) (NEP-50-
+        # faithful across numpy versions), then floor + clamp — so the unique
+        # gcell SET is identical, and the constant per-net weight makes the
+        # downstream += order irrelevant.
+        if pis.size < _NET_VECTORIZE_MIN:
+            drv = int(pis[0])
+            source_rc = self._grid_cell_for_pos_f32(
+                np.float32(self.pin_xy[drv, 0]),
+                np.float32(self.pin_xy[drv, 1]),
             )
-            gcells.add(rc)
+            gcells = {source_rc}
+            for p in pis[1:]:
+                p_int = int(p)
+                gcells.add(self._grid_cell_for_pos_f32(
+                    np.float32(self.pin_xy[p_int, 0]),
+                    np.float32(self.pin_xy[p_int, 1]),
+                ))
+        else:
+            idx = pis.astype(np.intp)
+            xs = self.pin_xy[idx, 0].astype(np.float32)
+            ys = self.pin_xy[idx, 1].astype(np.float32)
+            cols = np.floor(np.float32(xs / self.grid_w)).astype(np.int64)
+            rows = np.floor(np.float32(ys / self.grid_h)).astype(np.int64)
+            np.clip(cols, 0, self.G_cols - 1, out=cols)
+            np.clip(rows, 0, self.G_rows - 1, out=rows)
+            source_rc = (int(rows[0]), int(cols[0]))
+            gcells = set(zip(rows.tolist(), cols.tolist()))
 
         n = len(gcells)
         if n == 2:
@@ -888,62 +937,41 @@ class IncrementalEval:
         vra = self.vrouting_alloc * sign
         hra = self.hrouting_alloc * sign
 
-        if_partial_v = False
-        if_partial_h = False
-        # First pass: add to both grids — using PLC's coupled __overlap_dist.
-        for r in range(bl_row, ur_row + 1):
-            cy_lo = r * gh
-            cy_hi = cy_lo + gh
-            y_raw = min(y_hi, cy_hi) - max(y_lo, cy_lo)
-            for c in range(bl_col, ur_col + 1):
-                cx_lo = c * gw
-                cx_hi = cx_lo + gw
-                x_raw = min(x_hi, cx_hi) - max(x_lo, cx_lo)
-                # PLC __overlap_dist: returns (0, 0) if EITHER is non-positive.
-                if x_raw > 0 and y_raw > 0:
-                    x_dist = x_raw; y_dist = y_raw
-                else:
-                    x_dist = 0.0; y_dist = 0.0
-                if ur_row != bl_row:
-                    if (r == bl_row and abs(y_dist - gh) > 1e-5) or \
-                       (r == ur_row and abs(y_dist - gh) > 1e-5):
-                        if_partial_v = True
-                if ur_col != bl_col:
-                    if (c == bl_col and abs(x_dist - gw) > 1e-5) or \
-                       (c == ur_col and abs(x_dist - gw) > 1e-5):
-                        if_partial_h = True
-                V_arr[r * self.G_cols + c] += x_dist * vra
-                H_arr[r * self.G_cols + c] += y_dist * hra
-        # Second pass: partial-overlap correction. PLC re-computes x/y_dist
-        # via __overlap_dist (same coupled rule) inside the correction loops.
-        if if_partial_v:
-            r = ur_row
-            cy_lo = r * gh
-            cy_hi = cy_lo + gh
-            y_raw = min(y_hi, cy_hi) - max(y_lo, cy_lo)
-            for c in range(bl_col, ur_col + 1):
-                cx_lo = c * gw
-                cx_hi = cx_lo + gw
-                x_raw = min(x_hi, cx_hi) - max(x_lo, cx_lo)
-                if x_raw > 0 and y_raw > 0:
-                    x_dist = x_raw
-                else:
-                    x_dist = 0.0
-                V_arr[r * self.G_cols + c] -= x_dist * vra
-        if if_partial_h:
-            c = ur_col
-            cx_lo = c * gw
-            cx_hi = cx_lo + gw
-            x_raw = min(x_hi, cx_hi) - max(x_lo, cx_lo)
-            for r in range(bl_row, ur_row + 1):
-                cy_lo = r * gh
-                cy_hi = cy_lo + gh
-                y_raw = min(y_hi, cy_hi) - max(y_lo, cy_lo)
-                if x_raw > 0 and y_raw > 0:
-                    y_dist = y_raw
-                else:
-                    y_dist = 0.0
-                H_arr[r * self.G_cols + c] -= y_dist * hra
+        # Vectorized block update, bit-identical to the per-cell double loop.
+        # Row/col overlap distances are 1-D; PLC's __overlap_dist couples them
+        # (a cell contributes only where BOTH overlaps are positive), so each
+        # cell's x_dist/y_dist is the 1-D value masked by the outer-product
+        # validity. cx_hi/cy_hi are formed as cx_lo+gw / cy_lo+gh (NOT
+        # (c+1)*gw) to match the scalar rounding exactly.
+        rows = np.arange(bl_row, ur_row + 1)
+        cols = np.arange(bl_col, ur_col + 1)
+        cy_lo = rows * gh
+        cy_hi = cy_lo + gh
+        y_raw = np.minimum(y_hi, cy_hi) - np.maximum(y_lo, cy_lo)        # [nr]
+        cx_lo = cols * gw
+        cx_hi = cx_lo + gw
+        x_raw = np.minimum(x_hi, cx_hi) - np.maximum(x_lo, cx_lo)        # [nc]
+        valid = (y_raw > 0.0)[:, None] & (x_raw > 0.0)[None, :]          # [nr, nc]
+        x_dist = np.where(valid, x_raw[None, :], 0.0)
+        y_dist = np.where(valid, y_raw[:, None], 0.0)
+        xd_vra = x_dist * vra
+        yd_hra = y_dist * hra
+
+        V2 = V_arr.reshape(self.G_rows, self.G_cols)
+        H2 = H_arr.reshape(self.G_rows, self.G_cols)
+        V2[bl_row:ur_row + 1, bl_col:ur_col + 1] += xd_vra
+        H2[bl_row:ur_row + 1, bl_col:ur_col + 1] += yd_hra
+
+        # Partial-overlap correction at the top boundary row / right boundary
+        # column. The flag is derived from the COUPLED dists on the two
+        # boundary rows/cols (matching PLC), and the correction subtracts the
+        # EXACT first-pass products so the net (prev + d) - d is bit-identical.
+        if ur_row != bl_row:
+            if np.any(np.abs(y_dist[[0, -1], :] - gh) > 1e-5):
+                V2[ur_row, bl_col:ur_col + 1] -= xd_vra[-1, :]
+        if ur_col != bl_col:
+            if np.any(np.abs(x_dist[:, [0, -1]] - gw) > 1e-5):
+                H2[bl_row:ur_row + 1, ur_col] -= yd_hra[:, -1]
 
     def _smooth_routing(self, V_in: np.ndarray, H_in: np.ndarray
                           ) -> Tuple[np.ndarray, np.ndarray]:
@@ -964,31 +992,46 @@ class IncrementalEval:
         Gc = self.G_cols
         Gr = self.G_rows
 
-        # V cong: smooth across columns. For each (row, col), distribute
-        # V_in[row, col] / window_size across [col-sr, col+sr] clipped.
-        for r in range(Gr):
-            base = r * Gc
-            for c in range(Gc):
-                lp = c - sr
-                if lp < 0: lp = 0
-                rp = c + sr
-                if rp >= Gc: rp = Gc - 1
-                cnt = rp - lp + 1
-                val = V_in[base + c] / cnt
-                for ptr in range(lp, rp + 1):
-                    out_V[base + ptr] += val
-        # H cong: smooth across rows. For each (row, col), distribute
-        # H_in[row, col] / window_size across [row-sr, row+sr] clipped.
-        for r in range(Gr):
-            for c in range(Gc):
-                lp = r - sr
-                if lp < 0: lp = 0
-                up = r + sr
-                if up >= Gr: up = Gr - 1
-                cnt = up - lp + 1
-                val = H_in[r * Gc + c] / cnt
-                for ptr in range(lp, up + 1):
-                    out_H[ptr * Gc + c] += val
+        # Vectorized box blur, bit-identical to the per-cell scatter above.
+        # The scatter sends each source cell's value (pre-divided by its OWN
+        # clipped window count) to every output cell within ±sr, and for a
+        # valid output cell p the source set is exactly {c : |c - p| <= sr}
+        # (the clip only affects the per-source divisor, never membership).
+        # So: pre-divide each source by its window count, then accumulate the
+        # fixed-width window via integer shifts. Offsets MUST run in increasing
+        # order (-sr..+sr) so each output cell receives contributions in order
+        # of increasing source index, reproducing the scalar loop's += order
+        # exactly (constant-step shifts add identical operands per output).
+        V2d = V_in.reshape(Gr, Gc)
+        H2d = H_in.reshape(Gr, Gc)
+        out_V2d = out_V.reshape(Gr, Gc)   # views into the contiguous out arrays
+        out_H2d = out_H.reshape(Gr, Gc)
+
+        # V cong: smooth across columns (axis 1). Per-column window count.
+        cols = np.arange(Gc)
+        cntc = (np.minimum(Gc - 1, cols + sr) - np.maximum(0, cols - sr) + 1).astype(np.float64)
+        Wc = V2d / cntc[None, :]
+        for off in range(-sr, sr + 1):
+            if off >= 0:
+                if off < Gc:
+                    out_V2d[:, 0:Gc - off] += Wc[:, off:Gc]
+            else:
+                k = -off
+                if k < Gc:
+                    out_V2d[:, k:Gc] += Wc[:, 0:Gc - k]
+
+        # H cong: smooth across rows (axis 0). Per-row window count.
+        rows = np.arange(Gr)
+        cntr = (np.minimum(Gr - 1, rows + sr) - np.maximum(0, rows - sr) + 1).astype(np.float64)
+        Wr = H2d / cntr[:, None]
+        for off in range(-sr, sr + 1):
+            if off >= 0:
+                if off < Gr:
+                    out_H2d[0:Gr - off, :] += Wr[off:Gr, :]
+            else:
+                k = -off
+                if k < Gr:
+                    out_H2d[k:Gr, :] += Wr[0:Gr - k, :]
         return out_V, out_H
 
     def _abu_top_frac_mean(self, flat: np.ndarray, frac: float) -> float:
@@ -1038,6 +1081,365 @@ class IncrementalEval:
         V_final, H_final = self._build_full_routing_grids()
         flat = np.concatenate([V_final, H_final])
         return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+
+    # ───────────────────────────────────────────────────────────────────────
+    #  Incremental cong scoring (candidate moves, no commit)
+    # ───────────────────────────────────────────────────────────────────────
+    #  The assembled grids (normalised + box-blurred net demand + un-smoothed
+    #  macro blockage) are cached in _cong_Vf / _cong_Hf and kept exact by
+    #  set_placement() and commit_move(). _cong_cost_for_move() scores a
+    #  candidate move by updating ONLY the cells whose demand changes — the
+    #  box-blur is local (radius smooth_range), so a move's net re-routing and
+    #  macro blockage perturb the assembled grids only near the touched cells.
+    #  Result equals compute_cong_cost_full() up to float-reorder (~1e-15),
+    #  far below the ~1e-7 PLC-validation noise and the run-to-run kernel
+    #  nondeterminism, so move decisions are unaffected. This avoids the full
+    #  O(grid) re-smooth that a per-candidate commit→proxy→revert incurs.
+
+    def cong_cost(self) -> float:
+        """Cong cost of the CURRENT state from the cached assembled grids
+        (no re-smooth). Equals compute_cong_cost_full() up to float-reorder."""
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+
+    def _prep_old_routes(self, macro_idx: int) -> None:
+        """Cache the touched nets' routes (and the macro's blockage) at the
+        CURRENT positions for `macro_idx`, as the negated cell->value pairs that
+        _cong_cost_for_move applies as its "subtract old" term. This term is
+        identical for every candidate of a macro (it's the current placement),
+        so caching it once turns the per-candidate "subtract old" from a full
+        re-route into a cheap array write. Invalidated by commit_move()."""
+        dV = self._cong_dV; dH = self._cong_dH
+        for n in self.nets_per_macro[macro_idx]:
+            self._add_net_to_routing(int(n), dV, dH, sign=+1.0)
+        self._old_v_idx = np.flatnonzero(dV); self._old_v_neg = -dV[self._old_v_idx]
+        self._old_h_idx = np.flatnonzero(dH); self._old_h_neg = -dH[self._old_h_idx]
+        dV[self._old_v_idx] = 0.0; dH[self._old_h_idx] = 0.0
+        if macro_idx < self.nH:
+            dMV = self._cong_dMV; dMH = self._cong_dMH
+            self._add_macro_blockage(macro_idx, dMV, dMH, sign=+1.0)
+            self._old_mv_idx = np.flatnonzero(dMV); self._old_mv_neg = -dMV[self._old_mv_idx]
+            self._old_mh_idx = np.flatnonzero(dMH); self._old_mh_neg = -dMH[self._old_mh_idx]
+            dMV[self._old_mv_idx] = 0.0; dMH[self._old_mh_idx] = 0.0
+        self._score_prep_macro = macro_idx
+        # New macro (or post-commit re-prep): the soft-cong memo is now stale.
+        self._cong_sig_cache.clear()
+        # Cache the FIXED pins' gcells (pins on this macro's nets that the macro
+        # does NOT own — other macros' pins + ports). They sit at fixed positions
+        # for the whole candidate scan, so compute each once here and reuse in
+        # the cached re-route. The macro's own pins are filled per candidate.
+        gc = self._cong_gcell
+        gc.clear()
+        moving = set(int(p) for p in self.pins_per_macro[macro_idx])
+        for n in self.nets_per_macro[macro_idx]:
+            for p in self.net_pins[n]:
+                pi = int(p)
+                if pi not in moving:
+                    gc[pi] = self._grid_cell_for_pos_f32(
+                        np.float32(self.pin_xy[pi, 0]),
+                        np.float32(self.pin_xy[pi, 1]))
+
+    def _moving_pin_gcells(self, pins, new_xy: Tuple[float, float]):
+        """Vectorised gcell (row, col) of `pins` if their owner moves to new_xy.
+
+        Reproduces _add_net_to_routing's float32 narrowing
+        (`clamp(floor(f32(f32(pin_xy) / grid)))`) exactly. Returned as int32
+        row/col arrays; the soft-cong signature is their bytes, and the cached
+        re-route reads them per moving pin."""
+        px = (float(new_xy[0]) + self.pin_offset[pins, 0]).astype(np.float32)
+        py = (float(new_xy[1]) + self.pin_offset[pins, 1]).astype(np.float32)
+        cols = np.floor(np.float32(px / self.grid_w)).astype(np.int32)
+        rows = np.floor(np.float32(py / self.grid_h)).astype(np.int32)
+        np.clip(cols, 0, self.G_cols - 1, out=cols)
+        np.clip(rows, 0, self.G_rows - 1, out=rows)
+        return rows, cols
+
+    def _add_net_to_routing_cached(self, net_idx: int, V_arr: np.ndarray,
+                                   H_arr: np.ndarray, sign: float, gc: dict) -> None:
+        """Same as _add_net_to_routing but reads each pin's gcell from `gc`
+        (the per-macro cache: fixed pins pre-filled, moving pins set per
+        candidate) instead of recomputing it. Bit-identical: the gcell SET and
+        source_rc are the same, the segment routines are the same, and every
+        segment adds the same per-net weight so the cross-segment += order is
+        irrelevant."""
+        pis = self.net_pins[net_idx]
+        if pis.size < 2:
+            return
+        weight = float(self.net_weight[net_idx]) * sign
+        source_rc = gc[int(pis[0])]
+        gcells = {source_rc}
+        for p in pis[1:]:
+            gcells.add(gc[int(p)])
+        n = len(gcells)
+        if n == 2:
+            others = [g for g in gcells if g != source_rc]
+            if others:
+                self._add_two_pin_segment(source_rc, others[0], weight, V_arr, H_arr)
+        elif n == 3:
+            self._add_three_pin_segment(list(gcells), weight, V_arr, H_arr)
+        elif n > 3:
+            for g in gcells:
+                if g != source_rc:
+                    self._add_two_pin_segment(source_rc, g, weight, V_arr, H_arr)
+
+    def _cong_cost_for_move(self, macro_idx: int,
+                            new_xy: Tuple[float, float]) -> float:
+        """Cong cost if macro_idx moves to new_xy, computed incrementally from
+        the cached assembled grids WITHOUT mutating state."""
+        nets = self.nets_per_macro[macro_idx]
+        pins = self.pins_per_macro[macro_idx]
+        dV = self._cong_dV; dH = self._cong_dH
+        is_hard = macro_idx < self.nH
+
+        # "Subtract old routes" is identical for every candidate of this macro,
+        # so cache it once (per macro) and apply it as a plain array write.
+        if self._score_prep_macro != macro_idx:
+            self._prep_old_routes(macro_idx)
+
+        # Soft-macro gcell memo: a soft macro has no blockage, so its candidate
+        # cong is a pure function of where its pins land in gcells. Candidates
+        # sharing a signature are bit-identical (same routes -> same assembled
+        # flat -> same ABU), so each unique signature is computed once. Hard
+        # macros have area-weighted (sub-cell) blockage, so they are NOT memoized.
+        # Moving macro's pin gcells (vectorised, once) — reused for the soft-cong
+        # signature and the cached re-route below.
+        mov_rows, mov_cols = self._moving_pin_gcells(pins, new_xy)
+        sig = None
+        if not is_hard:
+            sig = mov_rows.tobytes() + b'|' + mov_cols.tobytes()
+            hit = self._cong_sig_cache.get(sig)
+            if hit is not None:
+                return hit
+
+        # Write the moving pins into the per-pin gcell cache (fixed pins already
+        # filled by _prep_old_routes), then re-route from the cache. No per-pin
+        # gcell recompute, and no pin_xy mutation (the cached router reads gc).
+        gc = self._cong_gcell
+        pins_l = pins.tolist() if hasattr(pins, 'tolist') else list(pins)
+        rows_l = mov_rows.tolist(); cols_l = mov_cols.tolist()
+        for i in range(len(pins_l)):
+            gc[pins_l[i]] = (rows_l[i], cols_l[i])
+
+        # Net-route delta: cached -old, then add the new routes from the cache.
+        dV[self._old_v_idx] = self._old_v_neg
+        dH[self._old_h_idx] = self._old_h_neg
+        for n in nets:
+            self._add_net_to_routing_cached(int(n), dV, dH, +1.0, gc)
+
+        # Macro-blockage delta (hard macros only; added un-smoothed).
+        if is_hard:
+            dMV = self._cong_dMV; dMH = self._cong_dMH
+            dMV[self._old_mv_idx] = self._old_mv_neg
+            dMH[self._old_mh_idx] = self._old_mh_neg
+            saved_pos = self.macro_pos[macro_idx].copy()
+            self.macro_pos[macro_idx, 0] = float(new_xy[0])
+            self.macro_pos[macro_idx, 1] = float(new_xy[1])
+            self._add_macro_blockage(macro_idx, dMV, dMH, sign=+1.0)
+            self.macro_pos[macro_idx] = saved_pos
+
+        # Assemble cached grids + the route/blockage deltas and ABU top-5%.
+        cong = self._scatter_delta_and_abu(is_hard)
+        if sig is not None:
+            self._cong_sig_cache[sig] = cong
+        return cong
+
+    def proxy_for_move(self, macro_idx: int, new_xy: Tuple[float, float],
+                       cur_wl: Optional[float] = None,
+                       cur_den: Optional[float] = None) -> float:
+        """Proxy if macro_idx moves to new_xy, WITHOUT committing. WL/density
+        use the existing incremental deltas; congestion uses the incremental
+        scorer. Pass cur_wl / cur_den (current costs) to avoid recomputing them
+        on every candidate."""
+        if cur_wl is None:
+            cur_wl = self.compute_wl_cost()
+        if cur_den is None:
+            cur_den = self.compute_density_cost()
+        st = self.delta_for_move(macro_idx, new_xy, include_cong=False)
+        new_wl  = cur_wl + st['delta_wl']
+        new_den = cur_den + st['delta_density']
+        new_cong = self._cong_cost_for_move(macro_idx, new_xy)
+        return (WEIGHT_WL * new_wl + WEIGHT_DENSITY * new_den
+                + WEIGHT_CONG * new_cong)
+
+    # ───────────────────────────────────────────────────────────────────────
+    #  Incremental PAIR-SWAP scoring (two macros swap, no commit / no re-smooth)
+    # ───────────────────────────────────────────────────────────────────────
+    #  A swap moves i -> new_i_xy and j -> new_j_xy simultaneously. The proxy of
+    #  the swapped state is scored exactly like proxy_for_move but over BOTH
+    #  macros, with shared nets (nets touching both i and j) handled ONCE so
+    #  their bbox/route reflects both moves. Bit-identical to the old
+    #  commit-i → commit-j → proxy → revert path (validated), but with no
+    #  commit_move churn and no full congestion re-smooth.
+
+    def _scatter_delta_and_abu(self, has_blockage: bool) -> float:
+        """Assemble the candidate congestion grid = cached _cong_Vf/_cong_Hf +
+        the deltas in _cong_dV/_cong_dH (net demand, box-blurred) and
+        _cong_dMV/_cong_dMH (macro blockage, un-smoothed), then ABU top-5%.
+        Resets the delta scratch to zero. Shared by _cong_cost_for_move and
+        _cong_cost_for_swap."""
+        Gc = self.G_cols; Gr = self.G_rows; sr = self.smooth_range
+        G = Gr * Gc
+        inv_v = (1.0 / self.grid_v_routes) if self.grid_v_routes > 0 else 1.0
+        inv_h = (1.0 / self.grid_h_routes) if self.grid_h_routes > 0 else 1.0
+        dV = self._cong_dV; dH = self._cong_dH
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        nzv = np.flatnonzero(dV)
+        if nzv.size:
+            rv = nzv // Gc; cv = nzv % Gc
+            wv = (dV[nzv] * inv_v) / self._cntc[cv]
+            for off in range(-sr, sr + 1):
+                tc = cv + off
+                ok = (tc >= 0) & (tc < Gc)
+                flat[rv[ok] * Gc + tc[ok]] += wv[ok]
+            dV[nzv] = 0.0
+        nzh = np.flatnonzero(dH)
+        if nzh.size:
+            rh = nzh // Gc; ch = nzh % Gc
+            wh = (dH[nzh] * inv_h) / self._cntr[rh]
+            for off in range(-sr, sr + 1):
+                tr = rh + off
+                ok = (tr >= 0) & (tr < Gr)
+                flat[G + tr[ok] * Gc + ch[ok]] += wh[ok]
+            dH[nzh] = 0.0
+        if has_blockage:
+            dMV = self._cong_dMV; dMH = self._cong_dMH
+            nzmv = np.flatnonzero(dMV)
+            if nzmv.size:
+                flat[nzmv] += dMV[nzmv] * inv_v
+                dMV[nzmv] = 0.0
+            nzmh = np.flatnonzero(dMH)
+            if nzmh.size:
+                flat[G + nzmh] += dMH[nzmh] * inv_h
+                dMH[nzmh] = 0.0
+        return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
+
+    def _swap_affected_nets(self, i: int, j: int) -> np.ndarray:
+        """Union of i's and j's nets (shared nets appear once)."""
+        return np.union1d(np.asarray(self.nets_per_macro[i]),
+                          np.asarray(self.nets_per_macro[j]))
+
+    def _cong_cost_for_swap(self, i: int, j: int,
+                            new_i_xy: Tuple[float, float],
+                            new_j_xy: Tuple[float, float]) -> float:
+        """Cong cost if macros i and j move to new_i_xy / new_j_xy, computed
+        incrementally (no full re-smooth, no commit)."""
+        dV = self._cong_dV; dH = self._cong_dH
+        affected = self._swap_affected_nets(i, j)
+        # Per-pin gcell cache for the cached re-route: compute each affected
+        # pin's gcell at its CURRENT position ONCE (the old path recomputed every
+        # pin twice — for subtract-old and add-new). Only i's and j's pins change
+        # between the two, so they're overwritten with their swapped gcells in
+        # between. No pin_xy mutation (the cached router reads gc).
+        gc = self._cong_gcell
+        gc.clear()
+        for n in affected:
+            for p in self.net_pins[int(n)]:
+                pi = int(p)
+                if pi not in gc:
+                    gc[pi] = self._grid_cell_for_pos_f32(
+                        np.float32(self.pin_xy[pi, 0]), np.float32(self.pin_xy[pi, 1]))
+        # Subtract OLD routes (current gcells).
+        for n in affected:
+            self._add_net_to_routing_cached(int(n), dV, dH, -1.0, gc)
+        # Overwrite i's and j's pins with their SWAPPED gcells (vectorised).
+        for (m, new_xy) in ((i, new_i_xy), (j, new_j_xy)):
+            pins_m = self.pins_per_macro[m]
+            rows, cols = self._moving_pin_gcells(pins_m, new_xy)
+            pl = pins_m.tolist() if hasattr(pins_m, 'tolist') else list(pins_m)
+            rl = rows.tolist(); cl = cols.tolist()
+            for k in range(len(pl)):
+                gc[pl[k]] = (rl[k], cl[k])
+        # Add NEW routes (swapped gcells).
+        for n in affected:
+            self._add_net_to_routing_cached(int(n), dV, dH, +1.0, gc)
+        # Macro-blockage delta (each hard macro: subtract old, add new).
+        i_hard = i < self.nH; j_hard = j < self.nH
+        has_block = i_hard or j_hard
+        if has_block:
+            dMV = self._cong_dMV; dMH = self._cong_dMH
+            if i_hard:
+                self._add_macro_blockage(i, dMV, dMH, sign=-1.0)
+            if j_hard:
+                self._add_macro_blockage(j, dMV, dMH, sign=-1.0)
+            saved_pi = self.macro_pos[i].copy(); saved_pj = self.macro_pos[j].copy()
+            self.macro_pos[i, 0] = float(new_i_xy[0]); self.macro_pos[i, 1] = float(new_i_xy[1])
+            self.macro_pos[j, 0] = float(new_j_xy[0]); self.macro_pos[j, 1] = float(new_j_xy[1])
+            if i_hard:
+                self._add_macro_blockage(i, dMV, dMH, sign=+1.0)
+            if j_hard:
+                self._add_macro_blockage(j, dMV, dMH, sign=+1.0)
+            self.macro_pos[i] = saved_pi; self.macro_pos[j] = saved_pj
+        return self._scatter_delta_and_abu(has_block)
+
+    def _delta_wl_for_swap(self, i: int, j: int,
+                           new_i_xy: Tuple[float, float],
+                           new_j_xy: Tuple[float, float]) -> float:
+        """Un-normalised total_hpwl delta if i,j swap. Shared nets are counted
+        once with BOTH macros' pins moved (min/max over a net's pins is
+        order-independent, so this matches commit-i-then-commit-j exactly)."""
+        new_pos = {}
+        nix, niy = float(new_i_xy[0]), float(new_i_xy[1])
+        for p in self.pins_per_macro[i]:
+            pi = int(p)
+            new_pos[pi] = (nix + self.pin_offset[pi, 0], niy + self.pin_offset[pi, 1])
+        njx, njy = float(new_j_xy[0]), float(new_j_xy[1])
+        for p in self.pins_per_macro[j]:
+            pj = int(p)
+            new_pos[pj] = (njx + self.pin_offset[pj, 0], njy + self.pin_offset[pj, 1])
+        delta = 0.0
+        for net_idx in self._swap_affected_nets(i, j):
+            net_idx = int(net_idx)
+            pis = self.net_pins[net_idx]
+            if pis.size == 0:
+                continue
+            mnx = math.inf; mxx = -math.inf; mny = math.inf; mxy = -math.inf
+            for p in pis:
+                p_int = int(p)
+                if p_int in new_pos:
+                    px, py = new_pos[p_int]
+                else:
+                    px = float(self.pin_xy[p_int, 0]); py = float(self.pin_xy[p_int, 1])
+                if px < mnx: mnx = px
+                if px > mxx: mxx = px
+                if py < mny: mny = py
+                if py > mxy: mxy = py
+            new_hpwl = self.net_weight[net_idx] * ((mxx - mnx) + (mxy - mny))
+            delta += new_hpwl - self.net_hpwl[net_idx]
+        return delta
+
+    def _density_cost_for_swap(self, i: int, j: int,
+                               new_i_xy: Tuple[float, float],
+                               new_j_xy: Tuple[float, float]) -> float:
+        """Density cost if i,j swap. Applies both macros' footprint deltas to a
+        scratch copy of grid_occupied (same per-cell `+= d` as committing both
+        moves), then scores it — bit-identical to compute_density_cost on the
+        committed swapped grid."""
+        Gc = self.G_cols
+        gflat = self.grid_occupied.reshape(-1)
+        s = getattr(self, '_swap_dens_scratch', None)
+        if s is None or s.shape[0] != gflat.shape[0]:
+            s = self._swap_dens_scratch = np.empty(gflat.shape[0], dtype=np.float64)
+        np.copyto(s, gflat)
+        for (m, new_xy) in ((i, new_i_xy), (j, new_j_xy)):
+            den_state = self._delta_density_for_move(m, new_xy)
+            for (r, c), d in den_state['cells_delta'].items():
+                s[r * Gc + c] += d
+        return self.compute_density_cost(
+            grid_occupied=s.reshape(self.G_rows, self.G_cols))
+
+    def proxy_for_swap(self, i: int, j: int,
+                       new_i_xy: Tuple[float, float],
+                       new_j_xy: Tuple[float, float],
+                       cur_wl: Optional[float] = None) -> float:
+        """Proxy if macros i and j swap to new_i_xy / new_j_xy, WITHOUT
+        committing. Pass cur_wl (current WL cost) to skip recomputing it."""
+        if cur_wl is None:
+            cur_wl = self.compute_wl_cost()
+        new_wl = cur_wl + self._delta_wl_for_swap(i, j, new_i_xy, new_j_xy) / self.wl_denominator
+        new_den = self._density_cost_for_swap(i, j, new_i_xy, new_j_xy)
+        new_cong = self._cong_cost_for_swap(i, j, new_i_xy, new_j_xy)
+        return (WEIGHT_WL * new_wl + WEIGHT_DENSITY * new_den
+                + WEIGHT_CONG * new_cong)
 
     def diff_against_plc_routing(self) -> dict:
         """Diagnostic: rebuild PLC's V/H routing grids and compare cell-by-cell
@@ -1334,8 +1736,9 @@ class IncrementalEval:
         include_cong=False; for True we currently fall back to a full
         recompute on a temporary placement, which is slow).
 
-        include_cong=True is only useful for validation; for SA prefer
-        include_cong=False then full-eval after the cheap delta wins.
+        include_cong=True is only useful for validation; the local-search
+        polish stages prefer include_cong=False then full-eval after the
+        cheap delta wins.
         """
         delta_total_hpwl, wl_state = self._delta_wl_for_move(macro_idx, new_xy)
         delta_wl = delta_total_hpwl / self.wl_denominator
@@ -1352,8 +1755,8 @@ class IncrementalEval:
         if include_cong:
             # Tentative-apply path: snapshot ALL mutable state, commit, eval,
             # restore. Smoothing + ABU is O(grid_size) per call, so this is
-            # ~100× faster than the previous PLC fallback. Mostly useful for
-            # validation; for production SA prefer include_cong=False + full
+            # ~100× faster than a full PLC rebuild. Mostly useful for
+            # validation; the polish stages prefer include_cong=False + full
             # eval after the cheap delta wins.
             old_cong = self.compute_cong_cost_full()
             saved = {
@@ -1437,6 +1840,16 @@ class IncrementalEval:
             self._add_macro_blockage(
                 macro_idx, self.macro_raw_V, self.macro_raw_H, sign=+1.0,
             )
+
+        # Keep the incremental-cong assembled-grid cache exact by rebuilding it
+        # from the updated raw grids. Commits are far rarer than candidate evals
+        # (only accepted moves), so this full re-smooth is cheap relative to the
+        # per-candidate scoring it enables — and avoids any drift.
+        if getattr(self, '_cong_Vf', None) is not None:
+            self._cong_Vf, self._cong_Hf = self._build_full_routing_grids()
+        # A move changes the touched nets' routes, so the cached "old routes"
+        # for incremental scoring are stale — invalidate them.
+        self._score_prep_macro = -1
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1558,7 +1971,7 @@ def benchmark_per_move(benchmark: Benchmark, plc: PlacementCost,
 
     A) compute_proxy_cost: rebuild PLC state from the placement tensor and
        call get_wirelength + get_density_cost + get_congestion_cost. This is
-       what v60's current Stage 2 / SA / basin-hop pipelines call.
+       what the Stage 2 / basin-hop / polish pipelines call.
     B) IncrementalEval: delta_for_move (WL+density) + commit_move (updates all
        three caches) + proxy_breakdown (reads cached cong, O(grid_size)).
 
