@@ -31,9 +31,9 @@ Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which con
 | ibm18 | 1.0859 | 2.7755 | 1.7722 | +60.9 % | +38.7 % | 0 |
 | **Average** | **0.9196** | 2.1251 | 1.4578 | **+56.7 %** | **+36.9 %** | **0** |
 
-**Set `deterministic=True` and you will reproduce this table bit-for-bit** — these are the exact figures from such a run. The default (non-deterministic) mode is faster and lands within run-to-run noise (~1.4 %) of these numbers.
+**Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) and you will reproduce this table bit-for-bit** — these are the exact figures from such a run. The default (non-deterministic) mode is faster and lands within run-to-run noise (~1.4 %) of these numbers.
 
-The SA and RePlAce baselines are the published results reported in [*An Updated Assessment of Reinforcement Learning for Macro Placement*](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=11300304) (IEEE), measured through the same TILOS MacroPlacement evaluator that scores v60.
+The SA and RePlAce baselines are the published results reported in [*An Updated Assessment of Reinforcement Learning for Macro Placement*](https://doi.org/10.1109/TCAD.2025.3644293) (IEEE), measured through the same TILOS MacroPlacement evaluator that scores v60.
 
 ## Quick Start
 
