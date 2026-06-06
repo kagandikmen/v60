@@ -1102,6 +1102,33 @@ class IncrementalEval:
         flat = np.concatenate([self._cong_Vf, self._cong_Hf])
         return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
 
+    def hot_cell_macros(self, frac: float = ABU_FRAC_CONG) -> np.ndarray:
+        """Indices of macros with >=1 pin on a top-`frac` congestion cell.
+
+        The exact-cost refinement basin-hop perturbs these (the macros sitting on
+        the routing-congestion tail that the proxy actually scores) and re-descends.
+        Reads the assembled, smoothed routing grids `_cong_Vf/_cong_Hf` (so the
+        placement must have been built via `set_placement`); flat cell index is
+        row*G_cols + col, matching `_grid_cell_for_pos`. Read-only."""
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        k = max(1, int(len(flat) * frac))
+        thresh = np.partition(flat, -k)[-k]
+        hot = (set(np.where(self._cong_Vf >= thresh)[0].tolist())
+               | set(np.where(self._cong_Hf >= thresh)[0].tolist()))
+        Gc = self.G_cols
+        mids = []
+        for m in range(self.nM):
+            pins = self.pins_per_macro[m]
+            if pins.size == 0:
+                continue
+            for p in pins:
+                r, c = self._grid_cell_for_pos(float(self.pin_xy[p, 0]),
+                                               float(self.pin_xy[p, 1]))
+                if (r * Gc + c) in hot:
+                    mids.append(m)
+                    break
+        return np.asarray(mids, dtype=np.int64)
+
     def _prep_old_routes(self, macro_idx: int) -> None:
         """Cache the touched nets' routes (and the macro's blockage) at the
         CURRENT positions for `macro_idx`, as the negated cell->value pairs that
