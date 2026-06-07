@@ -1129,6 +1129,41 @@ class IncrementalEval:
                     break
         return np.asarray(mids, dtype=np.int64)
 
+    def bottleneck_net_macros(self, frac: float = ABU_FRAC_CONG) -> np.ndarray:
+        """Macros that are ENDPOINTS of nets routing THROUGH the top-`frac`
+        congestion cells (cause-aware), vs `hot_cell_macros`' macros that merely SIT
+        in them. A net "crosses" a hot cell if its pin-gcell bounding box spans one
+        — i.e. the nets whose routing demand jams the channel, whose endpoint macros
+        may be far off-cell (and thus missed by hot_cell_macros). Used by the
+        cause-aware basin-hop kick (`refine_basin_hop_kick_mode='netcause'`). bbox is
+        an over-approx of the route (route ⊆ bbox); cheap, no re-routing. (NB: most
+        nets thread the central jam, so this selects ~90% of soft macros — A/B shows
+        the basin-hop win is the resulting SPREAD of the capped kick across the canvas,
+        not the cause-targeting per se; see refine_basin_hop_kick_mode.) Read-only;
+        reads `_cong_Vf/_cong_Hf` (placement must be built via set_placement)."""
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        k = max(1, int(len(flat) * frac))
+        thresh = np.partition(flat, -k)[-k]
+        Gc = self.G_cols; Gr = self.G_rows
+        hot2d = ((self._cong_Vf >= thresh) | (self._cong_Hf >= thresh)).reshape(Gr, Gc)
+        if not hot2d.any():
+            return np.empty(0, dtype=np.int64)
+        # gcell (row, col) of every pin (vectorised; float64 to match _grid_cell_for_pos)
+        col = np.clip(np.floor(self.pin_xy[:, 0].astype(np.float64) / self.grid_w).astype(np.int64), 0, Gc - 1)
+        row = np.clip(np.floor(self.pin_xy[:, 1].astype(np.float64) / self.grid_h).astype(np.int64), 0, Gr - 1)
+        mids = set()
+        for net in range(len(self.net_pins)):
+            pins = self.net_pins[net]
+            if pins.size < 2:
+                continue
+            r = row[pins]; c = col[pins]
+            if hot2d[r.min():r.max() + 1, c.min():c.max() + 1].any():
+                for p in pins:
+                    o = int(self.pin_owner[p])
+                    if o < self.nM:
+                        mids.add(o)
+        return np.asarray(sorted(mids), dtype=np.int64)
+
     def _prep_old_routes(self, macro_idx: int) -> None:
         """Cache the touched nets' routes (and the macro's blockage) at the
         CURRENT positions for `macro_idx`, as the negated cell->value pairs that

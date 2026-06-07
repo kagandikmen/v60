@@ -365,6 +365,16 @@ class v60_Placer:
         # ~6-10 sweeps; capping at 4 drops only the diminishing-return tail for
         # ~2.5x faster basin-hop at ~+0.38% proxy (ibm06: -2.99% vs -3.36% full).
         refine_basin_hop_cd_sweeps: int = 4,
+        # Which macros the per-hop kick perturbs. 'netcause' (default): endpoint
+        # macros of the nets routing THROUGH the top-cong cells (`bottleneck_net_macros`).
+        # Since most nets thread the central jam this is a broad set, so after the cap the
+        # kick lands SPREAD across the canvas — which escapes the floor better than the
+        # 'hotcell' kick (macros with a pin SITTING in a top-cong cell, `hot_cell_macros`),
+        # whose perturbation is clustered in the jam. A/B: netcause beats hotcell on the
+        # big designs (ibm06 -0.40%, ibm10 -0.07%), wash on ibm01; same count/cost. The
+        # win is the SPREAD, not the wires per se (a 60-macro cap is the count sweet spot;
+        # jiggling all soft macros overshoots and every hop is rejected).
+        refine_basin_hop_kick_mode: str = 'netcause',
         # -- v60 multi-candidate post-Stage-2 refinement -----------------------
         # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
         # winner, with separate widths for the (expensive, GPU) and (cheap,
@@ -474,6 +484,7 @@ class v60_Placer:
         self.refine_basin_hop_cap        = int(refine_basin_hop_cap)
         self.refine_basin_hop_cong_frac  = float(refine_basin_hop_cong_frac)
         self.refine_basin_hop_cd_sweeps  = int(refine_basin_hop_cd_sweeps)
+        self.refine_basin_hop_kick_mode  = str(refine_basin_hop_kick_mode)
         self.post_stage2_n_gpu = max(1, int(post_stage2_n_gpu))
         self.post_stage2_n_cpu = max(1, int(post_stage2_n_cpu))
         self.post_stage2_cpu_parallel = bool(post_stage2_cpu_parallel)
@@ -2213,7 +2224,10 @@ class v60_Placer:
         e.set_placement(incumbent_pos[:nM].detach().cpu().numpy().astype(np.float64))
         hw = e.macro_w * 0.5
         hh = e.macro_h * 0.5
-        hot = e.hot_cell_macros(self.refine_basin_hop_cong_frac)
+        if self.refine_basin_hop_kick_mode == 'netcause':
+            hot = e.bottleneck_net_macros(self.refine_basin_hop_cong_frac)
+        else:
+            hot = e.hot_cell_macros(self.refine_basin_hop_cong_frac)
         cap = self.refine_basin_hop_cap
         if cap and hot.size > cap:
             hot = np.sort(rng.choice(hot, cap, replace=False))
