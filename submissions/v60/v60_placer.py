@@ -357,7 +357,9 @@ class v60_Placer:
         # in parallel (one CD re-descent per σ) and greedily keeps the best, which
         # adapts the kick to the design AND anneals coarse→fine across the descent.
         refine_basin_hop_enabled: bool = True,
-        refine_basin_hop_hops: int = 4,        # full hops on every design (no runtime cap)
+        refine_basin_hop_hops: int = 2,        # hops 1-2 capture most of the gain; 3-4 add
+                                               # only ~0.1-0.3% but ~half the rbhop wall -> 2
+                                               # keeps the biggest designs (ibm18) under budget
         refine_basin_hop_sigma_set: tuple = (0.012, 0.024, 0.048, 0.072),  # per-hop σ line-search band
         refine_basin_hop_cap: int = 60,        # max hot soft macros perturbed / hop
         refine_basin_hop_cong_frac: float = 0.05,
