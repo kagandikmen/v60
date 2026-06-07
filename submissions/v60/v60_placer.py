@@ -348,18 +348,17 @@ class v60_Placer:
         soft_pair_swap_min_improve: float = 1e-7,
         soft_pair_swap_patience: int = 2,
         soft_pair_swap_verbose: bool = True,
-        # -- v60 exact-cost refinement basin-hop (post best-of-N) --------------
-        # After the multi-candidate CPU refinement picks the best-of-N, perturb
-        # the macros on the top-5% congestion cells and re-descend the WHOLE
-        # placement with CD on the EXACT proxy, accept iff it drops, repeat. This
-        # escapes the greedy-refinement floor (−0.8%..−2.3% measured, all
-        # congestion; see CLAUDE.md / IncrementalEval.hot_cell_macros). Each hop ≈
-        # one full CD pass, so the hop COUNT is runtime-guarded by congestion tier
-        # (hop_caps, like the engine basin-hop) to stay under the 1-hour budget.
+        # -- v60 exact-cost refinement basin-hop (per-hop σ line-search) -------
+        # Runs on the best-of-N refined floor. Each hop perturbs the SOFT macros on
+        # the top-`cong_frac` congestion cells and re-descends the WHOLE placement
+        # with CD on the EXACT proxy, accepting iff it drops. A single σ is a poor
+        # fit — the productive perturbation scale is design-dependent and rugged
+        # (ibm01≈0.020, ibm10≈0.024, ibm06≈0.048) — so each hop fans the σ-set out
+        # in parallel (one CD re-descent per σ) and greedily keeps the best, which
+        # adapts the kick to the design AND anneals coarse→fine across the descent.
         refine_basin_hop_enabled: bool = True,
-        refine_basin_hop_hops: int = 4,        # hops on small designs; thinned on big
-        refine_basin_hop_hop_caps: tuple = (1, 2, 2, 3),  # caps at cong tiers 4/3/2/1
-        refine_basin_hop_sigma_frac: float = 0.008,
+        refine_basin_hop_hops: int = 4,        # full hops on every design (no runtime cap)
+        refine_basin_hop_sigma_set: tuple = (0.012, 0.024, 0.048, 0.072),  # per-hop σ line-search band
         refine_basin_hop_cap: int = 60,        # max hot soft macros perturbed / hop
         refine_basin_hop_cong_frac: float = 0.05,
         refine_basin_hop_cd_sweeps: int = 15,
@@ -468,8 +467,7 @@ class v60_Placer:
         self.soft_pair_swap_verbose        = bool(soft_pair_swap_verbose)
         self.refine_basin_hop_enabled    = bool(refine_basin_hop_enabled)
         self.refine_basin_hop_hops       = int(refine_basin_hop_hops)
-        self.refine_basin_hop_hop_caps   = tuple(refine_basin_hop_hop_caps)
-        self.refine_basin_hop_sigma_frac = float(refine_basin_hop_sigma_frac)
+        self.refine_basin_hop_sigma_set  = tuple(float(s) for s in refine_basin_hop_sigma_set)
         self.refine_basin_hop_cap        = int(refine_basin_hop_cap)
         self.refine_basin_hop_cong_frac  = float(refine_basin_hop_cong_frac)
         self.refine_basin_hop_cd_sweeps  = int(refine_basin_hop_cd_sweeps)
@@ -726,39 +724,23 @@ class v60_Placer:
             for (rpos, rproxy, rtag) in results:
                 if rproxy < best_proxy - 1e-9:
                     best_pos, best_proxy, best_tag = rpos, rproxy, rtag
+
+            # Exact-cost refinement basin-hop on the best-of-N floor: each hop fans
+            # the σ-set out in parallel and greedily keeps the best-improving global
+            # CD re-descent (accept iff the exact proxy drops). Escapes the greedy
+            # refinement floor; adapts the kick scale per design. Runs here in the
+            # (non-daemon) main process after the CPU fork pool has joined.
+            if (self.refine_basin_hop_enabled and best_pos is not None
+                    and plc is not None and math.isfinite(best_proxy)):
+                hb_pos, hb_proxy = self._refine_basin_hop(best_pos, benchmark, plc, t0=t0)
+                if hb_proxy < best_proxy - 1e-9:
+                    best_pos, best_proxy = hb_pos, hb_proxy
+                    best_tag = f"{best_tag}+rbhop"
+
             self._log(
                 f"[v60 {benchmark.name}] post-Stage-2 done: best={best_proxy:.4f}  "
                 f"tag={best_tag}  total {time.time()-t0:.1f}s"
             )
-
-            # Exact-cost refinement basin-hop on the best-of-N (escapes the greedy
-            # floor). Hop count runtime-guarded by congestion tier so big designs
-            # stay under the 1-hour budget; the per-hop CD re-descent uses the
-            # parallel scorer. Runs in this (non-daemon) process after the fork
-            # pool has joined, so the CD score pool is legal to spawn.
-            if (self.refine_basin_hop_enabled and best_pos is not None
-                    and plc is not None and math.isfinite(best_proxy)):
-                hops = self._cap_for_congestion_runtime(
-                    benchmark, self.refine_basin_hop_hops,
-                    caps=self.refine_basin_hop_hop_caps)
-                if hops > 0:
-                    par = self.cd_polish_parallel_workers
-                    cd_w = (min(4, os.cpu_count() or 1) if par == 'auto'
-                            else max(1, int(par)))
-                    hb_pos, hb_proxy, _hist = self._refine_basin_hop(
-                        best_pos, benchmark, plc, hops=hops,
-                        sigma_frac=self.refine_basin_hop_sigma_frac,
-                        cong_frac=self.refine_basin_hop_cong_frac,
-                        cap=self.refine_basin_hop_cap,
-                        cd_sweeps=self.refine_basin_hop_cd_sweeps,
-                        max_workers=cd_w)
-                    if hb_proxy < best_proxy - 1e-9:
-                        best_pos, best_proxy = hb_pos, hb_proxy
-                        best_tag = f"{best_tag}+rbhop"
-                    self._log(
-                        f"[v60 {benchmark.name}] refine basin-hop done: "
-                        f"best={best_proxy:.4f}  tag={best_tag}  "
-                        f"total {time.time()-t0:.1f}s")
 
         return best_pos
 
@@ -2117,96 +2099,143 @@ class v60_Placer:
         )
         return out, costs
 
-    def _refine_basin_hop(self, placement, benchmark, plc, *,
-                          hops=4, sigma_frac=0.008, cong_frac=0.05, cap=60,
-                          cd_sweeps=15, global_redescend=True, resample=False,
-                          neighbors=False, seed=None, max_workers=1, log=None):
-        """Exact-cost refinement basin-hop — escapes the greedy-refinement floor.
+    def _refine_basin_hop(self, placement, benchmark, plc, *, t0=None):
+        """Exact-cost refinement basin-hop on a single placement (the best-of-N
+        floor) via a per-hop σ line-search. Each hop perturbs the hot SOFT macros
+        of the current incumbent by N(0, σ) for every σ in the set — the σ-descents
+        run concurrently (one fork each, each a parallel CD re-descent) — then
+        greedily keeps the best-improving descent (accept iff the exact proxy
+        drops). A single σ is a poor fit: the productive perturbation scale is
+        design-dependent and rugged, so trying the whole σ-set every hop and
+        keeping the winner adapts the kick to the design AND to where it is in the
+        descent (it naturally anneals coarse→fine). Distinct from the engine
+        `_basin_hop`, which re-descends the differentiable surrogate and washes out
+        under refinement; this hops the EXACT proxy (IncrementalEval + CD), so it
+        moves the SCORED floor. Deterministic (per-descent seed keyed on hop/σ).
+        Must run in a non-daemon process so each σ-descent can host its own CD
+        pool. Returns (pos, proxy)."""
+        hops   = self.refine_basin_hop_hops
+        sigmas = self.refine_basin_hop_sigma_set
+        nM = int(benchmark.num_macros)
+        e = IncrementalEval(benchmark, plc=plc)
+        e.set_placement(placement[:nM].detach().cpu().numpy().astype(np.float64))
+        inc_pos, inc_proxy = placement, float(e.proxy(include_cong=True))
+        del e
+        if hops <= 0 or not sigmas:
+            return inc_pos, inc_proxy
+        # The σ-descents run concurrently (one per σ); give each its own CD worker
+        # pool, sized so (σ-fan × per-descent workers) fits the core budget.
+        cpu_count = os.cpu_count() or 1
+        par = int(self.cd_polish_parallel_workers)
+        cd_w = max(1, min(par, cpu_count // max(1, len(sigmas)))) if par > 1 else 1
+        base = self.seed if self.deterministic else None
+        tot  = f"  total {time.time()-t0:.1f}s" if t0 is not None else ""
+        self._log(f"[v60 {benchmark.name}] === refine basin-hop: start={inc_proxy:.6f}  "
+                  f"{len(sigmas)} σ × {hops} hops (greedy per-hop σ line-search)  "
+                  f"cd_workers={cd_w}{tot} ===")
+        for hop in range(hops):
+            th = time.time()
+            jobs = [{'si': si, 'sigma': s, 'pos': inc_pos,
+                     'seed': (None if base is None else base * 100003 + hop * 101 + si)}
+                    for si, s in enumerate(sigmas)]
+            outs = self._basin_hop_fanout(jobs, benchmark, plc, cd_w)
+            best = min(outs, key=lambda o: o['proxy'])
+            if best['pos'] is not None and best['proxy'] < inc_proxy - 1e-9:
+                out_pos = benchmark.macro_positions.clone()
+                out_pos[:nM] = torch.tensor(best['pos'], dtype=out_pos.dtype)
+                inc_pos, inc_proxy = out_pos, best['proxy']
+                mark = f"σ={sigmas[best['si']]:.3f} ACCEPT"
+            else:
+                mark = f"σ={sigmas[best['si']]:.3f} --"
+            self._log(f"[v60 {benchmark.name}] refine basin-hop: hop {hop+1}/{hops} "
+                      f"-> best {best['proxy']:.6f} {mark}  incumbent={inc_proxy:.6f}  "
+                      f"{time.time()-th:.1f}s")
+        return inc_pos, inc_proxy
 
-        Each hop: perturb the SOFT macros sitting on the top-`cong_frac`
-        congestion cells (`IncrementalEval.hot_cell_macros`), re-descend with CD
-        (global by default = the whole placement; the cheap-but-weak local variant
-        restricts CD to the perturbed subset via `target_subset`), accept iff the
-        exact proxy drops. Distinct from the engine-level `_basin_hop`, which
-        re-descends with the differentiable Stage-2 SURROGATE and washes out under
-        refinement; this hops on the EXACT proxy (IncrementalEval + the CPU
-        refinement) so it moves the SCORED floor. Deterministic, bit-exact, no GPU.
+    def _basin_hop_fanout(self, jobs, benchmark, plc, cd_w):
+        """Run the σ-descents in `jobs` concurrently (one fork each; self/benchmark/
+        plc inherited via fork, never pickled — only the result returns over a
+        Queue). Each descent runs a `cd_w`-worker CD re-descent, so the forks are
+        non-daemon when cd_w>1 (a daemon process can't host the CD pool). Returns a
+        list aligned to `jobs`: {'pos': [nM,2] float64 or None, 'proxy', 'si'}."""
+        out = [None] * len(jobs)
+        try:
+            ctx = mp.get_context('fork')
+        except (ValueError, RuntimeError):
+            ctx = None
+        if ctx is None:                       # no fork: run the σ-fan sequentially
+            for k, job in enumerate(jobs):
+                pos_np, pr = self._basin_hop_descend(job['pos'], job['sigma'],
+                                                     job['seed'], benchmark, plc, cd_w)
+                out[k] = {'pos': pos_np, 'proxy': pr, 'si': job['si']}
+            return out
 
-        Start from a converged floor (post CD+swaps) to test escape, not initial
-        descent. Returns (best_pos, best_proxy, history[(proxy, accepted), ...]).
-        """
-        log = log or self._log
+        def _child(k, job, q):                # inherited via fork; logs discarded
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pos_np, pr = self._basin_hop_descend(
+                        job['pos'], job['sigma'], job['seed'], benchmark, plc, cd_w)
+                q.put((k, pos_np, pr))
+            except Exception:
+                q.put((k, None, float('inf')))
+
+        q = ctx.Queue()
+        procs = []
+        daemon = (cd_w == 1)                   # non-daemon when hosting a CD pool
+        for k, job in enumerate(jobs):
+            p = ctx.Process(target=_child, args=(k, job, q), daemon=daemon)
+            p.start(); procs.append(p)
+        for _ in jobs:
+            k, pos_np, pr = q.get()
+            out[k] = {'pos': pos_np, 'proxy': pr, 'si': jobs[k]['si']}
+        for p in procs:
+            p.join()
+        for k in range(len(jobs)):            # any child that died -> no-improvement
+            if out[k] is None:
+                out[k] = {'pos': None, 'proxy': float('inf'), 'si': jobs[k]['si']}
+        return out
+
+    def _basin_hop_descend(self, incumbent_pos, sigma_frac, seed, benchmark, plc, cd_w):
+        """One basin-hop descent: perturb the hot SOFT macros of `incumbent_pos` by
+        N(0, σ) (σ = sigma_frac · half-perimeter), then global CD re-descent on the
+        EXACT proxy with `cd_w` CD workers. Returns ([nM,2] float64 positions,
+        proxy)."""
         nM = int(benchmark.num_macros)
         nH = int(benchmark.num_hard_macros)
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
         sigma = sigma_frac * 0.5 * (cw + ch)
-        rng = np.random.default_rng(
-            seed if seed is not None
-            else (self.seed if self.deterministic else None))
-
-        best_pos = placement.clone()
+        rng = np.random.default_rng(seed)
         e = IncrementalEval(benchmark, plc=plc)
-        e.set_placement(best_pos[:nM].detach().cpu().numpy().astype(np.float64))
-        best_proxy = float(e.proxy(include_cong=True))
+        e.set_placement(incumbent_pos[:nM].detach().cpu().numpy().astype(np.float64))
         hw = e.macro_w * 0.5
         hh = e.macro_h * 0.5
-
-        def hot_subset():
-            e.set_placement(best_pos[:nM].detach().cpu().numpy().astype(np.float64))
-            hot = e.hot_cell_macros(cong_frac)
-            if neighbors and hot.size:
-                nb = set(hot.tolist())
-                for m in hot:
-                    for net in e.nets_per_macro[m]:
-                        for p in e.net_pins[net]:
-                            o = int(e.pin_owner[p])
-                            if o < nM:
-                                nb.add(o)
-                hot = np.asarray(sorted(nb), dtype=np.int64)
-            if cap and hot.size > cap:
-                hot = np.sort(rng.choice(hot, cap, replace=False))
-            return hot
-
-        subset = hot_subset()
-        log(f"[v60 {benchmark.name}] refine basin-hop: start proxy={best_proxy:.6f}  "
-            f"subset={subset.size}  sigma={sigma:.3f} ({sigma_frac*100:.1f}% canvas)  "
-            f"hops={hops}  redescend={'GLOBAL' if global_redescend else 'local'}")
-
-        saved_sweeps = self.cd_polish_sweeps        # cap CD per-hop, restore after
-        self.cd_polish_sweeps = int(cd_sweeps)
-        history = []
+        hot = e.hot_cell_macros(self.refine_basin_hop_cong_frac)
+        cap = self.refine_basin_hop_cap
+        if cap and hot.size > cap:
+            hot = np.sort(rng.choice(hot, cap, replace=False))
+        pert = hot[hot >= nH]                  # perturb SOFT only (no overlap risk)
+        cand = incumbent_pos.clone()
+        cnp = cand[:nM].detach().cpu().numpy().astype(np.float64)
+        if pert.size:
+            new = cnp[pert] + rng.normal(0.0, sigma, size=(pert.size, 2))
+            lx = np.minimum(hw[pert], cw - hw[pert]); ux = np.maximum(hw[pert], cw - hw[pert])
+            ly = np.minimum(hh[pert], ch - hh[pert]); uy = np.maximum(hh[pert], ch - hh[pert])
+            new[:, 0] = np.clip(new[:, 0], lx, ux)
+            new[:, 1] = np.clip(new[:, 1], ly, uy)
+            cnp[pert] = new
+            cand[:nM] = torch.tensor(cnp, dtype=cand.dtype)
+        saved = self.cd_polish_sweeps          # cap CD sweeps per hop (child-local)
+        self.cd_polish_sweeps = int(self.refine_basin_hop_cd_sweeps)
         try:
-            for hop in range(hops):
-                t0 = time.time()
-                sub = hot_subset() if resample else subset
-                pert = sub[sub >= nH]               # perturb SOFT only (no overlap risk)
-                cand = best_pos.clone()
-                cnp = cand[:nM].detach().cpu().numpy().astype(np.float64)
-                new = cnp[pert] + rng.normal(0.0, sigma, size=(pert.size, 2))
-                lx = np.minimum(hw[pert], cw - hw[pert]); ux = np.maximum(hw[pert], cw - hw[pert])
-                ly = np.minimum(hh[pert], ch - hh[pert]); uy = np.maximum(hh[pert], ch - hh[pert])
-                new[:, 0] = np.clip(new[:, 0], lx, ux)
-                new[:, 1] = np.clip(new[:, 1], ly, uy)
-                cnp[pert] = new
-                cand[:nM] = torch.tensor(cnp, dtype=cand.dtype)
-
-                tgt = None if global_redescend else sub
-                out, costs = self._cd_polish(cand, benchmark, plc,
-                                             max_workers=max_workers, target_subset=tgt)
-                pr = float(costs['proxy_cost']) if costs else float('inf')
-                accepted = pr < best_proxy - 1e-9
-                if accepted:
-                    best_proxy = pr
-                    best_pos = out
-                history.append((pr, accepted))
-                log(f"[v60 {benchmark.name}] refine basin-hop: hop {hop+1}/{hops} "
-                    f"-> proxy={pr:.6f}  best={best_proxy:.6f}  "
-                    f"{'ACCEPT' if accepted else '--'}  {time.time()-t0:.1f}s")
+            out, costs = self._cd_polish(cand, benchmark, plc,
+                                         max_workers=cd_w, target_subset=None)
         finally:
-            self.cd_polish_sweeps = saved_sweeps
-
-        return best_pos, best_proxy, history
+            self.cd_polish_sweeps = saved
+        pr = float(costs['proxy_cost']) if costs else float('inf')
+        pos_np = (out[:nM].detach().cpu().numpy().astype(np.float64)
+                  if out is not None else None)
+        return pos_np, pr
 
 
 def place(benchmark: Benchmark) -> torch.Tensor:

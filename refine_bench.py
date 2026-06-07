@@ -139,11 +139,9 @@ def cmd_run(args):
         elif st == "softswap":
             out, costs = placer._pair_swap_polish_soft(cur, benchmark, plc)
         elif st == "basinhop":
-            out, _proxy, _hist = placer._refine_basin_hop(
-                cur, benchmark, plc, hops=args.hops, sigma_frac=args.sigma,
-                cong_frac=args.cong_frac, cap=args.cap, cd_sweeps=args.bhop_sweeps,
-                global_redescend=not args.local, resample=args.resample,
-                neighbors=args.neighbors, seed=args.seed)
+            # Per-hop σ line-search on this single floor (the production path).
+            _apply_bhop_args(placer, args)
+            out, _pr = placer._refine_basin_hop(cur, benchmark, plc)
             bd = _breakdown(out, benchmark, plc)
             costs = {'proxy_cost': bd['proxy_cost'],
                      'wirelength_cost': bd['wirelength_cost'],
@@ -180,9 +178,10 @@ def cmd_run(args):
 def cmd_multicand(args):
     """Reproduce the pipeline's best-of-N refined floor: refine ALL cached
     candidates concurrently via _run_cpu_side (one fork per candidate, so wall ~=
-    one candidate, NOT N), pick the best FINAL, optionally basin-hop it. The best
-    PRE-refinement seed is not always the best POST-refinement one, so this is the
-    apples-to-apples (production-level) baseline a single-cand floor misses."""
+    one candidate, NOT N), pick the best FINAL. The best PRE-refinement seed is not
+    always the best POST-refinement one, so this is the apples-to-apples
+    (production-level) floor a single-cand floor misses. `run --stage basinhop
+    --load-pos <saved floor>` then exercises the production basin-hop on it."""
     benchmark, plc = _load_bench(args.benchmark, args.plc_root)
     nM = int(benchmark.num_macros)
     meta_path = osp.join(args.cache_dir, f"{args.benchmark}_meta.json")
@@ -225,20 +224,6 @@ def cmd_multicand(args):
         np.save(args.save_out, cur[:nM].detach().cpu().numpy().astype(np.float64))
         print(f"[bench] saved best-of-N floor -> {args.save_out}")
 
-    if args.bhop:
-        out, _proxy, _hist = placer._refine_basin_hop(
-            cur, benchmark, plc, hops=args.hops, sigma_frac=args.sigma,
-            cong_frac=args.cong_frac, cap=args.cap, cd_sweeps=args.bhop_sweeps,
-            global_redescend=not args.local, resample=args.resample,
-            neighbors=args.neighbors, seed=args.seed)
-        bd = _breakdown(out, benchmark, plc)
-        print(f"[bench] best-of-N + basin-hop: proxy={bd['proxy_cost']:.6f}  "
-              f"cong={bd['congestion_cost']:.3f} ovlp={bd['overlap_count']}  "
-              f"(floor {best[1]:.6f}, Δ={best[1]-bd['proxy_cost']:+.6f})")
-        if args.save_bhop:
-            np.save(args.save_bhop, out[:nM].detach().cpu().numpy().astype(np.float64))
-            print(f"[bench] saved post-bhop -> {args.save_bhop}")
-
 
 def main():
     p = argparse.ArgumentParser(
@@ -280,16 +265,12 @@ def main():
 
     pm = sub.add_parser("multicand",
                         help="refine ALL cached candidates concurrently "
-                             "(_run_cpu_side), pick best-of-N, optionally basin-hop it")
+                             "(_run_cpu_side), pick best-of-N floor")
     pm.add_argument("-b", "--benchmark", default="ibm14")
     pm.add_argument("--cache-dir", default=".refine_cache")
     pm.add_argument("--plc-root", default=DEFAULT_PLC_ROOT)
     pm.add_argument("--save-out", default=None, help="save best-of-N floor .npy")
-    pm.add_argument("--bhop", action="store_true",
-                    help="basin-hop the best-of-N floor after picking it")
-    pm.add_argument("--save-bhop", default=None, help="save post-bhop .npy")
     pm.add_argument("--seed", type=int, default=0)
-    _add_bhop_args(pm)
     pm.set_defaults(func=cmd_multicand)
 
     args = p.parse_args()
@@ -299,20 +280,26 @@ def main():
 def _add_bhop_args(ap):
     """Shared basin-hop knobs (used by `run --stage basinhop` and `multicand`)."""
     ap.add_argument("--hops", type=int, default=4)
-    ap.add_argument("--sigma", type=float, default=0.008,
-                    help="perturb std as a fraction of mean canvas side")
+    ap.add_argument("--sigma-set", type=str, default=None,
+                    help="comma-separated per-hop σ line-search set, as fractions of "
+                         "mean canvas side (default: the placer's refine_basin_hop_sigma_set)")
     ap.add_argument("--cong-frac", type=float, default=0.05,
                     help="congestion tail fraction defining 'hot' cells")
     ap.add_argument("--cap", type=int, default=60,
                     help="max hot soft macros perturbed per hop (0 = all)")
     ap.add_argument("--bhop-sweeps", type=int, default=15,
                     help="CD sweep cap per hop")
-    ap.add_argument("--local", action="store_true",
-                    help="local re-descend (perturbed subset only) instead of global")
-    ap.add_argument("--resample", action="store_true",
-                    help="re-pick the hot subset each hop")
-    ap.add_argument("--neighbors", action="store_true",
-                    help="include co-net neighbors of hot macros in the subset")
+
+
+def _apply_bhop_args(placer, args):
+    """Push the shared basin-hop CLI knobs onto the placer's ctor attributes."""
+    placer.refine_basin_hop_hops      = args.hops
+    placer.refine_basin_hop_cong_frac = args.cong_frac
+    placer.refine_basin_hop_cap       = args.cap
+    placer.refine_basin_hop_cd_sweeps = args.bhop_sweeps
+    if args.sigma_set:
+        placer.refine_basin_hop_sigma_set = tuple(
+            float(x) for x in args.sigma_set.split(","))
 
 
 if __name__ == "__main__":
