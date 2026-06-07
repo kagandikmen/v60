@@ -83,6 +83,161 @@ _NET_VECTORIZE_MIN = 8
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  numba-compiled congestion router (per-candidate hot path)
+# ════════════════════════════════════════════════════════════════════════════
+#  The per-candidate cong scorer's dominant cost is re-routing the moved macro's
+#  nets — millions of tiny numpy slice-adds + Python per-net/per-segment dispatch.
+#  These njit kernels do the whole "add the macro's nets to the demand grids" in
+#  one compiled call over a CSR of pin gcells. Bit-identical to the Python router
+#  (_add_two/three_pin_segment): same gcell SET (deduped), same L/T/special
+#  dispatch, same half-open slice ranges, and every segment of a net adds the
+#  SAME per-net weight so cross-segment += order is irrelevant; only >3-pin nets
+#  visit their non-source gcells in first-seen (not set-hash) order, a pure
+#  float-reorder (~1e-16). If numba is unavailable the class falls back to the
+#  Python router, so this is an optional accelerator, not a hard dependency.
+try:
+    from numba import njit as _njit
+    _NUMBA_OK = True
+except Exception:                                       # pragma: no cover
+    _NUMBA_OK = False
+    def _njit(*a, **k):
+        def deco(f):
+            return f
+        return deco
+
+
+@_njit(cache=True)
+def _two_pin_njit(sr, sc, tr, tc, w, V, H, Gc):
+    """PLC __two_pin_net_routing: H along source row, V along sink col."""
+    rmin = tr if tr < sr else sr
+    rmax = sr if tr < sr else tr
+    cmin = tc if tc < sc else sc
+    cmax = sc if tc < sc else tc
+    base = sr * Gc
+    for c in range(cmin, cmax):
+        H[base + c] += w
+    for r in range(rmin, rmax):
+        V[r * Gc + tc] += w
+
+
+@_njit(cache=True)
+def _three_pin_njit(ra, ca, rb, cb, rc, cc, w, V, H, Gc, Gr):
+    """PLC __three_pin_net_routing (L / T / special). Inputs are the 3 UNIQUE
+    gcells; this sorts them exactly as PLC does (by (col,row), and (row,col) for
+    the T case)."""
+    km = Gr + 1
+    R0 = ra; C0 = ca; K0 = ca * km + ra
+    R1 = rb; C1 = cb; K1 = cb * km + rb
+    R2 = rc; C2 = cc; K2 = cc * km + rc
+    if K0 > K1:
+        R0, C0, K0, R1, C1, K1 = R1, C1, K1, R0, C0, K0
+    if K1 > K2:
+        R1, C1, K1, R2, C2, K2 = R2, C2, K2, R1, C1, K1
+    if K0 > K1:
+        R0, C0, K0, R1, C1, K1 = R1, C1, K1, R0, C0, K0
+    y1 = R0; x1 = C0; y2 = R1; x2 = C1; y3 = R2; x3 = C2
+    if x1 < x2 and x2 < x3 and min(y1, y3) < y2 and max(y1, y3) > y2:
+        for c in range(x1, x2):
+            H[y1 * Gc + c] += w
+        for c in range(x2, x3):
+            H[y2 * Gc + c] += w
+        lo = y1 if y1 < y2 else y2; hi = y2 if y1 < y2 else y1
+        for r in range(lo, hi):
+            V[r * Gc + x2] += w
+        lo = y2 if y2 < y3 else y3; hi = y3 if y2 < y3 else y2
+        for r in range(lo, hi):
+            V[r * Gc + x3] += w
+    elif x2 == x3 and x1 < x2 and y1 < (y2 if y2 < y3 else y3):
+        for c in range(x1, x2):
+            H[y1 * Gc + c] += w
+        hi = y2 if y2 > y3 else y3
+        for r in range(y1, hi):
+            V[r * Gc + x2] += w
+    elif y2 == y3:
+        for c in range(x1, x2):
+            H[y1 * Gc + c] += w
+        for c in range(x2, x3):
+            H[y2 * Gc + c] += w
+        lo = y2 if y2 < y1 else y1; hi = y1 if y2 < y1 else y2
+        for r in range(lo, hi):
+            V[r * Gc + x2] += w
+    else:
+        # T-route: PLC re-sorts the nodes by (row, col).
+        km2 = Gc + 1
+        S0r = ra; S0c = ca; J0 = ra * km2 + ca
+        S1r = rb; S1c = cb; J1 = rb * km2 + cb
+        S2r = rc; S2c = cc; J2 = rc * km2 + cc
+        if J0 > J1:
+            S0r, S0c, J0, S1r, S1c, J1 = S1r, S1c, J1, S0r, S0c, J0
+        if J1 > J2:
+            S1r, S1c, J1, S2r, S2c, J2 = S2r, S2c, J2, S1r, S1c, J1
+        if J0 > J1:
+            S0r, S0c, J0, S1r, S1c, J1 = S1r, S1c, J1, S0r, S0c, J0
+        y1t = S0r; x1t = S0c; y2t = S1r; x2t = S1c; y3t = S2r; x3t = S2c
+        xmin = x1t
+        if x2t < xmin: xmin = x2t
+        if x3t < xmin: xmin = x3t
+        xmax = x1t
+        if x2t > xmax: xmax = x2t
+        if x3t > xmax: xmax = x3t
+        for c in range(xmin, xmax):
+            H[y2t * Gc + c] += w
+        lo = y1t if y1t < y2t else y2t; hi = y2t if y1t < y2t else y1t
+        for r in range(lo, hi):
+            V[r * Gc + x1t] += w
+        lo = y2t if y2t < y3t else y3t; hi = y3t if y2t < y3t else y2t
+        for r in range(lo, hi):
+            V[r * Gc + x3t] += w
+
+
+@_njit(cache=True)
+def _route_csr_njit(off, prow, pcol, netw, sign, V, H, Gc, Gr, sr_buf, sc_buf):
+    """Add (sign * weight) of every net's L-route to V/H. Nets are a CSR over
+    pin gcells: net k owns slots [off[k], off[k+1]); slot off[k] is the driver.
+    Per net: dedup gcells (first-seen), then PLC's 2-/3-/>3-pin dispatch."""
+    K = off.shape[0] - 1
+    for k in range(K):
+        s = off[k]; e = off[k + 1]
+        if e - s < 2:
+            continue
+        w = netw[k] * sign
+        nu = 0
+        for i in range(s, e):
+            r = prow[i]; c = pcol[i]
+            found = False
+            for j in range(nu):
+                if sr_buf[j] == r and sc_buf[j] == c:
+                    found = True
+                    break
+            if not found:
+                sr_buf[nu] = r; sc_buf[nu] = c; nu += 1
+        if nu < 2:
+            continue
+        srr = sr_buf[0]; scc = sc_buf[0]      # driver = first pin
+        if nu == 2:
+            _two_pin_njit(srr, scc, sr_buf[1], sc_buf[1], w, V, H, Gc)
+        elif nu == 3:
+            _three_pin_njit(sr_buf[0], sc_buf[0], sr_buf[1], sc_buf[1],
+                            sr_buf[2], sc_buf[2], w, V, H, Gc, Gr)
+        else:
+            for j in range(1, nu):
+                _two_pin_njit(srr, scc, sr_buf[j], sc_buf[j], w, V, H, Gc)
+
+
+def _numba_warmup():
+    """Compile the njit kernels once (in the parent, before any CD fork) on the
+    production dtypes so forked workers inherit the compiled code."""
+    if not _NUMBA_OK:
+        return
+    off = np.array([0, 2], dtype=np.int64)
+    prow = np.array([0, 1], dtype=np.int64); pcol = np.array([0, 1], dtype=np.int64)
+    netw = np.array([1.0], dtype=np.float64)
+    V = np.zeros(4, dtype=np.float64); H = np.zeros(4, dtype=np.float64)
+    sb = np.empty(8, dtype=np.int64); cb = np.empty(8, dtype=np.int64)
+    _route_csr_njit(off, prow, pcol, netw, 1.0, V, H, 2, 2, sb, cb)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  IncrementalEval
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -582,6 +737,14 @@ class IncrementalEval:
         # _add_net_to_routing_cached skip the per-pin gcell recompute (~70% of
         # per-candidate pin lookups are non-moving).
         self._cong_gcell = {}
+        # numba CSR re-route: per-macro pin-gcell CSR (built by _prep_old_routes)
+        # + dedup scratch sized to the largest net. Warm the kernels up now so a
+        # CD fork pool inherits the compiled code instead of re-JITting per worker.
+        self._max_net_pins = max((len(p) for p in self.net_pins), default=1)
+        self._csr_sr_buf = np.empty(max(self._max_net_pins, 1), dtype=np.int64)
+        self._csr_sc_buf = np.empty(max(self._max_net_pins, 1), dtype=np.int64)
+        self._csr_off = None
+        _numba_warmup()
 
     def _refresh_all_pin_positions(self) -> None:
         """Recompute self.pin_xy from current macro_pos and port_pos."""
@@ -1201,6 +1364,40 @@ class IncrementalEval:
                     gc[pi] = self._grid_cell_for_pos_f32(
                         np.float32(self.pin_xy[pi, 0]),
                         np.float32(self.pin_xy[pi, 1]))
+        # Build the numba re-route CSR for this macro's nets: per net, its pins'
+        # gcells (fixed pins filled from gc above; the macro's own pins left as
+        # placeholders, overwritten per candidate), the net weight, and the
+        # slot<->moving-pin map for the per-candidate scatter. Slot off[k] is the
+        # driver (net_pins[n][0]) — matches the Python router's source_rc.
+        if _NUMBA_OK:
+            nets = self.nets_per_macro[macro_idx]
+            local_of = {int(p): i for i, p in enumerate(self.pins_per_macro[macro_idx])}
+            total = int(sum(int(self.net_pins[int(n)].size) for n in nets))
+            offs = np.empty(len(nets) + 1, dtype=np.int64); offs[0] = 0
+            crow = np.empty(total, dtype=np.int64); ccol = np.empty(total, dtype=np.int64)
+            cw = np.empty(len(nets), dtype=np.float64)
+            mov_slots = []; mov_local = []
+            slot = 0
+            for k, n in enumerate(nets):
+                n = int(n)
+                for p in self.net_pins[n]:
+                    pi = int(p)
+                    li = local_of.get(pi, -1)
+                    if li >= 0:
+                        crow[slot] = 0; ccol[slot] = 0
+                        mov_slots.append(slot); mov_local.append(li)
+                    else:
+                        r, c = gc[pi]
+                        crow[slot] = r; ccol[slot] = c
+                    slot += 1
+                offs[k + 1] = slot
+                cw[k] = float(self.net_weight[n])
+            self._csr_off = offs
+            self._csr_row = crow
+            self._csr_col = ccol
+            self._csr_w = cw
+            self._csr_mov_slots = np.asarray(mov_slots, dtype=np.int64)
+            self._csr_mov_local = np.asarray(mov_local, dtype=np.int64)
 
     def _moving_pin_gcells(self, pins, new_xy: Tuple[float, float]):
         """Vectorised gcell (row, col) of `pins` if their owner moves to new_xy.
@@ -1274,20 +1471,28 @@ class IncrementalEval:
             if hit is not None:
                 return hit
 
-        # Write the moving pins into the per-pin gcell cache (fixed pins already
-        # filled by _prep_old_routes), then re-route from the cache. No per-pin
-        # gcell recompute, and no pin_xy mutation (the cached router reads gc).
-        gc = self._cong_gcell
-        pins_l = pins.tolist() if hasattr(pins, 'tolist') else list(pins)
-        rows_l = mov_rows.tolist(); cols_l = mov_cols.tolist()
-        for i in range(len(pins_l)):
-            gc[pins_l[i]] = (rows_l[i], cols_l[i])
-
-        # Net-route delta: cached -old, then add the new routes from the cache.
+        # Net-route delta: cached -old, then add the new routes.
         dV[self._old_v_idx] = self._old_v_neg
         dH[self._old_h_idx] = self._old_h_neg
-        for n in nets:
-            self._add_net_to_routing_cached(int(n), dV, dH, +1.0, gc)
+        if _NUMBA_OK:
+            # Scatter the candidate's moving-pin gcells into the per-macro CSR,
+            # then add every net's L-route in one compiled call (no Python
+            # per-net/per-segment dispatch, no gcell dict writes).
+            self._csr_row[self._csr_mov_slots] = mov_rows[self._csr_mov_local]
+            self._csr_col[self._csr_mov_slots] = mov_cols[self._csr_mov_local]
+            _route_csr_njit(self._csr_off, self._csr_row, self._csr_col,
+                            self._csr_w, 1.0, dV, dH,
+                            self.G_cols, self.G_rows,
+                            self._csr_sr_buf, self._csr_sc_buf)
+        else:
+            # Python fallback: write moving pins into the gcell dict, re-route.
+            gc = self._cong_gcell
+            pins_l = pins.tolist() if hasattr(pins, 'tolist') else list(pins)
+            rows_l = mov_rows.tolist(); cols_l = mov_cols.tolist()
+            for i in range(len(pins_l)):
+                gc[pins_l[i]] = (rows_l[i], cols_l[i])
+            for n in nets:
+                self._add_net_to_routing_cached(int(n), dV, dH, +1.0, gc)
 
         # Macro-blockage delta (hard macros only; added un-smoothed).
         if is_hard:
@@ -1318,7 +1523,7 @@ class IncrementalEval:
         if cur_den is None:
             cur_den = self.compute_density_cost()
         st = self.delta_for_move(macro_idx, new_xy, include_cong=False,
-                                 want_wl_state=False)
+                                 want_wl_state=False, cur_den_cost=cur_den)
         new_wl  = cur_wl + st['delta_wl']
         new_den = cur_den + st['delta_density']
         new_cong = self._cong_cost_for_move(macro_idx, new_xy)
@@ -1813,11 +2018,16 @@ class IncrementalEval:
         }
 
     def delta_for_move(self, macro_idx: int, new_xy: Tuple[float, float],
-                       include_cong: bool = False, want_wl_state: bool = True) -> dict:
+                       include_cong: bool = False, want_wl_state: bool = True,
+                       cur_den_cost: Optional[float] = None) -> dict:
         """Compute proxy delta if macro_idx moves to new_xy. State unchanged.
 
         `want_wl_state=False` (candidate scoring) skips building the per-net WL
         commit state — only the scalar delta is needed to rank candidates.
+        `cur_den_cost` (the current density cost) lets the caller supply the value
+        instead of re-deriving it here: it is CONSTANT across all candidates of a
+        macro, so recomputing it per candidate is pure waste. Bit-identical — the
+        supplied value is the same compute_density_cost() the caller already has.
 
         Returns dict with delta_wl, delta_density, delta_cong (=0 if
         include_cong=False; for True we currently fall back to a full
@@ -1837,7 +2047,8 @@ class IncrementalEval:
         for (r, c), d in den_state['cells_delta'].items():
             new_grid[r, c] += d
         new_den_cost = self.compute_density_cost(grid_occupied=new_grid)
-        delta_density = new_den_cost - self.compute_density_cost()
+        cur_den_now = cur_den_cost if cur_den_cost is not None else self.compute_density_cost()
+        delta_density = new_den_cost - cur_den_now
 
         delta_cong = 0.0
         if include_cong:
