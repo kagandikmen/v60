@@ -1519,8 +1519,10 @@ class v60_Placer:
                 for mult in step_mults:
                     s = base_step * mult
                     for (dx, dy) in dirs:
-                        new_x = float(np.clip(cur_x + dx * s, 0.0, cw))
-                        new_y = float(np.clip(cur_y + dy * s, 0.0, ch))
+                        # min/max clamp == np.clip for finite values, but ~5x cheaper
+                        # than the scalar np.clip machinery (per-candidate hot path).
+                        new_x = min(max(cur_x + dx * s, 0.0), cw)
+                        new_y = min(max(cur_y + dy * s, 0.0), ch)
                         if new_x == cur_x and new_y == cur_y:
                             continue
                         key = (new_x, new_y)

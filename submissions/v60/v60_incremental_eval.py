@@ -569,6 +569,7 @@ class IncrementalEval:
         self._cong_dMV = np.zeros(_G, dtype=np.float64)
         self._cong_dMH = np.zeros(_G, dtype=np.float64)
         self._score_prep_macro = -1   # macro whose old routes are cached (-1 = none)
+        self._wl_prep_macro = -1      # macro whose WL non-moving-pin bbox is cached
         # Per-macro soft-cong memo: {gcell-signature -> cong cost}. A soft macro
         # has no blockage, so its candidate cong depends ONLY on where its pins
         # land in gcells; candidates sharing a signature share a bit-identical
@@ -1316,7 +1317,8 @@ class IncrementalEval:
             cur_wl = self.compute_wl_cost()
         if cur_den is None:
             cur_den = self.compute_density_cost()
-        st = self.delta_for_move(macro_idx, new_xy, include_cong=False)
+        st = self.delta_for_move(macro_idx, new_xy, include_cong=False,
+                                 want_wl_state=False)
         new_wl  = cur_wl + st['delta_wl']
         new_den = cur_den + st['delta_density']
         new_cong = self._cong_cost_for_move(macro_idx, new_xy)
@@ -1635,58 +1637,78 @@ class IncrementalEval:
     #  WL: incremental delta and commit
     # ───────────────────────────────────────────────────────────────────────
 
-    def _delta_wl_for_move(self, macro_idx: int, new_xy: Tuple[float, float]) -> Tuple[float, dict]:
+    def _prep_wl_cache(self, macro_idx: int) -> None:
+        """Cache, for each net `macro_idx` is on, the bbox of its NON-moving pins
+        (other macros' pins + ports — constant for the whole candidate scan) and
+        the offset-bbox of the moving macro's own pins on that net (offsets never
+        change). _delta_wl_for_move then gets each candidate net's bbox as
+        min/max(fixed_bbox, new_xy + offset_bbox) — O(nets), no inner pin loop.
+        Bit-identical: min/max over the SAME values, and IEEE add is monotonic so
+        new_x + min(offset) == min(new_x + offset). Invalidated by commit_move()."""
+        nets = np.asarray(self.nets_per_macro[macro_idx], dtype=np.int64)
+        K = nets.size
+        fminx = np.full(K, np.inf);  fmaxx = np.full(K, -np.inf)
+        fminy = np.full(K, np.inf);  fmaxy = np.full(K, -np.inf)
+        mminox = np.full(K, np.inf); mmaxox = np.full(K, -np.inf)
+        mminoy = np.full(K, np.inf); mmaxoy = np.full(K, -np.inf)
+        owned = set(int(p) for p in self.pins_per_macro[macro_idx])
+        pin_xy = self.pin_xy; off = self.pin_offset
+        for k in range(K):
+            for p in self.net_pins[int(nets[k])]:
+                pi = int(p)
+                if pi in owned:
+                    ox = off[pi, 0]; oy = off[pi, 1]
+                    if ox < mminox[k]: mminox[k] = ox
+                    if ox > mmaxox[k]: mmaxox[k] = ox
+                    if oy < mminoy[k]: mminoy[k] = oy
+                    if oy > mmaxoy[k]: mmaxoy[k] = oy
+                else:
+                    px = pin_xy[pi, 0]; py = pin_xy[pi, 1]
+                    if px < fminx[k]: fminx[k] = px
+                    if px > fmaxx[k]: fmaxx[k] = px
+                    if py < fminy[k]: fminy[k] = py
+                    if py > fmaxy[k]: fmaxy[k] = py
+        self._wl_nets      = nets
+        self._wl_fix_minx  = fminx;  self._wl_fix_maxx = fmaxx
+        self._wl_fix_miny  = fminy;  self._wl_fix_maxy = fmaxy
+        self._wl_mov_minox = mminox; self._wl_mov_maxox = mmaxox
+        self._wl_mov_minoy = mminoy; self._wl_mov_maxoy = mmaxoy
+        self._wl_net_w     = self.net_weight[nets]
+        self._wl_net_hpwl0 = self.net_hpwl[nets]
+        self._wl_prep_macro = macro_idx
+
+    def _delta_wl_for_move(self, macro_idx: int, new_xy: Tuple[float, float],
+                           want_state: bool = True) -> Tuple[float, Optional[dict]]:
         """Compute the (un-normalised) total_hpwl delta if macro_idx moves.
 
-        Returns (delta_total_hpwl, per_net_new_state).
-        per_net_new_state[net_idx] = (new_min_x, new_max_x, new_min_y, new_max_y,
-                                       new_net_hpwl)  — to be applied on commit.
-        """
+        Uses the per-macro non-moving-pin bbox cache (see _prep_wl_cache) so the
+        per-candidate work is O(nets), not O(nets * pins). Returns
+        (delta_total_hpwl, per_net_new_state) where per_net_new_state[net_idx] =
+        (new_min_x, new_max_x, new_min_y, new_max_y, new_net_hpwl) is consumed by
+        commit_move(). When `want_state` is False (candidate SCORING, which needs
+        only the scalar delta) the dict is skipped and None is returned. Matches
+        the old per-pin scan up to float-reorder in the delta sum (~1e-15)."""
         nets = self.nets_per_macro[macro_idx]
-        if nets.size == 0:
-            return 0.0, {}
-
-        pin_idxs_macro = self.pins_per_macro[macro_idx]
-        new_x, new_y = float(new_xy[0]), float(new_xy[1])
-
-        # For each pin owned by macro: new_pin_xy = (new_x + offset_x, new_y + offset_y).
-        # Build a map pin_idx -> (new_px, new_py).
-        new_pin_pos = {}
-        for p_idx in pin_idxs_macro:
-            ox = new_x + self.pin_offset[p_idx, 0]
-            oy = new_y + self.pin_offset[p_idx, 1]
-            new_pin_pos[int(p_idx)] = (float(ox), float(oy))
-
-        delta = 0.0
+        if len(nets) == 0:
+            return 0.0, ({} if want_state else None)
+        if self._wl_prep_macro != macro_idx:
+            self._prep_wl_cache(macro_idx)
+        nx = float(new_xy[0]); ny = float(new_xy[1])
+        new_min_x = np.minimum(self._wl_fix_minx, nx + self._wl_mov_minox)
+        new_max_x = np.maximum(self._wl_fix_maxx, nx + self._wl_mov_maxox)
+        new_min_y = np.minimum(self._wl_fix_miny, ny + self._wl_mov_minoy)
+        new_max_y = np.maximum(self._wl_fix_maxy, ny + self._wl_mov_maxoy)
+        new_hpwl = self._wl_net_w * ((new_max_x - new_min_x) + (new_max_y - new_min_y))
+        delta = float((new_hpwl - self._wl_net_hpwl0).sum())
+        if not want_state:
+            return delta, None
         per_net = {}
-
-        for net_idx in nets:
-            net_idx = int(net_idx)
-            pis = self.net_pins[net_idx]
-            if pis.size == 0:
-                continue
-            # Build the candidate net pin positions: use new_pin_pos for moving pins,
-            # current pin_xy for the rest.
-            new_min_x = math.inf
-            new_max_x = -math.inf
-            new_min_y = math.inf
-            new_max_y = -math.inf
-            for p in pis:
-                p_int = int(p)
-                if p_int in new_pin_pos:
-                    px, py = new_pin_pos[p_int]
-                else:
-                    px = float(self.pin_xy[p_int, 0])
-                    py = float(self.pin_xy[p_int, 1])
-                if px < new_min_x: new_min_x = px
-                if px > new_max_x: new_max_x = px
-                if py < new_min_y: new_min_y = py
-                if py > new_max_y: new_max_y = py
-            new_hpwl_unweighted = (new_max_x - new_min_x) + (new_max_y - new_min_y)
-            new_net_hpwl = self.net_weight[net_idx] * new_hpwl_unweighted
-            delta += new_net_hpwl - self.net_hpwl[net_idx]
-            per_net[net_idx] = (new_min_x, new_max_x, new_min_y, new_max_y, new_net_hpwl)
-
+        nets_l = self._wl_nets.tolist()
+        mnx = new_min_x.tolist(); mxx = new_max_x.tolist()
+        mny = new_min_y.tolist(); mxy = new_max_y.tolist()
+        nh = new_hpwl.tolist()
+        for k in range(len(nets_l)):
+            per_net[nets_l[k]] = (mnx[k], mxx[k], mny[k], mxy[k], nh[k])
         return delta, per_net
 
     def _commit_wl(self, macro_idx: int, new_xy: Tuple[float, float], per_net: dict) -> None:
@@ -1791,8 +1813,11 @@ class IncrementalEval:
         }
 
     def delta_for_move(self, macro_idx: int, new_xy: Tuple[float, float],
-                       include_cong: bool = False) -> dict:
+                       include_cong: bool = False, want_wl_state: bool = True) -> dict:
         """Compute proxy delta if macro_idx moves to new_xy. State unchanged.
+
+        `want_wl_state=False` (candidate scoring) skips building the per-net WL
+        commit state — only the scalar delta is needed to rank candidates.
 
         Returns dict with delta_wl, delta_density, delta_cong (=0 if
         include_cong=False; for True we currently fall back to a full
@@ -1802,7 +1827,8 @@ class IncrementalEval:
         polish stages prefer include_cong=False then full-eval after the
         cheap delta wins.
         """
-        delta_total_hpwl, wl_state = self._delta_wl_for_move(macro_idx, new_xy)
+        delta_total_hpwl, wl_state = self._delta_wl_for_move(
+            macro_idx, new_xy, want_state=want_wl_state)
         delta_wl = delta_total_hpwl / self.wl_denominator
 
         den_state = self._delta_density_for_move(macro_idx, new_xy)
@@ -1912,6 +1938,8 @@ class IncrementalEval:
         # A move changes the touched nets' routes, so the cached "old routes"
         # for incremental scoring are stale — invalidate them.
         self._score_prep_macro = -1
+        # Pin positions changed -> the WL non-moving-pin bbox cache is stale too.
+        self._wl_prep_macro = -1
 
 
 # ════════════════════════════════════════════════════════════════════════════
