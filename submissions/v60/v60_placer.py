@@ -270,9 +270,6 @@ class v60_Placer:
         basin_hop_min_improve_frac: float = 0.005,                   # 0.5% of current proxy
         basin_hop_stratify:         bool  = False,                   # split B across sigma_set per hop
         basin_hop_restarts:         int   = 8,                       # small B per hop + more hops
-        # Runtime guard for large/routability-heavy benchmarks. 'auto' keeps
-        # ibm01-style behavior but caps expensive Stage-2 reruns on big netlists.
-        congestion_runtime_mode: str = 'auto',
         # -- v60 soft-only polish -------------------------------------------------
         soft_polish_enabled: bool = True,
         soft_polish_restarts: int = 16,
@@ -357,16 +354,18 @@ class v60_Placer:
         # in parallel (one CD re-descent per σ) and greedily keeps the best, which
         # adapts the kick to the design AND anneals coarse→fine across the descent.
         refine_basin_hop_enabled: bool = True,
-        refine_basin_hop_hops: int = 2,        # hops 1-2 capture most of the gain; 3-4 add
-                                               # only ~0.1-0.3% but ~half the rbhop wall -> 2
-                                               # keeps the biggest designs (ibm18) under budget
+        refine_basin_hop_hops: int = 4,        # restored 2->4 (2026-06-07): hops 3-4 add
+                                               # ~0.1-0.3% and the numba CD router makes the
+                                               # extra hops affordable again (was cut to 2 for
+                                               # big-design budget; designs still descend at 4)
         refine_basin_hop_sigma_set: tuple = (0.012, 0.024, 0.048, 0.072),  # per-hop σ line-search band
         refine_basin_hop_cap: int = 60,        # max hot soft macros perturbed / hop
         refine_basin_hop_cong_frac: float = 0.05,
         # Per-hop CD re-descend sweep cap. The natural early-stop (0.1%/sweep) runs
-        # ~6-10 sweeps; capping at 4 drops only the diminishing-return tail for
-        # ~2.5x faster basin-hop at ~+0.38% proxy (ibm06: -2.99% vs -3.36% full).
-        refine_basin_hop_cd_sweeps: int = 4,
+        # ~6-10 sweeps; raised 4->12 (2026-06-07) to recover the re-descend tail
+        # (~+0.38% on ibm06) now that the numba CD router makes the extra sweeps
+        # affordable. 12 sits above the typical early-stop, so it rarely binds.
+        refine_basin_hop_cd_sweeps: int = 12,
         # Which macros the per-hop kick perturbs. 'netcause' (default): endpoint
         # macros of the nets routing THROUGH the top-cong cells (`bottleneck_net_macros`).
         # Since most nets thread the central jam this is a broad set, so after the cap the
@@ -436,7 +435,6 @@ class v60_Placer:
         self.basin_hop_min_improve_frac = float(basin_hop_min_improve_frac)
         self.basin_hop_stratify       = bool(basin_hop_stratify)
         self.basin_hop_restarts       = int(basin_hop_restarts)
-        self.congestion_runtime_mode  = str(congestion_runtime_mode)
         self.soft_polish_enabled = bool(soft_polish_enabled)
         self.soft_polish_restarts = int(soft_polish_restarts)
         # 'auto' kept as-is; explicit values coerced. Resolved in _resolve_soft_polish.
@@ -551,29 +549,6 @@ class v60_Placer:
         hard_area   = 4.0 * float((hw * hh).sum())
         canvas_area = cw * ch
         return hard_area / max(canvas_area, 1e-12)
-
-    @staticmethod
-    def _congestion_runtime_scale(benchmark: Benchmark) -> float:
-        """0..1 runtime-pressure score for routability-heavy designs."""
-        return _congestion_work_tier(benchmark) / 4.0
-
-    def _runtime_guard_enabled(self) -> bool:
-        mode = self.congestion_runtime_mode.lower()
-        return mode not in ('off', 'false', '0', 'none')
-
-    def _cap_for_congestion_runtime(self, benchmark: Benchmark, value: int, caps: tuple) -> int:
-        if not self._runtime_guard_enabled():
-            return int(value)
-        pressure = self._congestion_runtime_scale(benchmark)
-        if pressure >= 1.0:
-            return min(int(value), int(caps[0]))
-        if pressure >= 0.75:
-            return min(int(value), int(caps[1]))
-        if pressure >= 0.5:
-            return min(int(value), int(caps[2]))
-        if pressure >= 0.25:
-            return min(int(value), int(caps[3]))
-        return int(value)
 
     @staticmethod
     def _auto_soft_polish_cong_interval(benchmark: Benchmark) -> int:
@@ -805,7 +780,6 @@ class v60_Placer:
                 and math.isfinite(cur_proxy)):
             Bhop = (self.basin_hop_restarts if self.basin_hop_restarts > 0
                     else int(getattr(winner_cohort, 'num_restarts', 16)))
-            Bhop = self._cap_for_congestion_runtime(benchmark, Bhop, caps=(5, 6, 7, 8))
             rng  = np.random.default_rng(self.seed if self.deterministic else None)
             try:
                 ic      = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)

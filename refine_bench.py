@@ -279,7 +279,8 @@ def main():
 
 def _add_bhop_args(ap):
     """Shared basin-hop knobs (used by `run --stage basinhop` and `multicand`)."""
-    ap.add_argument("--hops", type=int, default=4)
+    ap.add_argument("--hops", type=int, default=4,
+                    help="basin-hop count (production default: 4)")
     ap.add_argument("--sigma-set", type=str, default=None,
                     help="comma-separated per-hop σ line-search set, as fractions of "
                          "mean canvas side (default: the placer's refine_basin_hop_sigma_set)")
@@ -287,8 +288,8 @@ def _add_bhop_args(ap):
                     help="congestion tail fraction defining 'hot' cells")
     ap.add_argument("--cap", type=int, default=60,
                     help="max hot soft macros perturbed per hop (0 = all)")
-    ap.add_argument("--bhop-sweeps", type=int, default=4,
-                    help="CD sweep cap per hop (production default: 4)")
+    ap.add_argument("--bhop-sweeps", type=int, default=12,
+                    help="CD sweep cap per hop (production default: 12)")
 
 
 def _apply_bhop_args(placer, args):
