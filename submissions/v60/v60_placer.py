@@ -361,7 +361,10 @@ class v60_Placer:
         refine_basin_hop_sigma_set: tuple = (0.012, 0.024, 0.048, 0.072),  # per-hop σ line-search band
         refine_basin_hop_cap: int = 60,        # max hot soft macros perturbed / hop
         refine_basin_hop_cong_frac: float = 0.05,
-        refine_basin_hop_cd_sweeps: int = 15,
+        # Per-hop CD re-descend sweep cap. The natural early-stop (0.1%/sweep) runs
+        # ~6-10 sweeps; capping at 4 drops only the diminishing-return tail for
+        # ~2.5x faster basin-hop at ~+0.38% proxy (ibm06: -2.99% vs -3.36% full).
+        refine_basin_hop_cd_sweeps: int = 4,
         # -- v60 multi-candidate post-Stage-2 refinement -----------------------
         # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
         # winner, with separate widths for the (expensive, GPU) and (cheap,

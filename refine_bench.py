@@ -287,8 +287,8 @@ def _add_bhop_args(ap):
                     help="congestion tail fraction defining 'hot' cells")
     ap.add_argument("--cap", type=int, default=60,
                     help="max hot soft macros perturbed per hop (0 = all)")
-    ap.add_argument("--bhop-sweeps", type=int, default=15,
-                    help="CD sweep cap per hop")
+    ap.add_argument("--bhop-sweeps", type=int, default=4,
+                    help="CD sweep cap per hop (production default: 4)")
 
 
 def _apply_bhop_args(placer, args):
