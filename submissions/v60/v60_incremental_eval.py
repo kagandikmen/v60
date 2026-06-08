@@ -224,6 +224,60 @@ def _route_csr_njit(off, prow, pcol, netw, sign, V, H, Gc, Gr, sr_buf, sc_buf):
                 _two_pin_njit(srr, scc, sr_buf[j], sc_buf[j], w, V, H, Gc)
 
 
+@_njit(cache=True)
+def _scatter_njit(Vf, Hf, dV, dH, dMV, dMH, cntc, cntr, Gc, Gr, sr,
+                  inv_v, inv_h, has_block, flat, nzc, wbuf):
+    """Assemble flat = [Vf, Hf] + box-blurred dV/dH net demand (+ un-smoothed
+    macro blockage dMV/dMH), reset the deltas to 0. Bit-identical to the numpy
+    _scatter_delta_and_abu: same offset-outer / ascending-cell-inner order, w
+    computed once per cell, blockage in a disjoint flat range. `flat`/`nzc`/`wbuf`
+    are reused scratch (flat sized 2*G, nzc/wbuf sized G)."""
+    G = Gr * Gc
+    for i in range(G):
+        flat[i] = Vf[i]
+        flat[G + i] = Hf[i]
+    # V demand: smear each nonzero cell along its row over columns [c-sr, c+sr].
+    nv = 0
+    for cell in range(G):
+        if dV[cell] != 0.0:
+            c = cell % Gc
+            nzc[nv] = cell
+            wbuf[nv] = (dV[cell] * inv_v) / cntc[c]
+            nv += 1
+    for off in range(-sr, sr + 1):
+        for ii in range(nv):
+            cell = nzc[ii]
+            tc = (cell % Gc) + off
+            if 0 <= tc < Gc:
+                flat[(cell // Gc) * Gc + tc] += wbuf[ii]
+    for ii in range(nv):
+        dV[nzc[ii]] = 0.0
+    # H demand: smear each nonzero cell along its column over rows [r-sr, r+sr].
+    nh = 0
+    for cell in range(G):
+        if dH[cell] != 0.0:
+            r = cell // Gc
+            nzc[nh] = cell
+            wbuf[nh] = (dH[cell] * inv_h) / cntr[r]
+            nh += 1
+    for off in range(-sr, sr + 1):
+        for ii in range(nh):
+            cell = nzc[ii]
+            tr = (cell // Gc) + off
+            if 0 <= tr < Gr:
+                flat[G + tr * Gc + (cell % Gc)] += wbuf[ii]
+    for ii in range(nh):
+        dH[nzc[ii]] = 0.0
+    if has_block:
+        for cell in range(G):           # dMV->V half, dMH->H half (disjoint ranges)
+            if dMV[cell] != 0.0:
+                flat[cell] += dMV[cell] * inv_v
+                dMV[cell] = 0.0
+            if dMH[cell] != 0.0:
+                flat[G + cell] += dMH[cell] * inv_h
+                dMH[cell] = 0.0
+
+
 def _numba_warmup():
     """Compile the njit kernels once (in the parent, before any CD fork) on the
     production dtypes so forked workers inherit the compiled code."""
@@ -235,6 +289,14 @@ def _numba_warmup():
     V = np.zeros(4, dtype=np.float64); H = np.zeros(4, dtype=np.float64)
     sb = np.empty(8, dtype=np.int64); cb = np.empty(8, dtype=np.int64)
     _route_csr_njit(off, prow, pcol, netw, 1.0, V, H, 2, 2, sb, cb)
+    Vf = np.zeros(4, dtype=np.float64); Hf = np.zeros(4, dtype=np.float64)
+    dV = np.zeros(4, dtype=np.float64); dH = np.zeros(4, dtype=np.float64)
+    dMV = np.zeros(4, dtype=np.float64); dMH = np.zeros(4, dtype=np.float64)
+    cnt = np.ones(2, dtype=np.float64)
+    flat = np.empty(8, dtype=np.float64)
+    nz = np.empty(4, dtype=np.int64); wb = np.empty(4, dtype=np.float64)
+    _scatter_njit(Vf, Hf, dV, dH, dMV, dMH, cnt, cnt, 2, 2, 1,
+                  1.0, 1.0, True, flat, nz, wb)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -723,6 +785,11 @@ class IncrementalEval:
         self._cong_dH  = np.zeros(_G, dtype=np.float64)
         self._cong_dMV = np.zeros(_G, dtype=np.float64)
         self._cong_dMH = np.zeros(_G, dtype=np.float64)
+        # numba scatter scratch: the assembled flat grid (V|H) + per-call nonzero
+        # cell index / weight buffers (sized to one grid; reused per candidate).
+        self._cong_flat = np.empty(2 * _G, dtype=np.float64)
+        self._scat_nz   = np.empty(_G, dtype=np.int64)
+        self._scat_w    = np.empty(_G, dtype=np.float64)
         self._score_prep_macro = -1   # macro whose old routes are cached (-1 = none)
         self._wl_prep_macro = -1      # macro whose WL non-moving-pin bbox is cached
         # Per-macro soft-cong memo: {gcell-signature -> cong cost}. A soft macro
@@ -1550,6 +1617,14 @@ class IncrementalEval:
         G = Gr * Gc
         inv_v = (1.0 / self.grid_v_routes) if self.grid_v_routes > 0 else 1.0
         inv_h = (1.0 / self.grid_h_routes) if self.grid_h_routes > 0 else 1.0
+        if _NUMBA_OK:
+            # Compiled assemble + box-blur + delta-reset into the reused flat
+            # buffer; ABU stays in numpy (argpartition is already C-fast).
+            _scatter_njit(self._cong_Vf, self._cong_Hf, self._cong_dV, self._cong_dH,
+                          self._cong_dMV, self._cong_dMH, self._cntc, self._cntr,
+                          Gc, Gr, sr, inv_v, inv_h, bool(has_blockage),
+                          self._cong_flat, self._scat_nz, self._scat_w)
+            return self._abu_top_frac_mean(self._cong_flat, ABU_FRAC_CONG)
         dV = self._cong_dV; dH = self._cong_dH
         flat = np.concatenate([self._cong_Vf, self._cong_Hf])
         nzv = np.flatnonzero(dV)

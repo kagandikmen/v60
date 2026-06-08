@@ -2142,7 +2142,19 @@ class v60_Placer:
                   f"cd_workers={cd_w} ({concurrent} σ/wave){tot} ===")
         for hop in range(hops):
             th = time.time()
-            jobs = [{'si': si, 'sigma': s, 'pos': inc_pos,
+            # Hoist the per-hop shared setup out of the σ-descents: the incumbent
+            # is identical across all σ this hop, so build its eval + the hot-macro
+            # selector + half-dims ONCE here (not 8× in the forks). Each descent
+            # still does its own rng.choice(cap) + kick from this shared `hot`.
+            eh = IncrementalEval(benchmark, plc=plc)
+            eh.set_placement(inc_pos[:nM].detach().cpu().numpy().astype(np.float64))
+            if self.refine_basin_hop_kick_mode == 'netcause':
+                hot = eh.bottleneck_net_macros(self.refine_basin_hop_cong_frac)
+            else:
+                hot = eh.hot_cell_macros(self.refine_basin_hop_cong_frac)
+            hw = eh.macro_w * 0.5; hh = eh.macro_h * 0.5
+            del eh
+            jobs = [{'si': si, 'sigma': s, 'pos': inc_pos, 'hot': hot, 'hw': hw, 'hh': hh,
                      'seed': (None if base is None else base * 100003 + hop * 101 + si)}
                     for si, s in enumerate(sigmas)]
             outs = self._basin_hop_fanout(jobs, benchmark, plc, cd_w, concurrent)
@@ -2176,8 +2188,9 @@ class v60_Placer:
             ctx = None
         if ctx is None:                       # no fork: run the σ-fan sequentially
             for k, job in enumerate(jobs):
-                pos_np, pr = self._basin_hop_descend(job['pos'], job['sigma'],
-                                                     job['seed'], benchmark, plc, cd_w)
+                pos_np, pr = self._basin_hop_descend(
+                    job['pos'], job['sigma'], job['seed'], benchmark, plc, cd_w,
+                    job['hot'], job['hw'], job['hh'])
                 out[k] = {'pos': pos_np, 'proxy': pr, 'si': job['si']}
             return out
 
@@ -2185,7 +2198,8 @@ class v60_Placer:
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     pos_np, pr = self._basin_hop_descend(
-                        job['pos'], job['sigma'], job['seed'], benchmark, plc, cd_w)
+                        job['pos'], job['sigma'], job['seed'], benchmark, plc, cd_w,
+                        job['hot'], job['hw'], job['hh'])
                 q.put((k, pos_np, pr))
             except Exception:
                 q.put((k, None, float('inf')))
@@ -2208,25 +2222,20 @@ class v60_Placer:
                 out[k] = {'pos': None, 'proxy': float('inf'), 'si': jobs[k]['si']}
         return out
 
-    def _basin_hop_descend(self, incumbent_pos, sigma_frac, seed, benchmark, plc, cd_w):
+    def _basin_hop_descend(self, incumbent_pos, sigma_frac, seed, benchmark, plc, cd_w,
+                           hot, hw, hh):
         """One basin-hop descent: perturb the hot SOFT macros of `incumbent_pos` by
         N(0, σ) (σ = sigma_frac · half-perimeter), then global CD re-descent on the
-        EXACT proxy with `cd_w` CD workers. Returns ([nM,2] float64 positions,
-        proxy)."""
+        EXACT proxy with `cd_w` CD workers. `hot` (hot-macro set) and `hw`/`hh`
+        (macro half-dims) are computed ONCE per hop by the caller and shared across
+        the σ-descents (the incumbent is identical), so this no longer rebuilds the
+        incumbent eval/selector. Returns ([nM,2] float64 positions, proxy)."""
         nM = int(benchmark.num_macros)
         nH = int(benchmark.num_hard_macros)
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
         sigma = sigma_frac * 0.5 * (cw + ch)
         rng = np.random.default_rng(seed)
-        e = IncrementalEval(benchmark, plc=plc)
-        e.set_placement(incumbent_pos[:nM].detach().cpu().numpy().astype(np.float64))
-        hw = e.macro_w * 0.5
-        hh = e.macro_h * 0.5
-        if self.refine_basin_hop_kick_mode == 'netcause':
-            hot = e.bottleneck_net_macros(self.refine_basin_hop_cong_frac)
-        else:
-            hot = e.hot_cell_macros(self.refine_basin_hop_cong_frac)
         cap = self.refine_basin_hop_cap
         if cap and hot.size > cap:
             hot = np.sort(rng.choice(hot, cap, replace=False))
