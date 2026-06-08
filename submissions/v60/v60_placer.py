@@ -257,7 +257,10 @@ class v60_Placer:
         #   - B per hop is small (8) so the freed wall-time goes to more hop
         #     attempts (higher max_hops / final_explore).
         basin_hop:                  bool  = True,
-        basin_hop_max_hops:         int   = 24,
+        basin_hop_max_hops:         int   = 2,    # 24->2 (2026-06-07): empirically the
+                                                  # GPU basin-hop rarely improves past hop 2
+                                                  # (hop 3 is typically a dup-basin under-
+                                                  # threshold hop that improve_quota=1 ends on)
         basin_hop_final_explore:    int   = 0,
         basin_hop_sigma_set                = (0.015, 0.025, 0.035),  # productive band only
         basin_hop_tabu_eps:         float = 0.01,                    # spatial: mean macro disp / scale
@@ -358,7 +361,13 @@ class v60_Placer:
                                                # ~0.1-0.3% and the numba CD router makes the
                                                # extra hops affordable again (was cut to 2 for
                                                # big-design budget; designs still descend at 4)
-        refine_basin_hop_sigma_set: tuple = (0.012, 0.024, 0.048, 0.072),  # per-hop σ line-search band
+        # Per-hop σ line-search band (8 σ, denser at small values — 2026-06-07).
+        # Superset of the old (0.012,0.024,0.048,0.072) + finer small-end resolution
+        # (0.006/0.009 below the old 0.012 floor — small designs pinned there; plus
+        # 0.018/0.036 fills). Fanned out in waves (see _refine_basin_hop) so each σ
+        # keeps a full CD pool. 0.072 stays the ceiling (bigger kicks overshoot).
+        refine_basin_hop_sigma_set: tuple = (0.006, 0.009, 0.012, 0.018,
+                                             0.024, 0.036, 0.048, 0.072),
         refine_basin_hop_cap: int = 60,        # max hot soft macros perturbed / hop
         refine_basin_hop_cong_frac: float = 0.05,
         # Per-hop CD re-descend sweep cap. The natural early-stop (0.1%/sweep) runs
@@ -2119,18 +2128,24 @@ class v60_Placer:
         # pool, sized so (σ-fan × per-descent workers) fits the core budget.
         cpu_count = os.cpu_count() or 1
         par = int(self.cd_polish_parallel_workers)
-        cd_w = max(1, min(par, cpu_count // max(1, len(sigmas)))) if par > 1 else 1
+        # Keep each σ-descent at a full CD pool (cd_w) and run the σ-set in WAVES of
+        # `concurrent` so cd_w doesn't collapse as the set grows: 8 σ on a 16-core
+        # box would otherwise force cd_w=2. cd_w=4, concurrent=4 -> 8 σ in 2 waves;
+        # a 4-σ set is 1 wave (unchanged). par==1 keeps the old single-thread daemon
+        # forks (cd_w=1 -> run up to cpu_count descents at once).
+        cd_w = max(1, min(par, cpu_count)) if par > 1 else 1
+        concurrent = max(1, min(len(sigmas), cpu_count // cd_w))
         base = self.seed if self.deterministic else None
         tot  = f"  total {time.time()-t0:.1f}s" if t0 is not None else ""
         self._log(f"[v60 {benchmark.name}] === refine basin-hop: start={inc_proxy:.6f}  "
                   f"{len(sigmas)} σ × {hops} hops (greedy per-hop σ line-search)  "
-                  f"cd_workers={cd_w}{tot} ===")
+                  f"cd_workers={cd_w} ({concurrent} σ/wave){tot} ===")
         for hop in range(hops):
             th = time.time()
             jobs = [{'si': si, 'sigma': s, 'pos': inc_pos,
                      'seed': (None if base is None else base * 100003 + hop * 101 + si)}
                     for si, s in enumerate(sigmas)]
-            outs = self._basin_hop_fanout(jobs, benchmark, plc, cd_w)
+            outs = self._basin_hop_fanout(jobs, benchmark, plc, cd_w, concurrent)
             best = min(outs, key=lambda o: o['proxy'])
             if best['pos'] is not None and best['proxy'] < inc_proxy - 1e-9:
                 out_pos = benchmark.macro_positions.clone()
@@ -2144,12 +2159,16 @@ class v60_Placer:
                       f"{time.time()-th:.1f}s")
         return inc_pos, inc_proxy
 
-    def _basin_hop_fanout(self, jobs, benchmark, plc, cd_w):
-        """Run the σ-descents in `jobs` concurrently (one fork each; self/benchmark/
-        plc inherited via fork, never pickled — only the result returns over a
-        Queue). Each descent runs a `cd_w`-worker CD re-descent, so the forks are
-        non-daemon when cd_w>1 (a daemon process can't host the CD pool). Returns a
-        list aligned to `jobs`: {'pos': [nM,2] float64 or None, 'proxy', 'si'}."""
+    def _basin_hop_fanout(self, jobs, benchmark, plc, cd_w, concurrent=None):
+        """Run the σ-descents in `jobs` concurrently in WAVES of `concurrent` (one
+        fork each; self/benchmark/plc inherited via fork, never pickled — only the
+        result returns over a Queue). Each descent runs a `cd_w`-worker CD
+        re-descent, so the forks are non-daemon when cd_w>1 (a daemon process can't
+        host the CD pool); `concurrent × cd_w` is kept within the core budget by the
+        caller. `concurrent=None` runs the whole set in one wave. Returns a list
+        aligned to `jobs`: {'pos': [nM,2] float64 or None, 'proxy', 'si'}."""
+        if concurrent is None or concurrent < 1:
+            concurrent = len(jobs)
         out = [None] * len(jobs)
         try:
             ctx = mp.get_context('fork')
@@ -2171,17 +2190,19 @@ class v60_Placer:
             except Exception:
                 q.put((k, None, float('inf')))
 
-        q = ctx.Queue()
-        procs = []
         daemon = (cd_w == 1)                   # non-daemon when hosting a CD pool
-        for k, job in enumerate(jobs):
-            p = ctx.Process(target=_child, args=(k, job, q), daemon=daemon)
-            p.start(); procs.append(p)
-        for _ in jobs:
-            k, pos_np, pr = q.get()
-            out[k] = {'pos': pos_np, 'proxy': pr, 'si': jobs[k]['si']}
-        for p in procs:
-            p.join()
+        for w0 in range(0, len(jobs), concurrent):     # waves of `concurrent` forks
+            wave = range(w0, min(w0 + concurrent, len(jobs)))
+            q = ctx.Queue()
+            procs = []
+            for k in wave:
+                p = ctx.Process(target=_child, args=(k, jobs[k], q), daemon=daemon)
+                p.start(); procs.append(p)
+            for _ in wave:
+                k, pos_np, pr = q.get()
+                out[k] = {'pos': pos_np, 'proxy': pr, 'si': jobs[k]['si']}
+            for p in procs:
+                p.join()
         for k in range(len(jobs)):            # any child that died -> no-improvement
             if out[k] is None:
                 out[k] = {'pos': None, 'proxy': float('inf'), 'si': jobs[k]['si']}
