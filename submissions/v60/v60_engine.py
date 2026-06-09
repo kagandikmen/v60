@@ -56,6 +56,7 @@ from v60_kernels import (
     _run_stage0,
     _dump_cong_diagnostic_multi,
 )
+from v60_incremental_eval import IncrementalEval
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -634,13 +635,33 @@ class v60_Engine:
                 if osp.exists(init_plc):
                     plc.restore_placement(init_plc, ifInital=True, ifReadComment=True)
 
+            # Ranking every seed through compute_proxy_cost repeatedly invokes
+            # the pure-Python PLC router. On the large IBM designs that costs
+            # tens of seconds per seed. IncrementalEval rebuilds the same exact
+            # proxy state in under a second after a one-time setup, and matches
+            # PLC to float noise (~1e-7), so reuse one scorer across the cohort.
+            try:
+                seed_eval = IncrementalEval(benchmark, plc=plc)
+            except Exception as exc:
+                seed_eval = None
+                self._log(
+                    f"  [seed-rank] IncrementalEval init failed ({exc}); "
+                    f"falling back to PLC scoring"
+                )
+
             for i, pos_np in enumerate(all_pos):
                 ovlp = _total_overlap(pos_np, raw['nH'],
                                       raw['hw_np'][:raw['nH']], raw['hh_np'][:raw['nH']])
                 try:
-                    costs = compute_proxy_cost(
-                        torch.tensor(pos_np, dtype=torch.float32), benchmark, plc,
-                    )
+                    if seed_eval is not None:
+                        seed_eval.set_placement(
+                            np.asarray(pos_np, dtype=np.float64)
+                        )
+                        costs = seed_eval.proxy_breakdown(include_cong=True)
+                    else:
+                        costs = compute_proxy_cost(
+                            torch.tensor(pos_np, dtype=torch.float32), benchmark, plc,
+                        )
                     proxy = costs['proxy_cost']
                     all_metrics[i].update({
                         'score_proxy':   float(proxy),
