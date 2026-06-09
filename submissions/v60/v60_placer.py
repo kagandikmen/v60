@@ -53,6 +53,7 @@ from v60_engine import v60_Engine
 from v60_kernels   import (
     _basin_hop, _congestion_work_tier,
     _extract_raw, _parse_plc_routing_params, _quiet_plc, _run_batch,
+    _total_overlap,
 )
 from v60_incremental_eval import (
     IncrementalEval, WEIGHT_WL, WEIGHT_DENSITY, WEIGHT_CONG,
@@ -852,10 +853,9 @@ class v60_Placer:
         itself is added to the pool separately by the caller."""
         nM = int(benchmark.num_macros)
         out = []
-        base_costs = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
         self._soft_log(
             f"[v60 {benchmark.name}] soft polish ({cur_tag}) start: "
-            f"proxy={base_costs['proxy_cost']:.4f}"
+            f"proxy={cur_proxy:.4f}"
         )
         self._last_soft_pool = []
         _polished, _pc = self._soft_only_polish(cur_t, benchmark, plc)
@@ -1263,8 +1263,27 @@ class v60_Placer:
         best_legal_costs = None
         best_legal_proxy = float('inf')
         legal_restarts = []   # (proxy, pos_np) for overlap-free restarts
+        hard_overlap = _total_overlap(
+            base_np, nH,
+            benchmark.macro_sizes.numpy()[:nH, 0] * 0.5,
+            benchmark.macro_sizes.numpy()[:nH, 1] * 0.5,
+        )
+        try:
+            soft_eval = IncrementalEval(benchmark, plc=plc)
+        except Exception as exc:
+            soft_eval = None
+            self._soft_log(
+                f"  soft seed scorer init failed ({exc}); falling back to PLC"
+            )
         for i, pos_np in enumerate(all_pos):
-            costs = compute_proxy_cost(torch.tensor(pos_np, dtype=torch.float32), benchmark, plc)
+            if soft_eval is not None:
+                soft_eval.set_placement(np.asarray(pos_np, dtype=np.float64))
+                costs = soft_eval.proxy_breakdown(include_cong=True)
+                costs["total_overlap_area"] = hard_overlap
+            else:
+                costs = compute_proxy_cost(
+                    torch.tensor(pos_np, dtype=torch.float32), benchmark, plc
+                )
             proxy = float(costs['proxy_cost'])
             ovlp = float(costs.get('total_overlap_area', float('nan')))
             self._soft_log(
