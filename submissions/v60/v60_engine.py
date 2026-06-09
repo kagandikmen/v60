@@ -144,8 +144,8 @@ class v60_Engine:
     Canvas-aware resolvers fire when the corresponding arg is 'auto'
     (default for all five; all anchored at L=23 / ibm01-tuned values, so
     ibm01 behavior is preserved exactly):
-        num_steps_s1 ('auto') = 5000 + round(167.08*max(0,L-23.0))
-        num_steps_s2 ('auto') = 5000 + round(100*max(0,L-23)), clamped [5000, ∞)
+        num_steps_s1 ('auto') = 5000 + round(100*max(0,L-23.0))
+        num_steps_s2 ('auto') = 5000 + round(60*max(0,L-23)), clamped [5000, ∞)
         lr_s1        ('auto') = 1.15 + 1.65*(1-exp(-(L-23)/4)),  clamped [1.0, 3.0]
         lr_s2        ('auto') = 0.185 * (L/23)^0.5,         clamped [0.18, 0.45]
         gamma_s2_end          = 0.045 fixed (auto formula dropped — see ctor note)
@@ -172,7 +172,7 @@ class v60_Engine:
         gamma_s1_start: float = 2.149,
         gamma_s1_end: float   = 0.351,
         lambda_cong_s1: float = 8000.0,   # v60 (2026-05-20): sweep top-20 median at ibm01.
-        num_steps_s2          = 'auto',     # v60: 5000 baseline + 100/unit-L bump for big canvases.
+        num_steps_s2          = 'auto',     # v60: 5000 baseline + 60/unit-L bump for big canvases.
         lr_s2                 = 'auto',     # v60: rescaled formula, anchored 0.185 at L=23.
         gamma_s2_start: float = 0.498,
         # v60 (2026-05-21): the 0.031*(23/L)^0.5 auto formula was dropped — the
@@ -380,7 +380,11 @@ class v60_Engine:
         # side lengths) shared by every other size formula here, so elongated
         # (non-square) canvases scale consistently. The IBM benches are all
         # near-square (L == avg_dim), so this moves no IBM result.
-        ns = 5000 + int(round(167.08 * max(0.0, L - 23.0)))
+        # Ramp slope cut 167.08 -> 100.0 (×0.6, 2026-06-09): the big designs run
+        # 10-15k Stage-1 steps and the engine is 55%+ of wall there; the late
+        # convergence is re-optimised by the CPU refinement (washout-accepted), so
+        # trim the L-ramp (ibm01 baseline 5000 untouched). Restore 167.08 to revert.
+        ns = 5000 + int(round(100.0 * max(0.0, L - 23.0)))
         return ns, f'auto(L={L:.2f})'
 
     # v60 (2026-05-15): the lr / gamma resolvers were originally calibrated
@@ -437,7 +441,8 @@ class v60_Engine:
         # spreading stage and saturation is documented at 5000 for small
         # benches. Upper cap removed for symmetry with s1 (no current
         # bench hits 11000 anyway — ibm16 at L=81 only reaches 10808).
-        ns = 5000 + int(round(100.0 * max(0.0, L - 23.0)))
+        # Ramp slope cut 100.0 -> 60.0 (×0.6, 2026-06-09); see _resolve_num_steps_s1.
+        ns = 5000 + int(round(60.0 * max(0.0, L - 23.0)))
         ns = max(5000, ns)
         return ns, f'auto(L={L:.2f})'
 
