@@ -217,6 +217,8 @@ class v60_Engine:
         cong_edge_chunk: int   = 65536,  # 8x v60 default (8192). For ibm01 (~12k edges) -> 1 chunk; ibm10/14 still chunk safely.
         cong_eval_interval_s1 = 'auto',
         cong_eval_interval_s2 = 'auto',
+        cong_eval_interval_tiers_s1: tuple = (1, 2, 2, 3, 4),
+        cong_eval_interval_tiers_s2: tuple = (1, 2, 3, 4, 5),
         cong_sigma_l:  float = 0.41,
         cong_abu_frac: float = 0.029,   # v60: ibm01-tuned (loss-side; metric still uses 0.05).
         lambda_cong_size_scale: bool = True,   # v60: auto-scale lc_s1/lc_s2 by fast-saturating exp in L (sweep-fit 2026-05-20).
@@ -295,6 +297,14 @@ class v60_Engine:
         self.cong_edge_chunk      = int(cong_edge_chunk)
         self.cong_eval_interval_s1 = cong_eval_interval_s1
         self.cong_eval_interval_s2 = cong_eval_interval_s2
+        self.cong_eval_interval_tiers_s1 = tuple(int(v) for v in cong_eval_interval_tiers_s1)
+        self.cong_eval_interval_tiers_s2 = tuple(int(v) for v in cong_eval_interval_tiers_s2)
+        if (len(self.cong_eval_interval_tiers_s1) != 5 or
+                any(v < 1 for v in self.cong_eval_interval_tiers_s1)):
+            raise ValueError('cong_eval_interval_tiers_s1 must contain five positive integers')
+        if (len(self.cong_eval_interval_tiers_s2) != 5 or
+                any(v < 1 for v in self.cong_eval_interval_tiers_s2)):
+            raise ValueError('cong_eval_interval_tiers_s2 must contain five positive integers')
         self.cong_sigma_l         = float(cong_sigma_l)
         self.cong_abu_frac        = float(cong_abu_frac)
         self.lambda_cong_size_scale = bool(lambda_cong_size_scale)
@@ -456,15 +466,17 @@ class v60_Engine:
     def _resolve_cong_interval(self, value, benchmark: Benchmark, stage: int) -> tuple:
         """Resolve cong_eval_interval_s{1,2}.
 
-        'auto' thins the expensive congestion-gradient calls on large /
-        routability-heavy designs (tier from _congestion_work_tier); the
-        ×interval multiplier in _run_batch keeps roughly the same integrated
-        congestion force. Final seed ranking still uses compute_proxy_cost.
+        'auto' selects from the configured five-entry tier table using
+        _congestion_work_tier. Values above 1 thin the expensive congestion-
+        gradient calls; the ×interval multiplier in _run_batch keeps roughly
+        the same integrated congestion force. Final seed ranking still uses compute_proxy_cost.
         """
         if value != 'auto':
             return max(1, int(value)), 'fixed'
         tier = _congestion_work_tier(benchmark)
-        interval = (1, 2, 2, 3, 4)[tier] if stage == 1 else (1, 2, 3, 4, 5)[tier]
+        intervals = (self.cong_eval_interval_tiers_s1 if stage == 1
+                     else self.cong_eval_interval_tiers_s2)
+        interval = intervals[tier]
         n = int(benchmark.num_nets)
         cells = int(benchmark.grid_rows) * int(benchmark.grid_cols)
         return interval, f'auto(nets={n}, cells={cells})'

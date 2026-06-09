@@ -234,6 +234,9 @@ class v60_Placer:
         use_hh_overlap:            bool = True,
         use_ss_overlap:            bool = True,
         use_soft_degree_inflation: bool = False,
+        # Congestion-gradient interval by workload tier (tiers 0..4).
+        cong_eval_interval_tiers_s1: tuple = (1, 2, 2, 3, 4),
+        cong_eval_interval_tiers_s2: tuple = (1, 2, 3, 4, 5),
 
         # ── Common runtime ────────────────────────────────────────────────
         plc_root: str = "external/MacroPlacement/Testcases/ICCAD04",
@@ -430,6 +433,14 @@ class v60_Placer:
         self.use_hh_overlap            = use_hh_overlap
         self.use_ss_overlap            = use_ss_overlap
         self.use_soft_degree_inflation = use_soft_degree_inflation
+        self.cong_eval_interval_tiers_s1 = tuple(int(v) for v in cong_eval_interval_tiers_s1)
+        self.cong_eval_interval_tiers_s2 = tuple(int(v) for v in cong_eval_interval_tiers_s2)
+        if (len(self.cong_eval_interval_tiers_s1) != 5 or
+                any(v < 1 for v in self.cong_eval_interval_tiers_s1)):
+            raise ValueError('cong_eval_interval_tiers_s1 must contain five positive integers')
+        if (len(self.cong_eval_interval_tiers_s2) != 5 or
+                any(v < 1 for v in self.cong_eval_interval_tiers_s2)):
+            raise ValueError('cong_eval_interval_tiers_s2 must contain five positive integers')
         self.plc_root      = plc_root
         self.device        = device
         self.verbose       = verbose
@@ -582,6 +593,8 @@ class v60_Placer:
             use_hh_overlap            = self.use_hh_overlap,
             use_ss_overlap            = self.use_ss_overlap,
             use_soft_degree_inflation = self.use_soft_degree_inflation,
+            cong_eval_interval_tiers_s1 = self.cong_eval_interval_tiers_s1,
+            cong_eval_interval_tiers_s2 = self.cong_eval_interval_tiers_s2,
             plc_root                  = self.plc_root,
             device                    = self.device,
             verbose                   = self.verbose,
