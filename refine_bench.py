@@ -279,8 +279,8 @@ def main():
 
 def _add_bhop_args(ap):
     """Shared basin-hop knobs (used by `run --stage basinhop` and `multicand`)."""
-    ap.add_argument("--hops", type=int, default=4,
-                    help="basin-hop count (production default: 4)")
+    ap.add_argument("--hops", type=int, default=10,
+                    help="basin-hop ceiling (production default: 10, early-stopped)")
     ap.add_argument("--sigma-set", type=str, default=None,
                     help="comma-separated per-hop σ line-search set, as fractions of "
                          "mean canvas side (default: the placer's refine_basin_hop_sigma_set)")
@@ -288,8 +288,11 @@ def _add_bhop_args(ap):
                     help="congestion tail fraction defining 'hot' cells")
     ap.add_argument("--cap", type=int, default=60,
                     help="max hot soft macros perturbed per hop (0 = all)")
-    ap.add_argument("--bhop-sweeps", type=int, default=12,
-                    help="CD sweep cap per hop (production default: 12)")
+    ap.add_argument("--bhop-sweeps", type=int, default=15,
+                    help="CD sweep cap per hop (production default: 15)")
+    ap.add_argument("--bhop-min-improve", type=float, default=1e-4,
+                    help="per-hop relative-improvement early-stop threshold "
+                         "(production default: 1e-4 = 0.01%%; 0 disables)")
 
 
 def _apply_bhop_args(placer, args):
@@ -298,6 +301,7 @@ def _apply_bhop_args(placer, args):
     placer.refine_basin_hop_cong_frac = args.cong_frac
     placer.refine_basin_hop_cap       = args.cap
     placer.refine_basin_hop_cd_sweeps = args.bhop_sweeps
+    placer.refine_basin_hop_min_improve_frac = args.bhop_min_improve
     if args.sigma_set:
         placer.refine_basin_hop_sigma_set = tuple(
             float(x) for x in args.sigma_set.split(","))

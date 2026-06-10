@@ -361,10 +361,16 @@ class v60_Placer:
         # in parallel (one CD re-descent per σ) and greedily keeps the best, which
         # adapts the kick to the design AND anneals coarse→fine across the descent.
         refine_basin_hop_enabled: bool = True,
-        refine_basin_hop_hops: int = 4,        # restored 2->4 (2026-06-07): hops 3-4 add
-                                               # ~0.1-0.3% and the numba CD router makes the
-                                               # extra hops affordable again (was cut to 2 for
-                                               # big-design budget; designs still descend at 4)
+        refine_basin_hop_hops: int = 10,       # CEILING, not a fixed count (4->10 2026-06-10):
+                                               # the min_improve_frac early-stop below ends the
+                                               # loop per-design, so designs still descending at
+                                               # hop 4 (4/4 measured) keep harvesting while
+                                               # plateaued ones stop paying for empty hops
+        # Early stop for the hop loop: the first hop whose relative proxy drop is
+        # below this fraction (including a rejected hop, drop<=0) ends the loop.
+        # Mirrors the engine `_basin_hop` min_improve_frac semantics at its
+        # production improve_quota=1. 1e-4 = 0.01%.
+        refine_basin_hop_min_improve_frac: float = 1e-4,
         # Per-hop σ line-search band (8 σ, denser at small values — 2026-06-07).
         # Superset of the old (0.012,0.024,0.048,0.072) + finer small-end resolution
         # (0.006/0.009 below the old 0.012 floor — small designs pinned there; plus
@@ -377,8 +383,10 @@ class v60_Placer:
         # Per-hop CD re-descend sweep cap. The natural early-stop (0.1%/sweep) runs
         # ~6-10 sweeps; raised 4->12 (2026-06-07) to recover the re-descend tail
         # (~+0.38% on ibm06) now that the numba CD router makes the extra sweeps
-        # affordable. 12 sits above the typical early-stop, so it rarely binds.
-        refine_basin_hop_cd_sweeps: int = 12,
+        # affordable, then 12->15 (2026-06-10, back to the original full-rigor cap)
+        # together with the hop early-stop. Sits above the typical early-stop, so
+        # it rarely binds.
+        refine_basin_hop_cd_sweeps: int = 15,
         # Which macros the per-hop kick perturbs. 'netcause' (default): endpoint
         # macros of the nets routing THROUGH the top-cong cells (`bottleneck_net_macros`).
         # Since most nets thread the central jam this is a broad set, so after the cap the
@@ -501,6 +509,7 @@ class v60_Placer:
         self.soft_pair_swap_verbose        = bool(soft_pair_swap_verbose)
         self.refine_basin_hop_enabled    = bool(refine_basin_hop_enabled)
         self.refine_basin_hop_hops       = int(refine_basin_hop_hops)
+        self.refine_basin_hop_min_improve_frac = float(refine_basin_hop_min_improve_frac)
         self.refine_basin_hop_sigma_set  = tuple(float(s) for s in refine_basin_hop_sigma_set)
         self.refine_basin_hop_cap        = int(refine_basin_hop_cap)
         self.refine_basin_hop_cong_frac  = float(refine_basin_hop_cong_frac)
@@ -2145,10 +2154,14 @@ class v60_Placer:
         `_basin_hop`, which re-descends the differentiable surrogate and washes out
         under refinement; this hops the EXACT proxy (IncrementalEval + CD), so it
         moves the SCORED floor. Deterministic (per-descent seed keyed on hop/σ).
+        `refine_basin_hop_hops` is a CEILING: the first hop whose relative drop
+        falls below `refine_basin_hop_min_improve_frac` (rejected hops included)
+        ends the loop, so the count self-tiers per design.
         Must run in a non-daemon process so each σ-descent can host its own CD
         pool. Returns (pos, proxy)."""
-        hops   = self.refine_basin_hop_hops
-        sigmas = self.refine_basin_hop_sigma_set
+        hops     = self.refine_basin_hop_hops
+        sigmas   = self.refine_basin_hop_sigma_set
+        min_frac = float(self.refine_basin_hop_min_improve_frac)
         nM = int(benchmark.num_macros)
         e = IncrementalEval(benchmark, plc=plc)
         e.set_placement(placement[:nM].detach().cpu().numpy().astype(np.float64))
@@ -2170,7 +2183,8 @@ class v60_Placer:
         base = self.seed if self.deterministic else None
         tot  = f"  total {time.time()-t0:.1f}s" if t0 is not None else ""
         self._log(f"[v60 {benchmark.name}] === refine basin-hop: start={inc_proxy:.6f}  "
-                  f"{len(sigmas)} σ × {hops} hops (greedy per-hop σ line-search)  "
+                  f"{len(sigmas)} σ × ≤{hops} hops (greedy per-hop σ line-search, "
+                  f"early-stop <{min_frac*100:.2f}%/hop)  "
                   f"cd_workers={cd_w} ({concurrent} σ/wave){tot} ===")
         for hop in range(hops):
             th = time.time()
@@ -2191,6 +2205,12 @@ class v60_Placer:
                     for si, s in enumerate(sigmas)]
             outs = self._basin_hop_fanout(jobs, benchmark, plc, cd_w, concurrent)
             best = min(outs, key=lambda o: o['proxy'])
+            # Mirror the engine `_basin_hop` split: ANY exact-proxy reduction is
+            # accepted (free progress), but only a hop whose relative drop clears
+            # min_improve_frac keeps the loop alive — the first sub-threshold hop
+            # (a rejected one included, drop <= 0) ends it. Measured against the
+            # PRE-hop incumbent, so compute before the accept updates inc_proxy.
+            rel_drop = (inc_proxy - best['proxy']) / max(abs(inc_proxy), 1e-12)
             if best['pos'] is not None and best['proxy'] < inc_proxy - 1e-9:
                 out_pos = benchmark.macro_positions.clone()
                 out_pos[:nM] = torch.tensor(best['pos'], dtype=out_pos.dtype)
@@ -2201,6 +2221,11 @@ class v60_Placer:
             self._log(f"[v60 {benchmark.name}] refine basin-hop: hop {hop+1}/{hops} "
                       f"-> best {best['proxy']:.6f} {mark}  incumbent={inc_proxy:.6f}  "
                       f"{time.time()-th:.1f}s")
+            if min_frac > 0.0 and rel_drop < min_frac:
+                self._log(f"[v60 {benchmark.name}] refine basin-hop: early stop after "
+                          f"hop {hop+1}/{hops} (drop {max(rel_drop, 0.0)*100:.4f}% < "
+                          f"{min_frac*100:.4f}%)")
+                break
         return inc_pos, inc_proxy
 
     def _basin_hop_fanout(self, jobs, benchmark, plc, cd_w, concurrent=None):
