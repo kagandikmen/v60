@@ -290,9 +290,9 @@ def _add_bhop_args(ap):
                     help="max hot soft macros perturbed per hop (0 = all)")
     ap.add_argument("--bhop-sweeps", type=int, default=15,
                     help="CD sweep cap per hop (production default: 15)")
-    ap.add_argument("--bhop-min-improve", type=float, default=1e-4,
+    ap.add_argument("--bhop-min-improve", type=float, default=1e-3,
                     help="per-hop relative-improvement early-stop threshold "
-                         "(production default: 1e-4 = 0.01%%; 0 disables)")
+                         "(production default: 1e-3 = 0.1%%; 0 disables)")
 
 
 def _apply_bhop_args(placer, args):

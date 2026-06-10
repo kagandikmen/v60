@@ -369,8 +369,8 @@ class v60_Placer:
         # Early stop for the hop loop: the first hop whose relative proxy drop is
         # below this fraction (including a rejected hop, drop<=0) ends the loop.
         # Mirrors the engine `_basin_hop` min_improve_frac semantics at its
-        # production improve_quota=1. 1e-4 = 0.01%.
-        refine_basin_hop_min_improve_frac: float = 1e-4,
+        # production improve_quota=1. 1e-3 = 0.1%.
+        refine_basin_hop_min_improve_frac: float = 1e-3,
         # Per-hop σ line-search band (8 σ, denser at small values — 2026-06-07).
         # Superset of the old (0.012,0.024,0.048,0.072) + finer small-end resolution
         # (0.006/0.009 below the old 0.012 floor — small designs pinned there; plus
