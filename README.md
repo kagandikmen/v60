@@ -8,30 +8,30 @@ v60 was originally built for the [Partcl/HRT Macro Placement Challenge 2026](htt
 
 ## Results
 
-Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which contains no macros and is excluded by the challenge), v60 reaches an **average proxy cost of 0.9196** — **36.9 % below the RePlAce baseline** (1.4578) and **56.7 % below Simulated Annealing** (2.1251) — with **zero macro overlaps on every design**. Lower proxy is better.
+Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which contains no macros and is excluded by the challenge), v60 reaches an **average proxy cost of 0.8946** — **38.6 % below the RePlAce baseline** (1.4578) and **57.9 % below Simulated Annealing** (2.1251) — with no macro overlaps on any design.
 
 | Benchmark | v60 proxy | SA | RePlAce | vs SA | vs RePlAce | Overlaps |
 |-----------|----------:|-------:|--------:|------:|-----------:|:--------:|
-| ibm01 | 0.7493 | 1.3166 | 0.9976 | +43.1 % | +24.9 % | 0 |
-| ibm02 | 0.9017 | 1.9072 | 1.8370 | +52.7 % | +50.9 % | 0 |
-| ibm03 | 0.8559 | 1.7401 | 1.3222 | +50.8 % | +35.3 % | 0 |
-| ibm04 | 0.8349 | 1.5037 | 1.3024 | +44.5 % | +35.9 % | 0 |
-| ibm06 | 0.9691 | 2.5057 | 1.6187 | +61.3 % | +40.1 % | 0 |
-| ibm07 | 0.9237 | 2.0229 | 1.4633 | +54.3 % | +36.9 % | 0 |
-| ibm08 | 0.9633 | 1.9239 | 1.4285 | +49.9 % | +32.6 % | 0 |
-| ibm09 | 0.7177 | 1.3875 | 1.1194 | +48.3 % | +35.9 % | 0 |
-| ibm10 | 0.8600 | 2.1108 | 1.5009 | +59.3 % | +42.7 % | 0 |
-| ibm11 | 0.8065 | 1.7111 | 1.1774 | +52.9 % | +31.5 % | 0 |
-| ibm12 | 0.9724 | 2.8261 | 1.7261 | +65.6 % | +43.7 % | 0 |
-| ibm13 | 0.8294 | 1.9141 | 1.3355 | +56.7 % | +37.9 % | 0 |
-| ibm14 | 1.0169 | 2.2750 | 1.5436 | +55.3 % | +34.1 % | 0 |
-| ibm15 | 0.9839 | 2.3000 | 1.5159 | +57.2 % | +35.1 % | 0 |
-| ibm16 | 0.9943 | 2.2337 | 1.4780 | +55.5 % | +32.7 % | 0 |
-| ibm17 | 1.1681 | 3.6726 | 1.6446 | +68.2 % | +29.0 % | 0 |
-| ibm18 | 1.0859 | 2.7755 | 1.7722 | +60.9 % | +38.7 % | 0 |
-| **Average** | **0.9196** | 2.1251 | 1.4578 | **+56.7 %** | **+36.9 %** | **0** |
+| ibm01 | 0.7354 | 1.3166 | 0.9976 | +44.1 % | +26.3 % | 0 |
+| ibm02 | 0.8855 | 1.9072 | 1.8370 | +53.6 % | +51.8 % | 0 |
+| ibm03 | 0.8178 | 1.7401 | 1.3222 | +53.0 % | +38.1 % | 0 |
+| ibm04 | 0.8284 | 1.5037 | 1.3024 | +44.9 % | +36.4 % | 0 |
+| ibm06 | 0.9523 | 2.5057 | 1.6187 | +62.0 % | +41.2 % | 0 |
+| ibm07 | 0.8822 | 2.0229 | 1.4633 | +56.4 % | +39.7 % | 0 |
+| ibm08 | 0.9466 | 1.9239 | 1.4285 | +50.8 % | +33.7 % | 0 |
+| ibm09 | 0.7054 | 1.3875 | 1.1194 | +49.2 % | +37.0 % | 0 |
+| ibm10 | 0.8190 | 2.1108 | 1.5009 | +61.2 % | +45.4 % | 0 |
+| ibm11 | 0.7691 | 1.7111 | 1.1774 | +55.1 % | +34.7 % | 0 |
+| ibm12 | 0.9534 | 2.8261 | 1.7261 | +66.3 % | +44.8 % | 0 |
+| ibm13 | 0.8129 | 1.9141 | 1.3355 | +57.5 % | +39.1 % | 0 |
+| ibm14 | 1.0506 | 2.2750 | 1.5436 | +53.8 % | +31.9 % | 0 |
+| ibm15 | 0.9536 | 2.3000 | 1.5159 | +58.5 % | +37.1 % | 0 |
+| ibm16 | 0.9347 | 2.2337 | 1.4780 | +58.2 % | +36.8 % | 0 |
+| ibm17 | 1.1249 | 3.6726 | 1.6446 | +69.4 % | +31.6 % | 0 |
+| ibm18 | 1.0358 | 2.7755 | 1.7722 | +62.7 % | +41.6 % | 0 |
+| **Average** | **0.8946** | 2.1251 | 1.4578 | **+57.9 %** | **+38.6 %** | **0** |
 
-**Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) to reproduce this table** — these are the exact figures from a deterministic run on RTX 6000 Ada. The default (non-deterministic) mode is faster and lands within run-to-run noise (~1.4 %) of these numbers.
+**Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) to closely reproduce this table** — these are the figures from a deterministic run on an NVIDIA RTX 6000 Ada (49 GB) paired with an AMD EPYC 75F3. Even in deterministic mode a small residual GPU nondeterminism remains (see [Runtime & Reproducibility](#runtime--reproducibility)), so expect agreement within ~1 % rather than an exact match; the default (non-deterministic) mode is faster and lands within run-to-run noise (~1.4 %) of these numbers.
 
 The SA and RePlAce baselines are the published results reported in [*An Updated Assessment of Reinforcement Learning for Macro Placement*](https://doi.org/10.1109/TCAD.2025.3644293) (IEEE), measured through the same TILOS MacroPlacement evaluator that scores v60.
 
@@ -76,7 +76,7 @@ The macro placement problem is to assign 2D positions to a set of hard and soft 
 
 **The three-stage gradient engine.** From those cluster positions, the engine runs three successive gradient descent phases. *Stage 0* is a short global pass that places the super-macros; it establishes a rough floorplan before individual macros are freed. *Stage 1* then expands the super-macros back into their constituent hard macros and optimizes freely — this is the main exploration phase, where the optimizer is given enough room to move macros far from their cluster centers if the wirelength objective calls for it. *Stage 2* finishes by activating the density, overlap, and congestion penalties at full strength, driving hard-macro overlap towards zero while balancing the other cost terms.
 
-**Why many restarts?** The optimization landscape is highly non-convex — the congestion term alone introduces many local minima, and different initializations can settle into very different final arrangements. Rather than betting on a single trajectory, v60 runs 32 independent restarts in parallel on the GPU, each from a different random initialization, and scores every result against the real `compute_proxy_cost`. The lowest-proxy result whose hard-macro overlap falls within a small tolerance (a fixed fraction of the median hard-macro area) is carried forward; the downstream stages are trusted to clean up any small residual overlap rather than discarding an otherwise good seed for it.
+**Why many restarts?** The optimization landscape is highly non-convex — the congestion term alone introduces many local minima, and different initializations can settle into very different final arrangements. Rather than betting on a single trajectory, v60 runs 64 independent restarts in parallel on the GPU, each from a different random initialization, and scores every result on the exact proxy cost with a fast incremental scorer. The lowest-proxy result whose hard-macro overlap falls within a small tolerance (a fixed fraction of the median hard-macro area) is carried forward; the downstream stages are trusted to clean up any small residual overlap rather than discarding an otherwise good seed for it.
 
 **Escaping local minima: basin-hopping.** After the three-stage gradient engine, v60 applies a basin-hopping wrapper around the best placement found so far. A Gaussian perturbation is applied to macro positions, Stage 2 is re-run from the perturbed state, and the result is accepted if it improves the real proxy cost. A tabu list tracks visited basins (identified by both spatial displacement and proxy cost similarity) to avoid re-exploring the same region, and a priority queue biases perturbation towards seeds that have previously yielded improvements. The hop loop terminates early if no improvement is found for several consecutive attempts.
 
@@ -90,14 +90,16 @@ Scoring a single candidate move on the full official cost — re-routing every n
 
 **Pair swaps.** Single-macro moves cannot reach one particular configuration: two macros each sitting where the other would do better, so that no individual move improves the cost but exchanging the two does. v60 therefore finishes with two swap passes — one over hard macros, one over soft. For each macro it considers exchanging positions with the partners it shares the most connections with (and, for hard macros, its nearest spatial neighbours), and commits any swap that improves the placement. Hard-macro swaps are held to the same overlap check as coordinate descent.
 
-A few implementation details worth noting: the congestion term used during gradient descent is a differentiable port of the TILOS L-shape router; most geometric hyperparameters (step sizes, penalty weights, grid resolutions) auto-scale with canvas area based on Optuna sweeps across the benchmark suite; and a runtime guard progressively thins the more expensive work on the largest designs to stay within the one-hour-per-benchmark budget.
+**Basin-hopping on the exact cost.** Coordinate descent and the swap passes converge to a placement that no single move or pairwise exchange can improve. To escape that local minimum, v60 applies basin-hopping once more, now on the exact cost: each hop adds Gaussian noise to a small set of soft macros implicated in the congestion bottleneck — the endpoints of nets crossing the worst 5 % of routing cells — re-runs coordinate descent over the entire placement, and keeps the result only if it scores better. Every hop tries a ladder of eight noise scales in parallel and keeps the best outcome, letting the perturbation strength adapt to the design and to where the descent stands. Up to ten hops are run, ending early once a hop improves the cost by less than 0.1 %. Hard macros are never perturbed, though the re-descent may still move them legally.
+
+A few implementation details worth noting: the congestion term used during gradient descent is a differentiable port of the TILOS L-shape router; most geometric hyperparameters (step sizes, penalty weights, grid resolutions) auto-scale with canvas area based on Optuna sweeps across the benchmark suite; and the hot paths of the incremental scorer — net re-routing and the congestion-grid updates — are JIT-compiled with numba.
 
 ## Runtime & Reproducibility
 
 - **CPU and GPU.** The algorithm runs on either — `device='auto'` picks CUDA when available and falls back to CPU otherwise. A GPU is strongly recommended, since the many parallel restarts are what make the wall-clock budget comfortable.
 - **Non-deterministic by default.** This is intentional: the default mode keeps TF32 and the fast (non-deterministic) CUDA kernels enabled, which is the recommended setting for evaluation.
-- **Determinism is opt-in.** Setting `deterministic=True` on `v60_Placer` in `v60_placer.py` pins every RNG and disables non-deterministic kernels, giving bit-identical placements across runs — this is the mode that reproduces the [Results](#results) table exactly. It costs roughly **1.3–2× runtime** over the default.
-- **Other tradeoffs.** `torch.compile` is used automatically when the environment supports it and falls back to eager execution otherwise; Stage 2 uses bf16 autocast on GPU for speed; the refinement passes parallelize their candidate evaluations across CPU cores, so more cores shorten the refinement phase; and the runtime guard trades a little solution quality on the largest designs to stay safely under the 1-hour cap.
+- **Determinism is opt-in.** Setting `deterministic=True` on `v60_Placer` in `v60_placer.py` pins every RNG and switches to deterministic kernels wherever PyTorch provides them. The CPU refinement is then fully reproducible; the GPU engine retains a small residual nondeterminism (a few of its ops have no deterministic CUDA kernel), which the non-convex optimization amplifies — so end-to-end results land within roughly 1 % of the [Results](#results) table. It runs slower than the default.
+- **Other tradeoffs.** `torch.compile` is used automatically when the environment supports it and falls back to eager execution otherwise; Stage 2 uses bf16 autocast on GPU for speed; and the refinement passes parallelize their candidate evaluations across CPU cores, so more cores shorten the refinement phase.
 
 ## License
 
