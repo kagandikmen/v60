@@ -83,6 +83,223 @@ _NET_VECTORIZE_MIN = 8
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  numba-compiled congestion router (per-candidate hot path)
+# ════════════════════════════════════════════════════════════════════════════
+#  The per-candidate cong scorer's dominant cost is re-routing the moved macro's
+#  nets — millions of tiny numpy slice-adds + Python per-net/per-segment dispatch.
+#  These njit kernels do the whole "add the macro's nets to the demand grids" in
+#  one compiled call over a CSR of pin gcells. Bit-identical to the Python router
+#  (_add_two/three_pin_segment): same gcell SET (deduped), same L/T/special
+#  dispatch, same half-open slice ranges, and every segment of a net adds the
+#  SAME per-net weight so cross-segment += order is irrelevant; only >3-pin nets
+#  visit their non-source gcells in first-seen (not set-hash) order, a pure
+#  float-reorder (~1e-16). If numba is unavailable the class falls back to the
+#  Python router, so this is an optional accelerator, not a hard dependency.
+try:
+    from numba import njit as _njit
+    _NUMBA_OK = True
+except Exception:                                       # pragma: no cover
+    _NUMBA_OK = False
+    def _njit(*a, **k):
+        def deco(f):
+            return f
+        return deco
+
+
+@_njit(cache=True)
+def _two_pin_njit(sr, sc, tr, tc, w, V, H, Gc):
+    """PLC __two_pin_net_routing: H along source row, V along sink col."""
+    rmin = tr if tr < sr else sr
+    rmax = sr if tr < sr else tr
+    cmin = tc if tc < sc else sc
+    cmax = sc if tc < sc else tc
+    base = sr * Gc
+    for c in range(cmin, cmax):
+        H[base + c] += w
+    for r in range(rmin, rmax):
+        V[r * Gc + tc] += w
+
+
+@_njit(cache=True)
+def _three_pin_njit(ra, ca, rb, cb, rc, cc, w, V, H, Gc, Gr):
+    """PLC __three_pin_net_routing (L / T / special). Inputs are the 3 UNIQUE
+    gcells; this sorts them exactly as PLC does (by (col,row), and (row,col) for
+    the T case)."""
+    km = Gr + 1
+    R0 = ra; C0 = ca; K0 = ca * km + ra
+    R1 = rb; C1 = cb; K1 = cb * km + rb
+    R2 = rc; C2 = cc; K2 = cc * km + rc
+    if K0 > K1:
+        R0, C0, K0, R1, C1, K1 = R1, C1, K1, R0, C0, K0
+    if K1 > K2:
+        R1, C1, K1, R2, C2, K2 = R2, C2, K2, R1, C1, K1
+    if K0 > K1:
+        R0, C0, K0, R1, C1, K1 = R1, C1, K1, R0, C0, K0
+    y1 = R0; x1 = C0; y2 = R1; x2 = C1; y3 = R2; x3 = C2
+    if x1 < x2 and x2 < x3 and min(y1, y3) < y2 and max(y1, y3) > y2:
+        for c in range(x1, x2):
+            H[y1 * Gc + c] += w
+        for c in range(x2, x3):
+            H[y2 * Gc + c] += w
+        lo = y1 if y1 < y2 else y2; hi = y2 if y1 < y2 else y1
+        for r in range(lo, hi):
+            V[r * Gc + x2] += w
+        lo = y2 if y2 < y3 else y3; hi = y3 if y2 < y3 else y2
+        for r in range(lo, hi):
+            V[r * Gc + x3] += w
+    elif x2 == x3 and x1 < x2 and y1 < (y2 if y2 < y3 else y3):
+        for c in range(x1, x2):
+            H[y1 * Gc + c] += w
+        hi = y2 if y2 > y3 else y3
+        for r in range(y1, hi):
+            V[r * Gc + x2] += w
+    elif y2 == y3:
+        for c in range(x1, x2):
+            H[y1 * Gc + c] += w
+        for c in range(x2, x3):
+            H[y2 * Gc + c] += w
+        lo = y2 if y2 < y1 else y1; hi = y1 if y2 < y1 else y2
+        for r in range(lo, hi):
+            V[r * Gc + x2] += w
+    else:
+        # T-route: PLC re-sorts the nodes by (row, col).
+        km2 = Gc + 1
+        S0r = ra; S0c = ca; J0 = ra * km2 + ca
+        S1r = rb; S1c = cb; J1 = rb * km2 + cb
+        S2r = rc; S2c = cc; J2 = rc * km2 + cc
+        if J0 > J1:
+            S0r, S0c, J0, S1r, S1c, J1 = S1r, S1c, J1, S0r, S0c, J0
+        if J1 > J2:
+            S1r, S1c, J1, S2r, S2c, J2 = S2r, S2c, J2, S1r, S1c, J1
+        if J0 > J1:
+            S0r, S0c, J0, S1r, S1c, J1 = S1r, S1c, J1, S0r, S0c, J0
+        y1t = S0r; x1t = S0c; y2t = S1r; x2t = S1c; y3t = S2r; x3t = S2c
+        xmin = x1t
+        if x2t < xmin: xmin = x2t
+        if x3t < xmin: xmin = x3t
+        xmax = x1t
+        if x2t > xmax: xmax = x2t
+        if x3t > xmax: xmax = x3t
+        for c in range(xmin, xmax):
+            H[y2t * Gc + c] += w
+        lo = y1t if y1t < y2t else y2t; hi = y2t if y1t < y2t else y1t
+        for r in range(lo, hi):
+            V[r * Gc + x1t] += w
+        lo = y2t if y2t < y3t else y3t; hi = y3t if y2t < y3t else y2t
+        for r in range(lo, hi):
+            V[r * Gc + x3t] += w
+
+
+@_njit(cache=True)
+def _route_csr_njit(off, prow, pcol, netw, sign, V, H, Gc, Gr, sr_buf, sc_buf):
+    """Add (sign * weight) of every net's L-route to V/H. Nets are a CSR over
+    pin gcells: net k owns slots [off[k], off[k+1]); slot off[k] is the driver.
+    Per net: dedup gcells (first-seen), then PLC's 2-/3-/>3-pin dispatch."""
+    K = off.shape[0] - 1
+    for k in range(K):
+        s = off[k]; e = off[k + 1]
+        if e - s < 2:
+            continue
+        w = netw[k] * sign
+        nu = 0
+        for i in range(s, e):
+            r = prow[i]; c = pcol[i]
+            found = False
+            for j in range(nu):
+                if sr_buf[j] == r and sc_buf[j] == c:
+                    found = True
+                    break
+            if not found:
+                sr_buf[nu] = r; sc_buf[nu] = c; nu += 1
+        if nu < 2:
+            continue
+        srr = sr_buf[0]; scc = sc_buf[0]      # driver = first pin
+        if nu == 2:
+            _two_pin_njit(srr, scc, sr_buf[1], sc_buf[1], w, V, H, Gc)
+        elif nu == 3:
+            _three_pin_njit(sr_buf[0], sc_buf[0], sr_buf[1], sc_buf[1],
+                            sr_buf[2], sc_buf[2], w, V, H, Gc, Gr)
+        else:
+            for j in range(1, nu):
+                _two_pin_njit(srr, scc, sr_buf[j], sc_buf[j], w, V, H, Gc)
+
+
+@_njit(cache=True)
+def _scatter_njit(Vf, Hf, dV, dH, dMV, dMH, cntc, cntr, Gc, Gr, sr,
+                  inv_v, inv_h, has_block, flat, nzc, wbuf):
+    """Assemble flat = [Vf, Hf] + box-blurred dV/dH net demand (+ un-smoothed
+    macro blockage dMV/dMH), reset the deltas to 0. Bit-identical to the numpy
+    _scatter_delta_and_abu: same offset-outer / ascending-cell-inner order, w
+    computed once per cell, blockage in a disjoint flat range. `flat`/`nzc`/`wbuf`
+    are reused scratch (flat sized 2*G, nzc/wbuf sized G)."""
+    G = Gr * Gc
+    for i in range(G):
+        flat[i] = Vf[i]
+        flat[G + i] = Hf[i]
+    # V demand: smear each nonzero cell along its row over columns [c-sr, c+sr].
+    nv = 0
+    for cell in range(G):
+        if dV[cell] != 0.0:
+            c = cell % Gc
+            nzc[nv] = cell
+            wbuf[nv] = (dV[cell] * inv_v) / cntc[c]
+            nv += 1
+    for off in range(-sr, sr + 1):
+        for ii in range(nv):
+            cell = nzc[ii]
+            tc = (cell % Gc) + off
+            if 0 <= tc < Gc:
+                flat[(cell // Gc) * Gc + tc] += wbuf[ii]
+    for ii in range(nv):
+        dV[nzc[ii]] = 0.0
+    # H demand: smear each nonzero cell along its column over rows [r-sr, r+sr].
+    nh = 0
+    for cell in range(G):
+        if dH[cell] != 0.0:
+            r = cell // Gc
+            nzc[nh] = cell
+            wbuf[nh] = (dH[cell] * inv_h) / cntr[r]
+            nh += 1
+    for off in range(-sr, sr + 1):
+        for ii in range(nh):
+            cell = nzc[ii]
+            tr = (cell // Gc) + off
+            if 0 <= tr < Gr:
+                flat[G + tr * Gc + (cell % Gc)] += wbuf[ii]
+    for ii in range(nh):
+        dH[nzc[ii]] = 0.0
+    if has_block:
+        for cell in range(G):           # dMV->V half, dMH->H half (disjoint ranges)
+            if dMV[cell] != 0.0:
+                flat[cell] += dMV[cell] * inv_v
+                dMV[cell] = 0.0
+            if dMH[cell] != 0.0:
+                flat[G + cell] += dMH[cell] * inv_h
+                dMH[cell] = 0.0
+
+
+def _numba_warmup():
+    """Compile the njit kernels once (in the parent, before any CD fork) on the
+    production dtypes so forked workers inherit the compiled code."""
+    if not _NUMBA_OK:
+        return
+    off = np.array([0, 2], dtype=np.int64)
+    prow = np.array([0, 1], dtype=np.int64); pcol = np.array([0, 1], dtype=np.int64)
+    netw = np.array([1.0], dtype=np.float64)
+    V = np.zeros(4, dtype=np.float64); H = np.zeros(4, dtype=np.float64)
+    sb = np.empty(8, dtype=np.int64); cb = np.empty(8, dtype=np.int64)
+    _route_csr_njit(off, prow, pcol, netw, 1.0, V, H, 2, 2, sb, cb)
+    Vf = np.zeros(4, dtype=np.float64); Hf = np.zeros(4, dtype=np.float64)
+    dV = np.zeros(4, dtype=np.float64); dH = np.zeros(4, dtype=np.float64)
+    dMV = np.zeros(4, dtype=np.float64); dMH = np.zeros(4, dtype=np.float64)
+    cnt = np.ones(2, dtype=np.float64)
+    flat = np.empty(8, dtype=np.float64)
+    nz = np.empty(4, dtype=np.int64); wb = np.empty(4, dtype=np.float64)
+    _scatter_njit(Vf, Hf, dV, dH, dMV, dMH, cnt, cnt, 2, 2, 1,
+                  1.0, 1.0, True, flat, nz, wb)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  IncrementalEval
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -568,7 +785,13 @@ class IncrementalEval:
         self._cong_dH  = np.zeros(_G, dtype=np.float64)
         self._cong_dMV = np.zeros(_G, dtype=np.float64)
         self._cong_dMH = np.zeros(_G, dtype=np.float64)
+        # numba scatter scratch: the assembled flat grid (V|H) + per-call nonzero
+        # cell index / weight buffers (sized to one grid; reused per candidate).
+        self._cong_flat = np.empty(2 * _G, dtype=np.float64)
+        self._scat_nz   = np.empty(_G, dtype=np.int64)
+        self._scat_w    = np.empty(_G, dtype=np.float64)
         self._score_prep_macro = -1   # macro whose old routes are cached (-1 = none)
+        self._wl_prep_macro = -1      # macro whose WL non-moving-pin bbox is cached
         # Per-macro soft-cong memo: {gcell-signature -> cong cost}. A soft macro
         # has no blockage, so its candidate cong depends ONLY on where its pins
         # land in gcells; candidates sharing a signature share a bit-identical
@@ -581,6 +804,14 @@ class IncrementalEval:
         # _add_net_to_routing_cached skip the per-pin gcell recompute (~70% of
         # per-candidate pin lookups are non-moving).
         self._cong_gcell = {}
+        # numba CSR re-route: per-macro pin-gcell CSR (built by _prep_old_routes)
+        # + dedup scratch sized to the largest net. Warm the kernels up now so a
+        # CD fork pool inherits the compiled code instead of re-JITting per worker.
+        self._max_net_pins = max((len(p) for p in self.net_pins), default=1)
+        self._csr_sr_buf = np.empty(max(self._max_net_pins, 1), dtype=np.int64)
+        self._csr_sc_buf = np.empty(max(self._max_net_pins, 1), dtype=np.int64)
+        self._csr_off = None
+        _numba_warmup()
 
     def _refresh_all_pin_positions(self) -> None:
         """Recompute self.pin_xy from current macro_pos and port_pos."""
@@ -1102,6 +1333,68 @@ class IncrementalEval:
         flat = np.concatenate([self._cong_Vf, self._cong_Hf])
         return self._abu_top_frac_mean(flat, ABU_FRAC_CONG)
 
+    def hot_cell_macros(self, frac: float = ABU_FRAC_CONG) -> np.ndarray:
+        """Indices of macros with >=1 pin on a top-`frac` congestion cell.
+
+        The exact-cost refinement basin-hop perturbs these (the macros sitting on
+        the routing-congestion tail that the proxy actually scores) and re-descends.
+        Reads the assembled, smoothed routing grids `_cong_Vf/_cong_Hf` (so the
+        placement must have been built via `set_placement`); flat cell index is
+        row*G_cols + col, matching `_grid_cell_for_pos`. Read-only."""
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        k = max(1, int(len(flat) * frac))
+        thresh = np.partition(flat, -k)[-k]
+        hot = (set(np.where(self._cong_Vf >= thresh)[0].tolist())
+               | set(np.where(self._cong_Hf >= thresh)[0].tolist()))
+        Gc = self.G_cols
+        mids = []
+        for m in range(self.nM):
+            pins = self.pins_per_macro[m]
+            if pins.size == 0:
+                continue
+            for p in pins:
+                r, c = self._grid_cell_for_pos(float(self.pin_xy[p, 0]),
+                                               float(self.pin_xy[p, 1]))
+                if (r * Gc + c) in hot:
+                    mids.append(m)
+                    break
+        return np.asarray(mids, dtype=np.int64)
+
+    def bottleneck_net_macros(self, frac: float = ABU_FRAC_CONG) -> np.ndarray:
+        """Macros that are ENDPOINTS of nets routing THROUGH the top-`frac`
+        congestion cells (cause-aware), vs `hot_cell_macros`' macros that merely SIT
+        in them. A net "crosses" a hot cell if its pin-gcell bounding box spans one
+        — i.e. the nets whose routing demand jams the channel, whose endpoint macros
+        may be far off-cell (and thus missed by hot_cell_macros). Used by the
+        cause-aware basin-hop kick (`refine_basin_hop_kick_mode='netcause'`). bbox is
+        an over-approx of the route (route ⊆ bbox); cheap, no re-routing. (NB: most
+        nets thread the central jam, so this selects ~90% of soft macros — A/B shows
+        the basin-hop win is the resulting SPREAD of the capped kick across the canvas,
+        not the cause-targeting per se; see refine_basin_hop_kick_mode.) Read-only;
+        reads `_cong_Vf/_cong_Hf` (placement must be built via set_placement)."""
+        flat = np.concatenate([self._cong_Vf, self._cong_Hf])
+        k = max(1, int(len(flat) * frac))
+        thresh = np.partition(flat, -k)[-k]
+        Gc = self.G_cols; Gr = self.G_rows
+        hot2d = ((self._cong_Vf >= thresh) | (self._cong_Hf >= thresh)).reshape(Gr, Gc)
+        if not hot2d.any():
+            return np.empty(0, dtype=np.int64)
+        # gcell (row, col) of every pin (vectorised; float64 to match _grid_cell_for_pos)
+        col = np.clip(np.floor(self.pin_xy[:, 0].astype(np.float64) / self.grid_w).astype(np.int64), 0, Gc - 1)
+        row = np.clip(np.floor(self.pin_xy[:, 1].astype(np.float64) / self.grid_h).astype(np.int64), 0, Gr - 1)
+        mids = set()
+        for net in range(len(self.net_pins)):
+            pins = self.net_pins[net]
+            if pins.size < 2:
+                continue
+            r = row[pins]; c = col[pins]
+            if hot2d[r.min():r.max() + 1, c.min():c.max() + 1].any():
+                for p in pins:
+                    o = int(self.pin_owner[p])
+                    if o < self.nM:
+                        mids.add(o)
+        return np.asarray(sorted(mids), dtype=np.int64)
+
     def _prep_old_routes(self, macro_idx: int) -> None:
         """Cache the touched nets' routes (and the macro's blockage) at the
         CURRENT positions for `macro_idx`, as the negated cell->value pairs that
@@ -1138,6 +1431,40 @@ class IncrementalEval:
                     gc[pi] = self._grid_cell_for_pos_f32(
                         np.float32(self.pin_xy[pi, 0]),
                         np.float32(self.pin_xy[pi, 1]))
+        # Build the numba re-route CSR for this macro's nets: per net, its pins'
+        # gcells (fixed pins filled from gc above; the macro's own pins left as
+        # placeholders, overwritten per candidate), the net weight, and the
+        # slot<->moving-pin map for the per-candidate scatter. Slot off[k] is the
+        # driver (net_pins[n][0]) — matches the Python router's source_rc.
+        if _NUMBA_OK:
+            nets = self.nets_per_macro[macro_idx]
+            local_of = {int(p): i for i, p in enumerate(self.pins_per_macro[macro_idx])}
+            total = int(sum(int(self.net_pins[int(n)].size) for n in nets))
+            offs = np.empty(len(nets) + 1, dtype=np.int64); offs[0] = 0
+            crow = np.empty(total, dtype=np.int64); ccol = np.empty(total, dtype=np.int64)
+            cw = np.empty(len(nets), dtype=np.float64)
+            mov_slots = []; mov_local = []
+            slot = 0
+            for k, n in enumerate(nets):
+                n = int(n)
+                for p in self.net_pins[n]:
+                    pi = int(p)
+                    li = local_of.get(pi, -1)
+                    if li >= 0:
+                        crow[slot] = 0; ccol[slot] = 0
+                        mov_slots.append(slot); mov_local.append(li)
+                    else:
+                        r, c = gc[pi]
+                        crow[slot] = r; ccol[slot] = c
+                    slot += 1
+                offs[k + 1] = slot
+                cw[k] = float(self.net_weight[n])
+            self._csr_off = offs
+            self._csr_row = crow
+            self._csr_col = ccol
+            self._csr_w = cw
+            self._csr_mov_slots = np.asarray(mov_slots, dtype=np.int64)
+            self._csr_mov_local = np.asarray(mov_local, dtype=np.int64)
 
     def _moving_pin_gcells(self, pins, new_xy: Tuple[float, float]):
         """Vectorised gcell (row, col) of `pins` if their owner moves to new_xy.
@@ -1211,20 +1538,28 @@ class IncrementalEval:
             if hit is not None:
                 return hit
 
-        # Write the moving pins into the per-pin gcell cache (fixed pins already
-        # filled by _prep_old_routes), then re-route from the cache. No per-pin
-        # gcell recompute, and no pin_xy mutation (the cached router reads gc).
-        gc = self._cong_gcell
-        pins_l = pins.tolist() if hasattr(pins, 'tolist') else list(pins)
-        rows_l = mov_rows.tolist(); cols_l = mov_cols.tolist()
-        for i in range(len(pins_l)):
-            gc[pins_l[i]] = (rows_l[i], cols_l[i])
-
-        # Net-route delta: cached -old, then add the new routes from the cache.
+        # Net-route delta: cached -old, then add the new routes.
         dV[self._old_v_idx] = self._old_v_neg
         dH[self._old_h_idx] = self._old_h_neg
-        for n in nets:
-            self._add_net_to_routing_cached(int(n), dV, dH, +1.0, gc)
+        if _NUMBA_OK:
+            # Scatter the candidate's moving-pin gcells into the per-macro CSR,
+            # then add every net's L-route in one compiled call (no Python
+            # per-net/per-segment dispatch, no gcell dict writes).
+            self._csr_row[self._csr_mov_slots] = mov_rows[self._csr_mov_local]
+            self._csr_col[self._csr_mov_slots] = mov_cols[self._csr_mov_local]
+            _route_csr_njit(self._csr_off, self._csr_row, self._csr_col,
+                            self._csr_w, 1.0, dV, dH,
+                            self.G_cols, self.G_rows,
+                            self._csr_sr_buf, self._csr_sc_buf)
+        else:
+            # Python fallback: write moving pins into the gcell dict, re-route.
+            gc = self._cong_gcell
+            pins_l = pins.tolist() if hasattr(pins, 'tolist') else list(pins)
+            rows_l = mov_rows.tolist(); cols_l = mov_cols.tolist()
+            for i in range(len(pins_l)):
+                gc[pins_l[i]] = (rows_l[i], cols_l[i])
+            for n in nets:
+                self._add_net_to_routing_cached(int(n), dV, dH, +1.0, gc)
 
         # Macro-blockage delta (hard macros only; added un-smoothed).
         if is_hard:
@@ -1254,7 +1589,8 @@ class IncrementalEval:
             cur_wl = self.compute_wl_cost()
         if cur_den is None:
             cur_den = self.compute_density_cost()
-        st = self.delta_for_move(macro_idx, new_xy, include_cong=False)
+        st = self.delta_for_move(macro_idx, new_xy, include_cong=False,
+                                 want_wl_state=False, cur_den_cost=cur_den)
         new_wl  = cur_wl + st['delta_wl']
         new_den = cur_den + st['delta_density']
         new_cong = self._cong_cost_for_move(macro_idx, new_xy)
@@ -1281,6 +1617,14 @@ class IncrementalEval:
         G = Gr * Gc
         inv_v = (1.0 / self.grid_v_routes) if self.grid_v_routes > 0 else 1.0
         inv_h = (1.0 / self.grid_h_routes) if self.grid_h_routes > 0 else 1.0
+        if _NUMBA_OK:
+            # Compiled assemble + box-blur + delta-reset into the reused flat
+            # buffer; ABU stays in numpy (argpartition is already C-fast).
+            _scatter_njit(self._cong_Vf, self._cong_Hf, self._cong_dV, self._cong_dH,
+                          self._cong_dMV, self._cong_dMH, self._cntc, self._cntr,
+                          Gc, Gr, sr, inv_v, inv_h, bool(has_blockage),
+                          self._cong_flat, self._scat_nz, self._scat_w)
+            return self._abu_top_frac_mean(self._cong_flat, ABU_FRAC_CONG)
         dV = self._cong_dV; dH = self._cong_dH
         flat = np.concatenate([self._cong_Vf, self._cong_Hf])
         nzv = np.flatnonzero(dV)
@@ -1573,58 +1917,78 @@ class IncrementalEval:
     #  WL: incremental delta and commit
     # ───────────────────────────────────────────────────────────────────────
 
-    def _delta_wl_for_move(self, macro_idx: int, new_xy: Tuple[float, float]) -> Tuple[float, dict]:
+    def _prep_wl_cache(self, macro_idx: int) -> None:
+        """Cache, for each net `macro_idx` is on, the bbox of its NON-moving pins
+        (other macros' pins + ports — constant for the whole candidate scan) and
+        the offset-bbox of the moving macro's own pins on that net (offsets never
+        change). _delta_wl_for_move then gets each candidate net's bbox as
+        min/max(fixed_bbox, new_xy + offset_bbox) — O(nets), no inner pin loop.
+        Bit-identical: min/max over the SAME values, and IEEE add is monotonic so
+        new_x + min(offset) == min(new_x + offset). Invalidated by commit_move()."""
+        nets = np.asarray(self.nets_per_macro[macro_idx], dtype=np.int64)
+        K = nets.size
+        fminx = np.full(K, np.inf);  fmaxx = np.full(K, -np.inf)
+        fminy = np.full(K, np.inf);  fmaxy = np.full(K, -np.inf)
+        mminox = np.full(K, np.inf); mmaxox = np.full(K, -np.inf)
+        mminoy = np.full(K, np.inf); mmaxoy = np.full(K, -np.inf)
+        owned = set(int(p) for p in self.pins_per_macro[macro_idx])
+        pin_xy = self.pin_xy; off = self.pin_offset
+        for k in range(K):
+            for p in self.net_pins[int(nets[k])]:
+                pi = int(p)
+                if pi in owned:
+                    ox = off[pi, 0]; oy = off[pi, 1]
+                    if ox < mminox[k]: mminox[k] = ox
+                    if ox > mmaxox[k]: mmaxox[k] = ox
+                    if oy < mminoy[k]: mminoy[k] = oy
+                    if oy > mmaxoy[k]: mmaxoy[k] = oy
+                else:
+                    px = pin_xy[pi, 0]; py = pin_xy[pi, 1]
+                    if px < fminx[k]: fminx[k] = px
+                    if px > fmaxx[k]: fmaxx[k] = px
+                    if py < fminy[k]: fminy[k] = py
+                    if py > fmaxy[k]: fmaxy[k] = py
+        self._wl_nets      = nets
+        self._wl_fix_minx  = fminx;  self._wl_fix_maxx = fmaxx
+        self._wl_fix_miny  = fminy;  self._wl_fix_maxy = fmaxy
+        self._wl_mov_minox = mminox; self._wl_mov_maxox = mmaxox
+        self._wl_mov_minoy = mminoy; self._wl_mov_maxoy = mmaxoy
+        self._wl_net_w     = self.net_weight[nets]
+        self._wl_net_hpwl0 = self.net_hpwl[nets]
+        self._wl_prep_macro = macro_idx
+
+    def _delta_wl_for_move(self, macro_idx: int, new_xy: Tuple[float, float],
+                           want_state: bool = True) -> Tuple[float, Optional[dict]]:
         """Compute the (un-normalised) total_hpwl delta if macro_idx moves.
 
-        Returns (delta_total_hpwl, per_net_new_state).
-        per_net_new_state[net_idx] = (new_min_x, new_max_x, new_min_y, new_max_y,
-                                       new_net_hpwl)  — to be applied on commit.
-        """
+        Uses the per-macro non-moving-pin bbox cache (see _prep_wl_cache) so the
+        per-candidate work is O(nets), not O(nets * pins). Returns
+        (delta_total_hpwl, per_net_new_state) where per_net_new_state[net_idx] =
+        (new_min_x, new_max_x, new_min_y, new_max_y, new_net_hpwl) is consumed by
+        commit_move(). When `want_state` is False (candidate SCORING, which needs
+        only the scalar delta) the dict is skipped and None is returned. Matches
+        the old per-pin scan up to float-reorder in the delta sum (~1e-15)."""
         nets = self.nets_per_macro[macro_idx]
-        if nets.size == 0:
-            return 0.0, {}
-
-        pin_idxs_macro = self.pins_per_macro[macro_idx]
-        new_x, new_y = float(new_xy[0]), float(new_xy[1])
-
-        # For each pin owned by macro: new_pin_xy = (new_x + offset_x, new_y + offset_y).
-        # Build a map pin_idx -> (new_px, new_py).
-        new_pin_pos = {}
-        for p_idx in pin_idxs_macro:
-            ox = new_x + self.pin_offset[p_idx, 0]
-            oy = new_y + self.pin_offset[p_idx, 1]
-            new_pin_pos[int(p_idx)] = (float(ox), float(oy))
-
-        delta = 0.0
+        if len(nets) == 0:
+            return 0.0, ({} if want_state else None)
+        if self._wl_prep_macro != macro_idx:
+            self._prep_wl_cache(macro_idx)
+        nx = float(new_xy[0]); ny = float(new_xy[1])
+        new_min_x = np.minimum(self._wl_fix_minx, nx + self._wl_mov_minox)
+        new_max_x = np.maximum(self._wl_fix_maxx, nx + self._wl_mov_maxox)
+        new_min_y = np.minimum(self._wl_fix_miny, ny + self._wl_mov_minoy)
+        new_max_y = np.maximum(self._wl_fix_maxy, ny + self._wl_mov_maxoy)
+        new_hpwl = self._wl_net_w * ((new_max_x - new_min_x) + (new_max_y - new_min_y))
+        delta = float((new_hpwl - self._wl_net_hpwl0).sum())
+        if not want_state:
+            return delta, None
         per_net = {}
-
-        for net_idx in nets:
-            net_idx = int(net_idx)
-            pis = self.net_pins[net_idx]
-            if pis.size == 0:
-                continue
-            # Build the candidate net pin positions: use new_pin_pos for moving pins,
-            # current pin_xy for the rest.
-            new_min_x = math.inf
-            new_max_x = -math.inf
-            new_min_y = math.inf
-            new_max_y = -math.inf
-            for p in pis:
-                p_int = int(p)
-                if p_int in new_pin_pos:
-                    px, py = new_pin_pos[p_int]
-                else:
-                    px = float(self.pin_xy[p_int, 0])
-                    py = float(self.pin_xy[p_int, 1])
-                if px < new_min_x: new_min_x = px
-                if px > new_max_x: new_max_x = px
-                if py < new_min_y: new_min_y = py
-                if py > new_max_y: new_max_y = py
-            new_hpwl_unweighted = (new_max_x - new_min_x) + (new_max_y - new_min_y)
-            new_net_hpwl = self.net_weight[net_idx] * new_hpwl_unweighted
-            delta += new_net_hpwl - self.net_hpwl[net_idx]
-            per_net[net_idx] = (new_min_x, new_max_x, new_min_y, new_max_y, new_net_hpwl)
-
+        nets_l = self._wl_nets.tolist()
+        mnx = new_min_x.tolist(); mxx = new_max_x.tolist()
+        mny = new_min_y.tolist(); mxy = new_max_y.tolist()
+        nh = new_hpwl.tolist()
+        for k in range(len(nets_l)):
+            per_net[nets_l[k]] = (mnx[k], mxx[k], mny[k], mxy[k], nh[k])
         return delta, per_net
 
     def _commit_wl(self, macro_idx: int, new_xy: Tuple[float, float], per_net: dict) -> None:
@@ -1729,8 +2093,16 @@ class IncrementalEval:
         }
 
     def delta_for_move(self, macro_idx: int, new_xy: Tuple[float, float],
-                       include_cong: bool = False) -> dict:
+                       include_cong: bool = False, want_wl_state: bool = True,
+                       cur_den_cost: Optional[float] = None) -> dict:
         """Compute proxy delta if macro_idx moves to new_xy. State unchanged.
+
+        `want_wl_state=False` (candidate scoring) skips building the per-net WL
+        commit state — only the scalar delta is needed to rank candidates.
+        `cur_den_cost` (the current density cost) lets the caller supply the value
+        instead of re-deriving it here: it is CONSTANT across all candidates of a
+        macro, so recomputing it per candidate is pure waste. Bit-identical — the
+        supplied value is the same compute_density_cost() the caller already has.
 
         Returns dict with delta_wl, delta_density, delta_cong (=0 if
         include_cong=False; for True we currently fall back to a full
@@ -1740,7 +2112,8 @@ class IncrementalEval:
         polish stages prefer include_cong=False then full-eval after the
         cheap delta wins.
         """
-        delta_total_hpwl, wl_state = self._delta_wl_for_move(macro_idx, new_xy)
+        delta_total_hpwl, wl_state = self._delta_wl_for_move(
+            macro_idx, new_xy, want_state=want_wl_state)
         delta_wl = delta_total_hpwl / self.wl_denominator
 
         den_state = self._delta_density_for_move(macro_idx, new_xy)
@@ -1749,7 +2122,8 @@ class IncrementalEval:
         for (r, c), d in den_state['cells_delta'].items():
             new_grid[r, c] += d
         new_den_cost = self.compute_density_cost(grid_occupied=new_grid)
-        delta_density = new_den_cost - self.compute_density_cost()
+        cur_den_now = cur_den_cost if cur_den_cost is not None else self.compute_density_cost()
+        delta_density = new_den_cost - cur_den_now
 
         delta_cong = 0.0
         if include_cong:
@@ -1850,6 +2224,8 @@ class IncrementalEval:
         # A move changes the touched nets' routes, so the cached "old routes"
         # for incremental scoring are stale — invalidate them.
         self._score_prep_macro = -1
+        # Pin positions changed -> the WL non-moving-pin bbox cache is stale too.
+        self._wl_prep_macro = -1
 
 
 # ════════════════════════════════════════════════════════════════════════════

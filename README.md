@@ -1,39 +1,41 @@
 # v60
 
-**v60** is a multi-stage, analytical, GPU-accelerated macro placement algorithm. Given a netlist of hard and soft macros and a fixed-size canvas, it produces 2D positions for every macro that minimize the proxy cost `1.0 × Wirelength + 0.5 × Density + 0.5 × Congestion` — a weighted sum of the three quality terms most commonly used in placement: total wire routing length, packing uniformity, and routing congestion. The weights are the ones fixed by the challenge.
+**v60** is a multi-stage, analytical, GPU-accelerated macro placement algorithm. Given a netlist of hard and soft macros and a fixed-size canvas, it produces 2D positions for every macro that minimize the proxy cost `1.0 × Wirelength + 0.5 × Density + 0.5 × Congestion` — a weighted sum of the three quality terms most commonly used in placement: total wire routing length, packing uniformity, and routing congestion.
 
 Macro placement sits at the very front of a digital VLSI design flow: before standard cells can be placed and routed, the large macros (memories, custom blocks) have to be positioned on the die. Their placement disproportionately drives the quality of everything downstream, and the search space is large, near-discrete (hard macros must not overlap), and full of local minima — so the problem has long been a target for both classical analytical placers and more recent learning-based approaches.
 
-v60 was originally built for the [Partcl/HRT Macro Placement Challenge 2026](https://github.com/partcleda/macro-place-challenge-2026), which scores entries on the proxy cost above across the 17 ICCAD04 IBM benchmarks. The code lives in [`submissions/v60/`](submissions/v60/).
+v60 was originally built for the [Partcl/HRT Macro Placement Challenge 2026](https://github.com/partcleda/macro-place-challenge-2026). v60 lives in [`submissions/v60/`](submissions/v60/), whereas the rest of the repository simply mirrors the challenge repository.
 
-## Results
+## Results*
 
-Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which contains no macros and is excluded by the challenge), v60 reaches an **average proxy cost of 0.9196** — **36.9 % below the RePlAce baseline** (1.4578) and **56.7 % below Simulated Annealing** (2.1251) — with **zero macro overlaps on every design**. Lower proxy is better.
+Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which contains no macros and is excluded by the challenge), v60 reaches an average proxy cost of 0.8946 with no macro overlaps on any design.
 
-| Benchmark | v60 proxy | SA | RePlAce | vs SA | vs RePlAce | Overlaps |
-|-----------|----------:|-------:|--------:|------:|-----------:|:--------:|
-| ibm01 | 0.7493 | 1.3166 | 0.9976 | +43.1 % | +24.9 % | 0 |
-| ibm02 | 0.9017 | 1.9072 | 1.8370 | +52.7 % | +50.9 % | 0 |
-| ibm03 | 0.8559 | 1.7401 | 1.3222 | +50.8 % | +35.3 % | 0 |
-| ibm04 | 0.8349 | 1.5037 | 1.3024 | +44.5 % | +35.9 % | 0 |
-| ibm06 | 0.9691 | 2.5057 | 1.6187 | +61.3 % | +40.1 % | 0 |
-| ibm07 | 0.9237 | 2.0229 | 1.4633 | +54.3 % | +36.9 % | 0 |
-| ibm08 | 0.9633 | 1.9239 | 1.4285 | +49.9 % | +32.6 % | 0 |
-| ibm09 | 0.7177 | 1.3875 | 1.1194 | +48.3 % | +35.9 % | 0 |
-| ibm10 | 0.8600 | 2.1108 | 1.5009 | +59.3 % | +42.7 % | 0 |
-| ibm11 | 0.8065 | 1.7111 | 1.1774 | +52.9 % | +31.5 % | 0 |
-| ibm12 | 0.9724 | 2.8261 | 1.7261 | +65.6 % | +43.7 % | 0 |
-| ibm13 | 0.8294 | 1.9141 | 1.3355 | +56.7 % | +37.9 % | 0 |
-| ibm14 | 1.0169 | 2.2750 | 1.5436 | +55.3 % | +34.1 % | 0 |
-| ibm15 | 0.9839 | 2.3000 | 1.5159 | +57.2 % | +35.1 % | 0 |
-| ibm16 | 0.9943 | 2.2337 | 1.4780 | +55.5 % | +32.7 % | 0 |
-| ibm17 | 1.1681 | 3.6726 | 1.6446 | +68.2 % | +29.0 % | 0 |
-| ibm18 | 1.0859 | 2.7755 | 1.7722 | +60.9 % | +38.7 % | 0 |
-| **Average** | **0.9196** | 2.1251 | 1.4578 | **+56.7 %** | **+36.9 %** | **0** |
+| Benchmark | v60 proxy | SA | RePlAce | vs SA | vs RePlAce | Overlaps | Runtime |
+|-----------|----------:|-------:|--------:|------:|-----------:|:--------:|--------:|
+| ibm01 | 0.7354 | 1.3166 | 0.9976 | +44.1% | +26.3% | 0 | 550 s |
+| ibm02 | 0.8855 | 1.9072 | 1.8370 | +53.6% | +51.8% | 0 | 1340 s |
+| ibm03 | 0.8178 | 1.7401 | 1.3222 | +53.0% | +38.1% | 0 | 1920 s |
+| ibm04 | 0.8284 | 1.5037 | 1.3024 | +44.9% | +36.4% | 0 | 1660 s |
+| ibm06 | 0.9523 | 2.5057 | 1.6187 | +62.0% | +41.2% | 0 | 1620 s |
+| ibm07 | 0.8822 | 2.0229 | 1.4633 | +56.4% | +39.7% | 0 | 2050 s |
+| ibm08 | 0.9466 | 1.9239 | 1.4285 | +50.8% | +33.7% | 0 | 2190 s |
+| ibm09 | 0.7054 | 1.3875 | 1.1194 | +49.2% | +37.0% | 0 | 2160 s |
+| ibm10 | 0.8190 | 2.1108 | 1.5009 | +61.2% | +45.4% | 0 | 4810 s |
+| ibm11 | 0.7691 | 1.7111 | 1.1774 | +55.1% | +34.7% | 0 | 3170 s |
+| ibm12 | 0.9534 | 2.8261 | 1.7261 | +66.3% | +44.8% | 0 | 4790 s |
+| ibm13 | 0.8129 | 1.9141 | 1.3355 | +57.5% | +39.1% | 0 | 2460 s |
+| ibm14 | 1.0506 | 2.2750 | 1.5436 | +53.8% | +31.9% | 0 | 4570 s |
+| ibm15 | 0.9536 | 2.3000 | 1.5159 | +58.5% | +37.1% | 0 | 3600 s |
+| ibm16 | 0.9347 | 2.2337 | 1.4780 | +58.2% | +36.8% | 0 | 5320 s |
+| ibm17 | 1.1249 | 3.6726 | 1.6446 | +69.4% | +31.6% | 0 | 5300 s |
+| ibm18 | 1.0358 | 2.7755 | 1.7722 | +62.7% | +41.6% | 0 | 3460 s |
+| **Average** | **0.8946** | 2.1251 | 1.4578 | **+57.9%** | **+38.6%** | **0** | **3000 s** |
 
-**Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) and you will reproduce this table bit-for-bit** — these are the exact figures from such a run. The default (non-deterministic) mode is faster and lands within run-to-run noise (~1.4 %) of these numbers.
+*\*Run with `deterministic=True` on an NVIDIA RTX 6000 Ada (48 GB) paired with an AMD EPYC 75F3.*
 
-The SA and RePlAce baselines are the published results reported in [*An Updated Assessment of Reinforcement Learning for Macro Placement*](https://doi.org/10.1109/TCAD.2025.3644293) (IEEE), measured through the same TILOS MacroPlacement evaluator that scores v60.
+Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) to closely reproduce this table. The default (non-deterministic) mode is faster and lands within the same run-to-run noise margin.
+
+The SA and RePlAce baselines are the published results reported in [*An Updated Assessment of Reinforcement Learning for Macro Placement*](https://doi.org/10.1109/TCAD.2025.3644293).
 
 ## Quick Start
 
@@ -68,7 +70,9 @@ The entry point is `v60_placer.py`; it pulls in `v60_engine.py`, `v60_kernels.py
 
 ## How It Works
 
-The macro placement problem is to assign 2D positions to a set of hard and soft macros on a bounded canvas such that a weighted sum of wirelength, placement density, and routing congestion is minimized. v60 works in two phases. The first is *global placement* on the GPU, driven by gradient descent. Gradient descent needs a differentiable objective, but the official cost is not one: it is computed by ranking the busiest grid cells and routing each net onto a discrete grid — operations that carry no useful gradient. So this phase instead optimizes a smooth, differentiable surrogate of the three cost terms, running gradient descent directly on macro coordinates to reach a strong overall arrangement. The second phase is *refinement*: local-search passes that work on the exact cost. Local search only ever compares finished placements, so it needs no gradients and can call the official scorer directly — closing the gap the surrogate leaves behind.
+The macro placement problem is to assign 2D positions to a set of hard and soft macros on a bounded canvas such that the downstream PPA outcome is as good as possible. In our case, these goals are represented as a weighted sum of wirelength, placement density, and routing congestion. In this simplification, the placement algorithm works through minimizing this value called *proxy cost* or simply *proxy*, which is defined as `1.0 × Wirelength + 0.5 × Density + 0.5 × Congestion`.
+
+v60 works in two phases. The first is *global placement* performed on the GPU, driven by gradient descent. (Theoretically it can be performed on the CPU as well, but orders of magnitude slower. See [Runtime & Reproducibility](#runtime--reproducibility).) Gradient descent needs a differentiable objective, but the official cost is not one: it is computed by ranking the busiest grid cells and routing each net onto a discrete grid — operations that carry no useful gradient. So this phase instead optimizes a smooth, differentiable surrogate of the three cost terms, running gradient descent directly on macro coordinates to reach a strong overall arrangement. The second phase is *refinement*: local-search passes that work on the exact cost. Local search only ever compares finished placements, so it needs no gradients and can call the official scorer directly — closing the gap the surrogate leaves behind.
 
 ### Global placement
 
@@ -76,7 +80,7 @@ The macro placement problem is to assign 2D positions to a set of hard and soft 
 
 **The three-stage gradient engine.** From those cluster positions, the engine runs three successive gradient descent phases. *Stage 0* is a short global pass that places the super-macros; it establishes a rough floorplan before individual macros are freed. *Stage 1* then expands the super-macros back into their constituent hard macros and optimizes freely — this is the main exploration phase, where the optimizer is given enough room to move macros far from their cluster centers if the wirelength objective calls for it. *Stage 2* finishes by activating the density, overlap, and congestion penalties at full strength, driving hard-macro overlap towards zero while balancing the other cost terms.
 
-**Why many restarts?** The optimization landscape is highly non-convex — the congestion term alone introduces many local minima, and different initializations can settle into very different final arrangements. Rather than betting on a single trajectory, v60 runs 32 independent restarts in parallel on the GPU, each from a different random initialization, and scores every result against the real `compute_proxy_cost`. The lowest-proxy result whose hard-macro overlap falls within a small tolerance (a fixed fraction of the median hard-macro area) is carried forward; the downstream stages are trusted to clean up any small residual overlap rather than discarding an otherwise good seed for it.
+**Why many restarts?** The optimization landscape is highly non-convex — the congestion term alone introduces many local minima, and different initializations can settle into very different final arrangements. This is why v60 runs 64 independent restarts in parallel rather than betting on a single trajectory. Each restart starts from a different random initialization, and every restart is scored on the exact proxy cost at the end of Stage 2. The lowest-proxy result whose hard-macro overlap falls within a small tolerance (a fixed fraction of the median hard-macro area) is carried forward; the downstream stages are trusted to clean up any small residual overlap rather than discarding an otherwise good seed for it. (This means that there is a minuscule but indeed present chance you end up with an invalid placement at the very end; but I have not once seen this happen with the current default values. If absolutely necessary, the tolerance threshold can still be adjusted.)
 
 **Escaping local minima: basin-hopping.** After the three-stage gradient engine, v60 applies a basin-hopping wrapper around the best placement found so far. A Gaussian perturbation is applied to macro positions, Stage 2 is re-run from the perturbed state, and the result is accepted if it improves the real proxy cost. A tabu list tracks visited basins (identified by both spatial displacement and proxy cost similarity) to avoid re-exploring the same region, and a priority queue biases perturbation towards seeds that have previously yielded improvements. The hop loop terminates early if no improvement is found for several consecutive attempts.
 
@@ -84,20 +88,21 @@ The macro placement problem is to assign 2D positions to a set of hard and soft 
 
 ### Refinement
 
-Scoring a single candidate move on the full official cost — re-routing every net and re-scoring the whole grid — would be far too slow for the thousands of moves these passes try. `IncrementalEval` makes it practical: it returns exactly the official cost, but after a trial move it recomputes only the parts that actually change — the few nets whose wirelength shifts, and the grid cells whose density or congestion moves — leaving the rest of the placement untouched.
-
 **Coordinate descent.** The first refinement pass nudges one macro at a time. For each movable macro, v60 generates candidate offsets along sixteen evenly-spaced directions across a wide range of step sizes, evaluates each one against the cost, and commits the single best improving move; it sweeps over all macros repeatedly until the gains taper off. Hard macros participate too, with each candidate move checked against the other hard macros so the zero-overlap guarantee is never broken.
 
-**Pair swaps.** Single-macro moves cannot reach one particular configuration: two macros each sitting where the other would do better, so that no individual move improves the cost but exchanging the two does. v60 therefore finishes with two swap passes — one over hard macros, one over soft. For each macro it considers exchanging positions with the partners it shares the most connections with (and, for hard macros, its nearest spatial neighbours), and commits any swap that improves the placement. Hard-macro swaps are held to the same overlap check as coordinate descent.
+Scoring a single candidate move on the full official cost — re-routing every net and re-scoring the whole grid — would be far too slow for the thousands of moves coordinate descent and the following refinement stages try. `IncrementalEval` makes it practical: it returns exactly the official cost, but after a trial move it recomputes only the parts that actually change — the few nets whose wirelength shifts, and the grid cells whose density or congestion moves. This drastically reduces the amount of proxy computation needed during refinement.
 
-A few implementation details worth noting: the congestion term used during gradient descent is a differentiable port of the TILOS L-shape router; most geometric hyperparameters (step sizes, penalty weights, grid resolutions) auto-scale with canvas area based on Optuna sweeps across the benchmark suite; and a runtime guard progressively thins the more expensive work on the largest designs to stay within the one-hour-per-benchmark budget.
+**Pair swaps.** Single-macro moves cannot reach one particular configuration: two macros each sitting where the other would do better, so that no individual move improves the cost but exchanging the two does. v60 therefore finishes with two swap passes — one over hard macros, one over soft. For each macro it considers exchanging positions with the partners it shares the most connections with (and, for hard macros, its nearest spatial neighbours), and commits any swap that improves the placement. Hard-macro swaps are held to the same overlap check as the one in coordinate descent.
+
+**Basin-hopping on the exact cost.** Coordinate descent and the swap passes converge to a placement that no single move or pairwise exchange can improve. To escape that local minimum, v60 applies basin-hopping once more, now on the exact cost: each hop adds Gaussian noise to a small set of soft macros that are the endpoints of nets crossing the worst 5% of routing cells. The algorithm then re-runs coordinate descent over the entire placement, and keeps the result only if it scores better. Every hop tries a ladder of eight noise scales (sigma values) in parallel and keeps the best outcome, letting the perturbation strength adapt to the design and to where the descent stands. Hard macros are never perturbed, though the re-descent may still move them legally.
 
 ## Runtime & Reproducibility
 
-- **CPU and GPU.** The algorithm runs on either — `device='auto'` picks CUDA when available and falls back to CPU otherwise. A GPU is strongly recommended, since the many parallel restarts are what make the wall-clock budget comfortable.
-- **Non-deterministic by default.** This is intentional: the default mode keeps TF32 and the fast (non-deterministic) CUDA kernels enabled, which is the recommended setting for evaluation.
-- **Determinism is opt-in.** Setting `deterministic=True` on `v60_Placer` in `v60_placer.py` pins every RNG and disables non-deterministic kernels, giving bit-identical placements across runs — this is the mode that reproduces the [Results](#results) table exactly. It costs roughly **1.3–2× runtime** over the default.
-- **Other tradeoffs.** `torch.compile` is used automatically when the environment supports it and falls back to eager execution otherwise; Stage 2 uses bf16 autocast on GPU for speed; the refinement passes parallelize their candidate evaluations across CPU cores, so more cores shorten the refinement phase; and the runtime guard trades a little solution quality on the largest designs to stay safely under the 1-hour cap.
+- The algorithm runs on either — `device='auto'` picks CUDA when available and falls back to CPU otherwise. A GPU is strongly recommended, since the many parallel restarts are what make the wall-clock budget comfortable.
+- The algorithm is nondeterministic by default. Setting `deterministic=True` in `v60_placer.py` pins every RNG and switches to deterministic kernels wherever PyTorch provides them. The end-to-end results should then closely replicate those in the [Results](#results) table, but runtime would be higher.
+- `torch.compile` is used automatically when the environment supports it and falls back to eager execution otherwise.
+- Stage 2 uses bf16 autocast on GPU for speed. No meaningful proxy deterioration was observed.
+- The refinement passes parallelize their candidate evaluations across CPU cores, so more CPU cores shorten the refinement phase.
 
 ## License
 

@@ -53,6 +53,7 @@ from v60_engine import v60_Engine
 from v60_kernels   import (
     _basin_hop, _congestion_work_tier,
     _extract_raw, _parse_plc_routing_params, _quiet_plc, _run_batch,
+    _total_overlap,
 )
 from v60_incremental_eval import (
     IncrementalEval, WEIGHT_WL, WEIGHT_DENSITY, WEIGHT_CONG,
@@ -212,7 +213,7 @@ class v60_Placer:
     def __init__(
         self,
         # ── Restart count for the cohort ──────────────────────────────────
-        num_restarts: int = 32,
+        num_restarts: int = 64,
 
         # ── Multi-level config ─────────────────────────────────────────────
         num_clusters             = 'auto',
@@ -233,6 +234,9 @@ class v60_Placer:
         use_hh_overlap:            bool = True,
         use_ss_overlap:            bool = True,
         use_soft_degree_inflation: bool = False,
+        # Congestion-gradient interval by workload tier (tiers 0..4).
+        cong_eval_interval_tiers_s1: tuple = (1, 2, 2, 3, 4),
+        cong_eval_interval_tiers_s2: tuple = (1, 2, 3, 4, 5),
 
         # ── Common runtime ────────────────────────────────────────────────
         plc_root: str = "external/MacroPlacement/Testcases/ICCAD04",
@@ -257,7 +261,10 @@ class v60_Placer:
         #   - B per hop is small (8) so the freed wall-time goes to more hop
         #     attempts (higher max_hops / final_explore).
         basin_hop:                  bool  = True,
-        basin_hop_max_hops:         int   = 24,
+        basin_hop_max_hops:         int   = 2,    # 24->2 (2026-06-07): empirically the
+                                                  # GPU basin-hop rarely improves past hop 2
+                                                  # (hop 3 is typically a dup-basin under-
+                                                  # threshold hop that improve_quota=1 ends on)
         basin_hop_final_explore:    int   = 0,
         basin_hop_sigma_set                = (0.015, 0.025, 0.035),  # productive band only
         basin_hop_tabu_eps:         float = 0.01,                    # spatial: mean macro disp / scale
@@ -270,9 +277,6 @@ class v60_Placer:
         basin_hop_min_improve_frac: float = 0.005,                   # 0.5% of current proxy
         basin_hop_stratify:         bool  = False,                   # split B across sigma_set per hop
         basin_hop_restarts:         int   = 8,                       # small B per hop + more hops
-        # Runtime guard for large/routability-heavy benchmarks. 'auto' keeps
-        # ibm01-style behavior but caps expensive Stage-2 reruns on big netlists.
-        congestion_runtime_mode: str = 'auto',
         # -- v60 soft-only polish -------------------------------------------------
         soft_polish_enabled: bool = True,
         soft_polish_restarts: int = 16,
@@ -348,6 +352,51 @@ class v60_Placer:
         soft_pair_swap_min_improve: float = 1e-7,
         soft_pair_swap_patience: int = 2,
         soft_pair_swap_verbose: bool = True,
+        # -- v60 exact-cost refinement basin-hop (per-hop σ line-search) -------
+        # Runs on the best-of-N refined floor. Each hop perturbs the SOFT macros on
+        # the top-`cong_frac` congestion cells and re-descends the WHOLE placement
+        # with CD on the EXACT proxy, accepting iff it drops. A single σ is a poor
+        # fit — the productive perturbation scale is design-dependent and rugged
+        # (ibm01≈0.020, ibm10≈0.024, ibm06≈0.048) — so each hop fans the σ-set out
+        # in parallel (one CD re-descent per σ) and greedily keeps the best, which
+        # adapts the kick to the design AND anneals coarse→fine across the descent.
+        refine_basin_hop_enabled: bool = True,
+        refine_basin_hop_hops: int = 10,       # CEILING, not a fixed count (4->10 2026-06-10):
+                                               # the min_improve_frac early-stop below ends the
+                                               # loop per-design, so designs still descending at
+                                               # hop 4 (4/4 measured) keep harvesting while
+                                               # plateaued ones stop paying for empty hops
+        # Early stop for the hop loop: the first hop whose relative proxy drop is
+        # below this fraction (including a rejected hop, drop<=0) ends the loop.
+        # Mirrors the engine `_basin_hop` min_improve_frac semantics at its
+        # production improve_quota=1. 1e-3 = 0.1%.
+        refine_basin_hop_min_improve_frac: float = 1e-3,
+        # Per-hop σ line-search band (8 σ, denser at small values — 2026-06-07).
+        # Superset of the old (0.012,0.024,0.048,0.072) + finer small-end resolution
+        # (0.006/0.009 below the old 0.012 floor — small designs pinned there; plus
+        # 0.018/0.036 fills). Fanned out in waves (see _refine_basin_hop) so each σ
+        # keeps a full CD pool. 0.072 stays the ceiling (bigger kicks overshoot).
+        refine_basin_hop_sigma_set: tuple = (0.006, 0.009, 0.012, 0.018,
+                                             0.024, 0.036, 0.048, 0.072),
+        refine_basin_hop_cap: int = 60,        # max hot soft macros perturbed / hop
+        refine_basin_hop_cong_frac: float = 0.05,
+        # Per-hop CD re-descend sweep cap. The natural early-stop (0.1%/sweep) runs
+        # ~6-10 sweeps; raised 4->12 (2026-06-07) to recover the re-descend tail
+        # (~+0.38% on ibm06) now that the numba CD router makes the extra sweeps
+        # affordable, then 12->15 (2026-06-10, back to the original full-rigor cap)
+        # together with the hop early-stop. Sits above the typical early-stop, so
+        # it rarely binds.
+        refine_basin_hop_cd_sweeps: int = 15,
+        # Which macros the per-hop kick perturbs. 'netcause' (default): endpoint
+        # macros of the nets routing THROUGH the top-cong cells (`bottleneck_net_macros`).
+        # Since most nets thread the central jam this is a broad set, so after the cap the
+        # kick lands SPREAD across the canvas — which escapes the floor better than the
+        # 'hotcell' kick (macros with a pin SITTING in a top-cong cell, `hot_cell_macros`),
+        # whose perturbation is clustered in the jam. A/B: netcause beats hotcell on the
+        # big designs (ibm06 -0.40%, ibm10 -0.07%), wash on ibm01; same count/cost. The
+        # win is the SPREAD, not the wires per se (a 60-macro cap is the count sweet spot;
+        # jiggling all soft macros overshoots and every hop is rejected).
+        refine_basin_hop_kick_mode: str = 'netcause',
         # -- v60 multi-candidate post-Stage-2 refinement -----------------------
         # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
         # winner, with separate widths for the (expensive, GPU) and (cheap,
@@ -392,6 +441,14 @@ class v60_Placer:
         self.use_hh_overlap            = use_hh_overlap
         self.use_ss_overlap            = use_ss_overlap
         self.use_soft_degree_inflation = use_soft_degree_inflation
+        self.cong_eval_interval_tiers_s1 = tuple(int(v) for v in cong_eval_interval_tiers_s1)
+        self.cong_eval_interval_tiers_s2 = tuple(int(v) for v in cong_eval_interval_tiers_s2)
+        if (len(self.cong_eval_interval_tiers_s1) != 5 or
+                any(v < 1 for v in self.cong_eval_interval_tiers_s1)):
+            raise ValueError('cong_eval_interval_tiers_s1 must contain five positive integers')
+        if (len(self.cong_eval_interval_tiers_s2) != 5 or
+                any(v < 1 for v in self.cong_eval_interval_tiers_s2)):
+            raise ValueError('cong_eval_interval_tiers_s2 must contain five positive integers')
         self.plc_root      = plc_root
         self.device        = device
         self.verbose       = verbose
@@ -407,7 +464,6 @@ class v60_Placer:
         self.basin_hop_min_improve_frac = float(basin_hop_min_improve_frac)
         self.basin_hop_stratify       = bool(basin_hop_stratify)
         self.basin_hop_restarts       = int(basin_hop_restarts)
-        self.congestion_runtime_mode  = str(congestion_runtime_mode)
         self.soft_polish_enabled = bool(soft_polish_enabled)
         self.soft_polish_restarts = int(soft_polish_restarts)
         # 'auto' kept as-is; explicit values coerced. Resolved in _resolve_soft_polish.
@@ -451,6 +507,14 @@ class v60_Placer:
         self.soft_pair_swap_min_improve    = float(soft_pair_swap_min_improve)
         self.soft_pair_swap_patience       = int(soft_pair_swap_patience)
         self.soft_pair_swap_verbose        = bool(soft_pair_swap_verbose)
+        self.refine_basin_hop_enabled    = bool(refine_basin_hop_enabled)
+        self.refine_basin_hop_hops       = int(refine_basin_hop_hops)
+        self.refine_basin_hop_min_improve_frac = float(refine_basin_hop_min_improve_frac)
+        self.refine_basin_hop_sigma_set  = tuple(float(s) for s in refine_basin_hop_sigma_set)
+        self.refine_basin_hop_cap        = int(refine_basin_hop_cap)
+        self.refine_basin_hop_cong_frac  = float(refine_basin_hop_cong_frac)
+        self.refine_basin_hop_cd_sweeps  = int(refine_basin_hop_cd_sweeps)
+        self.refine_basin_hop_kick_mode  = str(refine_basin_hop_kick_mode)
         self.post_stage2_n_gpu = max(1, int(post_stage2_n_gpu))
         self.post_stage2_n_cpu = max(1, int(post_stage2_n_cpu))
         self.post_stage2_cpu_parallel = bool(post_stage2_cpu_parallel)
@@ -517,29 +581,6 @@ class v60_Placer:
         return hard_area / max(canvas_area, 1e-12)
 
     @staticmethod
-    def _congestion_runtime_scale(benchmark: Benchmark) -> float:
-        """0..1 runtime-pressure score for routability-heavy designs."""
-        return _congestion_work_tier(benchmark) / 4.0
-
-    def _runtime_guard_enabled(self) -> bool:
-        mode = self.congestion_runtime_mode.lower()
-        return mode not in ('off', 'false', '0', 'none')
-
-    def _cap_for_congestion_runtime(self, benchmark: Benchmark, value: int, caps: tuple) -> int:
-        if not self._runtime_guard_enabled():
-            return int(value)
-        pressure = self._congestion_runtime_scale(benchmark)
-        if pressure >= 1.0:
-            return min(int(value), int(caps[0]))
-        if pressure >= 0.75:
-            return min(int(value), int(caps[1]))
-        if pressure >= 0.5:
-            return min(int(value), int(caps[2]))
-        if pressure >= 0.25:
-            return min(int(value), int(caps[3]))
-        return int(value)
-
-    @staticmethod
     def _auto_soft_polish_cong_interval(benchmark: Benchmark) -> int:
         """Soft-polish cong_eval_interval — floors at 2 even on small designs."""
         return _congestion_work_tier(benchmark) + 2
@@ -561,6 +602,8 @@ class v60_Placer:
             use_hh_overlap            = self.use_hh_overlap,
             use_ss_overlap            = self.use_ss_overlap,
             use_soft_degree_inflation = self.use_soft_degree_inflation,
+            cong_eval_interval_tiers_s1 = self.cong_eval_interval_tiers_s1,
+            cong_eval_interval_tiers_s2 = self.cong_eval_interval_tiers_s2,
             plc_root                  = self.plc_root,
             device                    = self.device,
             verbose                   = self.verbose,
@@ -687,17 +730,71 @@ class v60_Placer:
                 seen.add(key)
                 deduped.append(c)
             cpu_cands = deduped[: self.post_stage2_n_cpu]
+            # Optional: dump the pre-refinement candidate pool to disk so the
+            # CPU refinement stages can be developed/A-B'd in isolation without
+            # re-running the (expensive) engine. Off by default — only active
+            # when `refine_cache_dir` is set (see refine_bench.py). With
+            # `refine_dump_only` we stop here and skip refinement entirely.
+            if getattr(self, 'refine_cache_dir', None):
+                self._dump_refine_cache(cpu_cands, benchmark, t0)
+                if getattr(self, 'refine_dump_only', False):
+                    self._log(
+                        f"[v60 {benchmark.name}] refine-cache: dump-only, "
+                        f"skipping refinement.")
+                    return best_pos
             results = self._run_cpu_side(
                 cpu_cands, benchmark, plc, gpu_pool=len(cand_pool), t0=t0)
             for (rpos, rproxy, rtag) in results:
                 if rproxy < best_proxy - 1e-9:
                     best_pos, best_proxy, best_tag = rpos, rproxy, rtag
+
+            # Exact-cost refinement basin-hop on the best-of-N floor: each hop fans
+            # the σ-set out in parallel and greedily keeps the best-improving global
+            # CD re-descent (accept iff the exact proxy drops). Escapes the greedy
+            # refinement floor; adapts the kick scale per design. Runs here in the
+            # (non-daemon) main process after the CPU fork pool has joined.
+            if (self.refine_basin_hop_enabled and best_pos is not None
+                    and plc is not None and math.isfinite(best_proxy)):
+                hb_pos, hb_proxy = self._refine_basin_hop(best_pos, benchmark, plc, t0=t0)
+                if hb_proxy < best_proxy - 1e-9:
+                    best_pos, best_proxy = hb_pos, hb_proxy
+                    best_tag = f"{best_tag}+rbhop"
+
             self._log(
                 f"[v60 {benchmark.name}] post-Stage-2 done: best={best_proxy:.4f}  "
                 f"tag={best_tag}  total {time.time()-t0:.1f}s"
             )
 
         return best_pos
+
+    def _dump_refine_cache(self, cpu_cands, benchmark, t0):
+        """Dump the pre-refinement candidate pool (full placement tensors +
+        metadata) to `self.refine_cache_dir`. Used by refine_bench.py to test
+        the CPU refinement stages from a fixed input without paying the engine
+        cost each time. Each candidate's positions are saved as float64 .npy;
+        a JSON sidecar records benchmark dims, tags, and starting proxies."""
+        import json
+        d = self.refine_cache_dir
+        os.makedirs(d, exist_ok=True)
+        meta = {
+            'benchmark':       benchmark.name,
+            'num_macros':      int(benchmark.num_macros),
+            'num_hard_macros': int(benchmark.num_hard_macros),
+            'candidates':      [],
+        }
+        for i, c in enumerate(cpu_cands):
+            pos_np = c['pos'].detach().cpu().numpy().astype(np.float64)
+            fname = f"{benchmark.name}_cand{i}.npy"
+            np.save(osp.join(d, fname), pos_np)
+            meta['candidates'].append({
+                'index': i, 'tag': c['tag'],
+                'proxy': float(c['proxy']), 'file': fname,
+            })
+        with open(osp.join(d, f"{benchmark.name}_meta.json"), 'w') as f:
+            json.dump(meta, f, indent=2)
+        self._log(
+            f"[v60 {benchmark.name}] refine-cache: dumped {len(cpu_cands)} "
+            f"candidate(s) to {d}  total {time.time()-t0:.1f}s")
 
     def _gpu_basinhop(self, seed_pos_np, seed_proxy, benchmark, plc, winner_cohort,
                       mov_idx, scale, label):
@@ -715,7 +812,6 @@ class v60_Placer:
                 and math.isfinite(cur_proxy)):
             Bhop = (self.basin_hop_restarts if self.basin_hop_restarts > 0
                     else int(getattr(winner_cohort, 'num_restarts', 16)))
-            Bhop = self._cap_for_congestion_runtime(benchmark, Bhop, caps=(5, 6, 7, 8))
             rng  = np.random.default_rng(self.seed if self.deterministic else None)
             try:
                 ic      = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
@@ -779,10 +875,9 @@ class v60_Placer:
         itself is added to the pool separately by the caller."""
         nM = int(benchmark.num_macros)
         out = []
-        base_costs = compute_proxy_cost(cur_t[:nM].to(torch.float32), benchmark, plc)
         self._soft_log(
             f"[v60 {benchmark.name}] soft polish ({cur_tag}) start: "
-            f"proxy={base_costs['proxy_cost']:.4f}"
+            f"proxy={cur_proxy:.4f}"
         )
         self._last_soft_pool = []
         _polished, _pc = self._soft_only_polish(cur_t, benchmark, plc)
@@ -1190,8 +1285,27 @@ class v60_Placer:
         best_legal_costs = None
         best_legal_proxy = float('inf')
         legal_restarts = []   # (proxy, pos_np) for overlap-free restarts
+        hard_overlap = _total_overlap(
+            base_np, nH,
+            benchmark.macro_sizes.numpy()[:nH, 0] * 0.5,
+            benchmark.macro_sizes.numpy()[:nH, 1] * 0.5,
+        )
+        try:
+            soft_eval = IncrementalEval(benchmark, plc=plc)
+        except Exception as exc:
+            soft_eval = None
+            self._soft_log(
+                f"  soft seed scorer init failed ({exc}); falling back to PLC"
+            )
         for i, pos_np in enumerate(all_pos):
-            costs = compute_proxy_cost(torch.tensor(pos_np, dtype=torch.float32), benchmark, plc)
+            if soft_eval is not None:
+                soft_eval.set_placement(np.asarray(pos_np, dtype=np.float64))
+                costs = soft_eval.proxy_breakdown(include_cong=True)
+                costs["total_overlap_area"] = hard_overlap
+            else:
+                costs = compute_proxy_cost(
+                    torch.tensor(pos_np, dtype=torch.float32), benchmark, plc
+                )
             proxy = float(costs['proxy_cost'])
             ovlp = float(costs.get('total_overlap_area', float('nan')))
             self._soft_log(
@@ -1240,6 +1354,7 @@ class v60_Placer:
         benchmark: Benchmark,
         plc: PlacementCost,
         max_workers: int = 1,
+        target_subset=None,
     ):
         """Single-macro coordinate descent over movable macros (soft and,
         if `cd_polish_include_hard`, hard too) using IncrementalEval.
@@ -1291,6 +1406,13 @@ class v60_Placer:
             target_idx = np.where(movable[:nM])[0]
         else:
             target_idx = np.where(movable[:nM] & (np.arange(nM) >= nH))[0]
+        if target_subset is not None:
+            # Restrict CD to a caller-supplied subset of macros (used by the
+            # exact-cost refinement basin-hop for fast LOCAL re-descent). Keeps
+            # all the global IncrementalEval scoring intact; only limits which
+            # macros are attempted as movers.
+            keep = np.intersect1d(target_idx, np.asarray(target_subset, dtype=np.int64))
+            target_idx = keep
         if target_idx.size == 0:
             return placement, None
 
@@ -1421,8 +1543,10 @@ class v60_Placer:
                 for mult in step_mults:
                     s = base_step * mult
                     for (dx, dy) in dirs:
-                        new_x = float(np.clip(cur_x + dx * s, 0.0, cw))
-                        new_y = float(np.clip(cur_y + dy * s, 0.0, ch))
+                        # min/max clamp == np.clip for finite values, but ~5x cheaper
+                        # than the scalar np.clip machinery (per-candidate hot path).
+                        new_x = min(max(cur_x + dx * s, 0.0), cw)
+                        new_y = min(max(cur_y + dy * s, 0.0), ch)
                         if new_x == cur_x and new_y == cur_y:
                             continue
                         key = (new_x, new_y)
@@ -2016,6 +2140,184 @@ class v60_Placer:
             f"cong={costs['congestion_cost']:.3f}  elapsed={time.time()-t0:.1f}s"
         )
         return out, costs
+
+    def _refine_basin_hop(self, placement, benchmark, plc, *, t0=None):
+        """Exact-cost refinement basin-hop on a single placement (the best-of-N
+        floor) via a per-hop σ line-search. Each hop perturbs the hot SOFT macros
+        of the current incumbent by N(0, σ) for every σ in the set — the σ-descents
+        run concurrently (one fork each, each a parallel CD re-descent) — then
+        greedily keeps the best-improving descent (accept iff the exact proxy
+        drops). A single σ is a poor fit: the productive perturbation scale is
+        design-dependent and rugged, so trying the whole σ-set every hop and
+        keeping the winner adapts the kick to the design AND to where it is in the
+        descent (it naturally anneals coarse→fine). Distinct from the engine
+        `_basin_hop`, which re-descends the differentiable surrogate and washes out
+        under refinement; this hops the EXACT proxy (IncrementalEval + CD), so it
+        moves the SCORED floor. Deterministic (per-descent seed keyed on hop/σ).
+        `refine_basin_hop_hops` is a CEILING: the first hop whose relative drop
+        falls below `refine_basin_hop_min_improve_frac` (rejected hops included)
+        ends the loop, so the count self-tiers per design.
+        Must run in a non-daemon process so each σ-descent can host its own CD
+        pool. Returns (pos, proxy)."""
+        hops     = self.refine_basin_hop_hops
+        sigmas   = self.refine_basin_hop_sigma_set
+        min_frac = float(self.refine_basin_hop_min_improve_frac)
+        nM = int(benchmark.num_macros)
+        e = IncrementalEval(benchmark, plc=plc)
+        e.set_placement(placement[:nM].detach().cpu().numpy().astype(np.float64))
+        inc_pos, inc_proxy = placement, float(e.proxy(include_cong=True))
+        del e
+        if hops <= 0 or not sigmas:
+            return inc_pos, inc_proxy
+        # The σ-descents run concurrently (one per σ); give each its own CD worker
+        # pool, sized so (σ-fan × per-descent workers) fits the core budget.
+        cpu_count = os.cpu_count() or 1
+        par = int(self.cd_polish_parallel_workers)
+        # Keep each σ-descent at a full CD pool (cd_w) and run the σ-set in WAVES of
+        # `concurrent` so cd_w doesn't collapse as the set grows: 8 σ on a 16-core
+        # box would otherwise force cd_w=2. cd_w=4, concurrent=4 -> 8 σ in 2 waves;
+        # a 4-σ set is 1 wave (unchanged). par==1 keeps the old single-thread daemon
+        # forks (cd_w=1 -> run up to cpu_count descents at once).
+        cd_w = max(1, min(par, cpu_count)) if par > 1 else 1
+        concurrent = max(1, min(len(sigmas), cpu_count // cd_w))
+        base = self.seed if self.deterministic else None
+        tot  = f"  total {time.time()-t0:.1f}s" if t0 is not None else ""
+        self._log(f"[v60 {benchmark.name}] === refine basin-hop: start={inc_proxy:.6f}  "
+                  f"{len(sigmas)} σ × ≤{hops} hops (greedy per-hop σ line-search, "
+                  f"early-stop <{min_frac*100:.2f}%/hop)  "
+                  f"cd_workers={cd_w} ({concurrent} σ/wave){tot} ===")
+        for hop in range(hops):
+            th = time.time()
+            # Hoist the per-hop shared setup out of the σ-descents: the incumbent
+            # is identical across all σ this hop, so build its eval + the hot-macro
+            # selector + half-dims ONCE here (not 8× in the forks). Each descent
+            # still does its own rng.choice(cap) + kick from this shared `hot`.
+            eh = IncrementalEval(benchmark, plc=plc)
+            eh.set_placement(inc_pos[:nM].detach().cpu().numpy().astype(np.float64))
+            if self.refine_basin_hop_kick_mode == 'netcause':
+                hot = eh.bottleneck_net_macros(self.refine_basin_hop_cong_frac)
+            else:
+                hot = eh.hot_cell_macros(self.refine_basin_hop_cong_frac)
+            hw = eh.macro_w * 0.5; hh = eh.macro_h * 0.5
+            del eh
+            jobs = [{'si': si, 'sigma': s, 'pos': inc_pos, 'hot': hot, 'hw': hw, 'hh': hh,
+                     'seed': (None if base is None else base * 100003 + hop * 101 + si)}
+                    for si, s in enumerate(sigmas)]
+            outs = self._basin_hop_fanout(jobs, benchmark, plc, cd_w, concurrent)
+            best = min(outs, key=lambda o: o['proxy'])
+            # Mirror the engine `_basin_hop` split: ANY exact-proxy reduction is
+            # accepted (free progress), but only a hop whose relative drop clears
+            # min_improve_frac keeps the loop alive — the first sub-threshold hop
+            # (a rejected one included, drop <= 0) ends it. Measured against the
+            # PRE-hop incumbent, so compute before the accept updates inc_proxy.
+            rel_drop = (inc_proxy - best['proxy']) / max(abs(inc_proxy), 1e-12)
+            if best['pos'] is not None and best['proxy'] < inc_proxy - 1e-9:
+                out_pos = benchmark.macro_positions.clone()
+                out_pos[:nM] = torch.tensor(best['pos'], dtype=out_pos.dtype)
+                inc_pos, inc_proxy = out_pos, best['proxy']
+                mark = f"σ={sigmas[best['si']]:.3f} ACCEPT"
+            else:
+                mark = f"σ={sigmas[best['si']]:.3f} --"
+            self._log(f"[v60 {benchmark.name}] refine basin-hop: hop {hop+1}/{hops} "
+                      f"-> best {best['proxy']:.6f} {mark}  incumbent={inc_proxy:.6f}  "
+                      f"{time.time()-th:.1f}s")
+            if min_frac > 0.0 and rel_drop < min_frac:
+                self._log(f"[v60 {benchmark.name}] refine basin-hop: early stop after "
+                          f"hop {hop+1}/{hops} (drop {max(rel_drop, 0.0)*100:.4f}% < "
+                          f"{min_frac*100:.4f}%)")
+                break
+        return inc_pos, inc_proxy
+
+    def _basin_hop_fanout(self, jobs, benchmark, plc, cd_w, concurrent=None):
+        """Run the σ-descents in `jobs` concurrently in WAVES of `concurrent` (one
+        fork each; self/benchmark/plc inherited via fork, never pickled — only the
+        result returns over a Queue). Each descent runs a `cd_w`-worker CD
+        re-descent, so the forks are non-daemon when cd_w>1 (a daemon process can't
+        host the CD pool); `concurrent × cd_w` is kept within the core budget by the
+        caller. `concurrent=None` runs the whole set in one wave. Returns a list
+        aligned to `jobs`: {'pos': [nM,2] float64 or None, 'proxy', 'si'}."""
+        if concurrent is None or concurrent < 1:
+            concurrent = len(jobs)
+        out = [None] * len(jobs)
+        try:
+            ctx = mp.get_context('fork')
+        except (ValueError, RuntimeError):
+            ctx = None
+        if ctx is None:                       # no fork: run the σ-fan sequentially
+            for k, job in enumerate(jobs):
+                pos_np, pr = self._basin_hop_descend(
+                    job['pos'], job['sigma'], job['seed'], benchmark, plc, cd_w,
+                    job['hot'], job['hw'], job['hh'])
+                out[k] = {'pos': pos_np, 'proxy': pr, 'si': job['si']}
+            return out
+
+        def _child(k, job, q):                # inherited via fork; logs discarded
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    pos_np, pr = self._basin_hop_descend(
+                        job['pos'], job['sigma'], job['seed'], benchmark, plc, cd_w,
+                        job['hot'], job['hw'], job['hh'])
+                q.put((k, pos_np, pr))
+            except Exception:
+                q.put((k, None, float('inf')))
+
+        daemon = (cd_w == 1)                   # non-daemon when hosting a CD pool
+        for w0 in range(0, len(jobs), concurrent):     # waves of `concurrent` forks
+            wave = range(w0, min(w0 + concurrent, len(jobs)))
+            q = ctx.Queue()
+            procs = []
+            for k in wave:
+                p = ctx.Process(target=_child, args=(k, jobs[k], q), daemon=daemon)
+                p.start(); procs.append(p)
+            for _ in wave:
+                k, pos_np, pr = q.get()
+                out[k] = {'pos': pos_np, 'proxy': pr, 'si': jobs[k]['si']}
+            for p in procs:
+                p.join()
+        for k in range(len(jobs)):            # any child that died -> no-improvement
+            if out[k] is None:
+                out[k] = {'pos': None, 'proxy': float('inf'), 'si': jobs[k]['si']}
+        return out
+
+    def _basin_hop_descend(self, incumbent_pos, sigma_frac, seed, benchmark, plc, cd_w,
+                           hot, hw, hh):
+        """One basin-hop descent: perturb the hot SOFT macros of `incumbent_pos` by
+        N(0, σ) (σ = sigma_frac · half-perimeter), then global CD re-descent on the
+        EXACT proxy with `cd_w` CD workers. `hot` (hot-macro set) and `hw`/`hh`
+        (macro half-dims) are computed ONCE per hop by the caller and shared across
+        the σ-descents (the incumbent is identical), so this no longer rebuilds the
+        incumbent eval/selector. Returns ([nM,2] float64 positions, proxy)."""
+        nM = int(benchmark.num_macros)
+        nH = int(benchmark.num_hard_macros)
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
+        sigma = sigma_frac * 0.5 * (cw + ch)
+        rng = np.random.default_rng(seed)
+        cap = self.refine_basin_hop_cap
+        if cap and hot.size > cap:
+            hot = np.sort(rng.choice(hot, cap, replace=False))
+        pert = hot[hot >= nH]                  # perturb SOFT only (no overlap risk)
+        cand = incumbent_pos.clone()
+        cnp = cand[:nM].detach().cpu().numpy().astype(np.float64)
+        if pert.size:
+            new = cnp[pert] + rng.normal(0.0, sigma, size=(pert.size, 2))
+            lx = np.minimum(hw[pert], cw - hw[pert]); ux = np.maximum(hw[pert], cw - hw[pert])
+            ly = np.minimum(hh[pert], ch - hh[pert]); uy = np.maximum(hh[pert], ch - hh[pert])
+            new[:, 0] = np.clip(new[:, 0], lx, ux)
+            new[:, 1] = np.clip(new[:, 1], ly, uy)
+            cnp[pert] = new
+            cand[:nM] = torch.tensor(cnp, dtype=cand.dtype)
+        saved = self.cd_polish_sweeps          # cap CD sweeps per hop (child-local)
+        self.cd_polish_sweeps = int(self.refine_basin_hop_cd_sweeps)
+        try:
+            out, costs = self._cd_polish(cand, benchmark, plc,
+                                         max_workers=cd_w, target_subset=None)
+        finally:
+            self.cd_polish_sweeps = saved
+        pr = float(costs['proxy_cost']) if costs else float('inf')
+        pos_np = (out[:nM].detach().cpu().numpy().astype(np.float64)
+                  if out is not None else None)
+        return pos_np, pr
 
 
 def place(benchmark: Benchmark) -> torch.Tensor:

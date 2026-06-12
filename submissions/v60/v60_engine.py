@@ -56,6 +56,7 @@ from v60_kernels import (
     _run_stage0,
     _dump_cong_diagnostic_multi,
 )
+from v60_incremental_eval import IncrementalEval
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,7 +145,7 @@ class v60_Engine:
     Canvas-aware resolvers fire when the corresponding arg is 'auto'
     (default for all five; all anchored at L=23 / ibm01-tuned values, so
     ibm01 behavior is preserved exactly):
-        num_steps_s1 ('auto') = 5000 + round(167.08*max(0,L-23.0))
+        num_steps_s1 ('auto') = 5000 + round(170*max(0,L-23.0))
         num_steps_s2 ('auto') = 5000 + round(100*max(0,L-23)), clamped [5000, ∞)
         lr_s1        ('auto') = 1.15 + 1.65*(1-exp(-(L-23)/4)),  clamped [1.0, 3.0]
         lr_s2        ('auto') = 0.185 * (L/23)^0.5,         clamped [0.18, 0.45]
@@ -216,6 +217,8 @@ class v60_Engine:
         cong_edge_chunk: int   = 65536,  # 8x v60 default (8192). For ibm01 (~12k edges) -> 1 chunk; ibm10/14 still chunk safely.
         cong_eval_interval_s1 = 'auto',
         cong_eval_interval_s2 = 'auto',
+        cong_eval_interval_tiers_s1: tuple = (1, 2, 2, 3, 4),
+        cong_eval_interval_tiers_s2: tuple = (1, 2, 3, 4, 5),
         cong_sigma_l:  float = 0.41,
         cong_abu_frac: float = 0.029,   # v60: ibm01-tuned (loss-side; metric still uses 0.05).
         lambda_cong_size_scale: bool = True,   # v60: auto-scale lc_s1/lc_s2 by fast-saturating exp in L (sweep-fit 2026-05-20).
@@ -294,6 +297,14 @@ class v60_Engine:
         self.cong_edge_chunk      = int(cong_edge_chunk)
         self.cong_eval_interval_s1 = cong_eval_interval_s1
         self.cong_eval_interval_s2 = cong_eval_interval_s2
+        self.cong_eval_interval_tiers_s1 = tuple(int(v) for v in cong_eval_interval_tiers_s1)
+        self.cong_eval_interval_tiers_s2 = tuple(int(v) for v in cong_eval_interval_tiers_s2)
+        if (len(self.cong_eval_interval_tiers_s1) != 5 or
+                any(v < 1 for v in self.cong_eval_interval_tiers_s1)):
+            raise ValueError('cong_eval_interval_tiers_s1 must contain five positive integers')
+        if (len(self.cong_eval_interval_tiers_s2) != 5 or
+                any(v < 1 for v in self.cong_eval_interval_tiers_s2)):
+            raise ValueError('cong_eval_interval_tiers_s2 must contain five positive integers')
         self.cong_sigma_l         = float(cong_sigma_l)
         self.cong_abu_frac        = float(cong_abu_frac)
         self.lambda_cong_size_scale = bool(lambda_cong_size_scale)
@@ -380,7 +391,8 @@ class v60_Engine:
         # side lengths) shared by every other size formula here, so elongated
         # (non-square) canvases scale consistently. The IBM benches are all
         # near-square (L == avg_dim), so this moves no IBM result.
-        ns = 5000 + int(round(167.08 * max(0.0, L - 23.0)))
+        # Stage-1 ramp slightly increased beyond the pre-2026-06-09 slope.
+        ns = 5000 + int(round(170.0 * max(0.0, L - 23.0)))
         return ns, f'auto(L={L:.2f})'
 
     # v60 (2026-05-15): the lr / gamma resolvers were originally calibrated
@@ -437,6 +449,7 @@ class v60_Engine:
         # spreading stage and saturation is documented at 5000 for small
         # benches. Upper cap removed for symmetry with s1 (no current
         # bench hits 11000 anyway — ibm16 at L=81 only reaches 10808).
+        # Stage-2 ramp fully restored to the pre-2026-06-09 slope.
         ns = 5000 + int(round(100.0 * max(0.0, L - 23.0)))
         ns = max(5000, ns)
         return ns, f'auto(L={L:.2f})'
@@ -453,15 +466,17 @@ class v60_Engine:
     def _resolve_cong_interval(self, value, benchmark: Benchmark, stage: int) -> tuple:
         """Resolve cong_eval_interval_s{1,2}.
 
-        'auto' thins the expensive congestion-gradient calls on large /
-        routability-heavy designs (tier from _congestion_work_tier); the
-        ×interval multiplier in _run_batch keeps roughly the same integrated
-        congestion force. Final seed ranking still uses compute_proxy_cost.
+        'auto' selects from the configured five-entry tier table using
+        _congestion_work_tier. Values above 1 thin the expensive congestion-
+        gradient calls; the ×interval multiplier in _run_batch keeps roughly
+        the same integrated congestion force. Final seed ranking still uses compute_proxy_cost.
         """
         if value != 'auto':
             return max(1, int(value)), 'fixed'
         tier = _congestion_work_tier(benchmark)
-        interval = (1, 2, 2, 3, 4)[tier] if stage == 1 else (1, 2, 3, 4, 5)[tier]
+        intervals = (self.cong_eval_interval_tiers_s1 if stage == 1
+                     else self.cong_eval_interval_tiers_s2)
+        interval = intervals[tier]
         n = int(benchmark.num_nets)
         cells = int(benchmark.grid_rows) * int(benchmark.grid_cols)
         return interval, f'auto(nets={n}, cells={cells})'
@@ -629,13 +644,33 @@ class v60_Engine:
                 if osp.exists(init_plc):
                     plc.restore_placement(init_plc, ifInital=True, ifReadComment=True)
 
+            # Ranking every seed through compute_proxy_cost repeatedly invokes
+            # the pure-Python PLC router. On the large IBM designs that costs
+            # tens of seconds per seed. IncrementalEval rebuilds the same exact
+            # proxy state in under a second after a one-time setup, and matches
+            # PLC to float noise (~1e-7), so reuse one scorer across the cohort.
+            try:
+                seed_eval = IncrementalEval(benchmark, plc=plc)
+            except Exception as exc:
+                seed_eval = None
+                self._log(
+                    f"  [seed-rank] IncrementalEval init failed ({exc}); "
+                    f"falling back to PLC scoring"
+                )
+
             for i, pos_np in enumerate(all_pos):
                 ovlp = _total_overlap(pos_np, raw['nH'],
                                       raw['hw_np'][:raw['nH']], raw['hh_np'][:raw['nH']])
                 try:
-                    costs = compute_proxy_cost(
-                        torch.tensor(pos_np, dtype=torch.float32), benchmark, plc,
-                    )
+                    if seed_eval is not None:
+                        seed_eval.set_placement(
+                            np.asarray(pos_np, dtype=np.float64)
+                        )
+                        costs = seed_eval.proxy_breakdown(include_cong=True)
+                    else:
+                        costs = compute_proxy_cost(
+                            torch.tensor(pos_np, dtype=torch.float32), benchmark, plc,
+                        )
                     proxy = costs['proxy_cost']
                     all_metrics[i].update({
                         'score_proxy':   float(proxy),
