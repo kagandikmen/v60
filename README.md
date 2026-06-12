@@ -6,32 +6,34 @@ Macro placement sits at the very front of a digital VLSI design flow: before sta
 
 v60 was originally built for the [Partcl/HRT Macro Placement Challenge 2026](https://github.com/partcleda/macro-place-challenge-2026), which scores entries on the proxy cost above across the 17 ICCAD04 IBM benchmarks. The code lives in [`submissions/v60/`](submissions/v60/).
 
-## Results
+## Results*
 
 Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which contains no macros and is excluded by the challenge), v60 reaches an **average proxy cost of 0.8946** — **38.6 % below the RePlAce baseline** (1.4578) and **57.9 % below Simulated Annealing** (2.1251) — with no macro overlaps on any design.
 
-| Benchmark | v60 proxy | SA | RePlAce | vs SA | vs RePlAce | Overlaps |
-|-----------|----------:|-------:|--------:|------:|-----------:|:--------:|
-| ibm01 | 0.7354 | 1.3166 | 0.9976 | +44.1 % | +26.3 % | 0 |
-| ibm02 | 0.8855 | 1.9072 | 1.8370 | +53.6 % | +51.8 % | 0 |
-| ibm03 | 0.8178 | 1.7401 | 1.3222 | +53.0 % | +38.1 % | 0 |
-| ibm04 | 0.8284 | 1.5037 | 1.3024 | +44.9 % | +36.4 % | 0 |
-| ibm06 | 0.9523 | 2.5057 | 1.6187 | +62.0 % | +41.2 % | 0 |
-| ibm07 | 0.8822 | 2.0229 | 1.4633 | +56.4 % | +39.7 % | 0 |
-| ibm08 | 0.9466 | 1.9239 | 1.4285 | +50.8 % | +33.7 % | 0 |
-| ibm09 | 0.7054 | 1.3875 | 1.1194 | +49.2 % | +37.0 % | 0 |
-| ibm10 | 0.8190 | 2.1108 | 1.5009 | +61.2 % | +45.4 % | 0 |
-| ibm11 | 0.7691 | 1.7111 | 1.1774 | +55.1 % | +34.7 % | 0 |
-| ibm12 | 0.9534 | 2.8261 | 1.7261 | +66.3 % | +44.8 % | 0 |
-| ibm13 | 0.8129 | 1.9141 | 1.3355 | +57.5 % | +39.1 % | 0 |
-| ibm14 | 1.0506 | 2.2750 | 1.5436 | +53.8 % | +31.9 % | 0 |
-| ibm15 | 0.9536 | 2.3000 | 1.5159 | +58.5 % | +37.1 % | 0 |
-| ibm16 | 0.9347 | 2.2337 | 1.4780 | +58.2 % | +36.8 % | 0 |
-| ibm17 | 1.1249 | 3.6726 | 1.6446 | +69.4 % | +31.6 % | 0 |
-| ibm18 | 1.0358 | 2.7755 | 1.7722 | +62.7 % | +41.6 % | 0 |
-| **Average** | **0.8946** | 2.1251 | 1.4578 | **+57.9 %** | **+38.6 %** | **0** |
+| Benchmark | v60 proxy | SA | RePlAce | vs SA | vs RePlAce | Overlaps | Runtime |
+|-----------|----------:|-------:|--------:|------:|-----------:|:--------:|--------:|
+| ibm01 | 0.7354 | 1.3166 | 0.9976 | +44.1 % | +26.3 % | 0 | 550 s |
+| ibm02 | 0.8855 | 1.9072 | 1.8370 | +53.6 % | +51.8 % | 0 | 1340 s |
+| ibm03 | 0.8178 | 1.7401 | 1.3222 | +53.0 % | +38.1 % | 0 | 1920 s |
+| ibm04 | 0.8284 | 1.5037 | 1.3024 | +44.9 % | +36.4 % | 0 | 1660 s |
+| ibm06 | 0.9523 | 2.5057 | 1.6187 | +62.0 % | +41.2 % | 0 | 1620 s |
+| ibm07 | 0.8822 | 2.0229 | 1.4633 | +56.4 % | +39.7 % | 0 | 2050 s |
+| ibm08 | 0.9466 | 1.9239 | 1.4285 | +50.8 % | +33.7 % | 0 | 2190 s |
+| ibm09 | 0.7054 | 1.3875 | 1.1194 | +49.2 % | +37.0 % | 0 | 2160 s |
+| ibm10 | 0.8190 | 2.1108 | 1.5009 | +61.2 % | +45.4 % | 0 | 4810 s |
+| ibm11 | 0.7691 | 1.7111 | 1.1774 | +55.1 % | +34.7 % | 0 | 3170 s |
+| ibm12 | 0.9534 | 2.8261 | 1.7261 | +66.3 % | +44.8 % | 0 | 4790 s |
+| ibm13 | 0.8129 | 1.9141 | 1.3355 | +57.5 % | +39.1 % | 0 | 2460 s |
+| ibm14 | 1.0506 | 2.2750 | 1.5436 | +53.8 % | +31.9 % | 0 | 4570 s |
+| ibm15 | 0.9536 | 2.3000 | 1.5159 | +58.5 % | +37.1 % | 0 | 3600 s |
+| ibm16 | 0.9347 | 2.2337 | 1.4780 | +58.2 % | +36.8 % | 0 | 5320 s |
+| ibm17 | 1.1249 | 3.6726 | 1.6446 | +69.4 % | +31.6 % | 0 | 5300 s |
+| ibm18 | 1.0358 | 2.7755 | 1.7722 | +62.7 % | +41.6 % | 0 | 3460 s |
+| **Average** | **0.8946** | 2.1251 | 1.4578 | **+57.9 %** | **+38.6 %** | **0** | **3000 s** |
 
-**Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) to closely reproduce this table** — these are the figures from a deterministic run on an NVIDIA RTX 6000 Ada (49 GB) paired with an AMD EPYC 75F3. Even in deterministic mode a small residual GPU nondeterminism remains (see [Runtime & Reproducibility](#runtime--reproducibility)), so expect agreement within ~1 % rather than an exact match; the default (non-deterministic) mode is faster and lands within run-to-run noise (~1.4 %) of these numbers.
+*\*Run with `deterministic=True` on an NVIDIA RTX 6000 Ada (48 GB) paired with an AMD EPYC 75F3.*
+
+**Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) to closely reproduce this table.** Even in deterministic mode a small residual GPU nondeterminism remains (see [Runtime & Reproducibility](#runtime--reproducibility)), so expect agreement within ~1 % rather than an exact match; the default (non-deterministic) mode is faster and lands within run-to-run noise (~1.4 %) of these numbers.
 
 The SA and RePlAce baselines are the published results reported in [*An Updated Assessment of Reinforcement Learning for Macro Placement*](https://doi.org/10.1109/TCAD.2025.3644293) (IEEE), measured through the same TILOS MacroPlacement evaluator that scores v60.
 
