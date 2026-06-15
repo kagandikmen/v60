@@ -210,14 +210,62 @@ class v60_Placer:
     embedding (see v60_engine.py).
     """
 
+    # Mode-owned knobs. The active mode's dict is applied at the end of
+    # __init__ and is the single source of truth for these values: EDIT THEM
+    # HERE. They are NOT ctor parameters; for a one-off variant, construct the
+    # placer and assign attributes afterwards (the refine_bench pattern), e.g.
+    # p = v60_Placer(mode='fast'); p.num_restarts = 12.
+    # Both dicts must carry the SAME key set (checked at construction).
+    FULL_MODE_DEFAULTS = {
+        'num_restarts':             64,    # cohort restart count
+        'refine_basin_hop_enabled': True,  # refinement basin-hop on/off
+    }
+    FAST_MODE_DEFAULTS = {
+        'num_restarts':             32,    # cohort restart count
+        'refine_basin_hop_enabled': False, # refinement basin-hop on/off
+    }
+
     def __init__(
         self,
-        # ── Restart count for the cohort ──────────────────────────────────
-        num_restarts: int = 64,
-        # Pipeline mode: 'full' (default) or 'fast'. 'fast' runs the full
-        # pipeline minus the refinement basin-hop, with 32 restarts.
-        mode: str = 'full',
+        # ── Pipeline mode ──────────────────────────────────────────────────
+        # 'full' (default): the complete pipeline. 'fast': the full pipeline
+        # minus the refinement basin-hop, with 32 restarts. The mode-owned
+        # knobs (restart count, refinement basin-hop on/off) live in
+        # FULL_MODE_DEFAULTS / FAST_MODE_DEFAULTS above — they are not ctor
+        # parameters.
+        mode: str = 'fast',
 
+        # ── Common runtime ────────────────────────────────────────────────
+        plc_root: str = "external/MacroPlacement/Testcases/ICCAD04",
+        device: str   = 'auto',
+        verbose: bool = True,
+        deterministic: bool = False,   # production default: keep TF32 / fast kernels on
+        seed: int           = 0,
+
+        # -- v60 multi-candidate post-Stage-2 refinement -----------------------
+        # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
+        # winner, with separate widths for the (expensive, GPU) and (cheap,
+        # parallelizable, CPU) halves:
+        #   - post_stage2_n_gpu: how many top engine seeds get the GPU side
+        #     (basin-hop + soft polish). Each is runtime-heavy, so keep small.
+        #   - post_stage2_n_cpu: how many legal candidates from the pooled GPU
+        #     output get the CPU side (CD + pair-swap + soft-pair-swap). The
+        #     GPU stages emit their top legal candidates (soft-polish restarts +
+        #     basin-hop incumbents); the global top-n_cpu of that pool are
+        #     polished, and the best final wins. CPU side is ~independent per
+        #     candidate, so this widens cheaply (parallel) for little runtime.
+        # Defaults (1, 1) reproduce the original single-winner pipeline exactly.
+        post_stage2_n_gpu: int = 1,
+        post_stage2_n_cpu: int = 8,
+        # Run the n_cpu CPU-downstream chains in parallel processes (GIL makes
+        # threads useless for the Python-bound CD/swap loops). Falls back to a
+        # sequential loop if the pool can't be created. max_workers caps the
+        # process count ('auto' = min(n_cpu, os.cpu_count())).
+        post_stage2_cpu_parallel: bool = True,
+        post_stage2_cpu_max_workers = 'auto',
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Everything below is per-stage tuning, in pipeline order.
         # ── Multi-level config ─────────────────────────────────────────────
         num_clusters             = 'auto',
         cluster_jitter_frac: float = 0.30,
@@ -241,12 +289,6 @@ class v60_Placer:
         cong_eval_interval_tiers_s1: tuple = (1, 2, 2, 3, 4),
         cong_eval_interval_tiers_s2: tuple = (1, 2, 3, 4, 5),
 
-        # ── Common runtime ────────────────────────────────────────────────
-        plc_root: str = "external/MacroPlacement/Testcases/ICCAD04",
-        device: str   = 'auto',
-        verbose: bool = True,
-        deterministic: bool = False,   # production default: keep TF32 / fast kernels on
-        seed: int           = 0,
         # ── Basin-hopping wrapper (v60). After the cohort run, perturb
         # the running-best placement and re-run Stage 2 from it, with a
         # promising-seed priority queue + visited-basin tabu list (see
@@ -363,7 +405,6 @@ class v60_Placer:
         # (ibm01≈0.020, ibm10≈0.024, ibm06≈0.048) — so each hop fans the σ-set out
         # in parallel (one CD re-descent per σ) and greedily keeps the best, which
         # adapts the kick to the design AND anneals coarse→fine across the descent.
-        refine_basin_hop_enabled: bool = True,
         refine_basin_hop_hops: int = 10,       # CEILING, not a fixed count (4->10 2026-06-10):
                                                # the min_improve_frac early-stop below ends the
                                                # loop per-design, so designs still descending at
@@ -400,27 +441,6 @@ class v60_Placer:
         # win is the SPREAD, not the wires per se (a 60-macro cap is the count sweet spot;
         # jiggling all soft macros overshoots and every hop is rejected).
         refine_basin_hop_kick_mode: str = 'netcause',
-        # -- v60 multi-candidate post-Stage-2 refinement -----------------------
-        # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
-        # winner, with separate widths for the (expensive, GPU) and (cheap,
-        # parallelizable, CPU) halves:
-        #   - post_stage2_n_gpu: how many top engine seeds get the GPU side
-        #     (basin-hop + soft polish). Each is runtime-heavy, so keep small.
-        #   - post_stage2_n_cpu: how many legal candidates from the pooled GPU
-        #     output get the CPU side (CD + pair-swap + soft-pair-swap). The
-        #     GPU stages emit their top legal candidates (soft-polish restarts +
-        #     basin-hop incumbents); the global top-n_cpu of that pool are
-        #     polished, and the best final wins. CPU side is ~independent per
-        #     candidate, so this widens cheaply (parallel) for little runtime.
-        # Defaults (1, 1) reproduce the original single-winner pipeline exactly.
-        post_stage2_n_gpu: int = 1,
-        post_stage2_n_cpu: int = 8,
-        # Run the n_cpu CPU-downstream chains in parallel processes (GIL makes
-        # threads useless for the Python-bound CD/swap loops). Falls back to a
-        # sequential loop if the pool can't be created. max_workers caps the
-        # process count ('auto' = min(n_cpu, os.cpu_count())).
-        post_stage2_cpu_parallel: bool = True,
-        post_stage2_cpu_max_workers = 'auto',
         # -- Stage 2 seed picker overlap tolerance ------------------------------
         # Threshold = ratio * median(hard_macro_area), floored at 1e-9.
         # ratio=0 → strict (legal-only). ratio=0.1 lets seeds with up to ~10%
@@ -429,7 +449,6 @@ class v60_Placer:
         # polish, CD) then have a chance to legalize the residual.
         stage2_overlap_tol_ratio: float = 0.5,
     ):
-        self.num_restarts = int(num_restarts)
         self.num_clusters         = num_clusters
         self.cluster_jitter_frac  = float(cluster_jitter_frac)
         self.cluster_margin_frac  = float(cluster_margin_frac)
@@ -510,7 +529,6 @@ class v60_Placer:
         self.soft_pair_swap_min_improve    = float(soft_pair_swap_min_improve)
         self.soft_pair_swap_patience       = int(soft_pair_swap_patience)
         self.soft_pair_swap_verbose        = bool(soft_pair_swap_verbose)
-        self.refine_basin_hop_enabled    = bool(refine_basin_hop_enabled)
         self.refine_basin_hop_hops       = int(refine_basin_hop_hops)
         self.refine_basin_hop_min_improve_frac = float(refine_basin_hop_min_improve_frac)
         self.refine_basin_hop_sigma_set  = tuple(float(s) for s in refine_basin_hop_sigma_set)
@@ -524,15 +542,21 @@ class v60_Placer:
         self.post_stage2_cpu_max_workers = post_stage2_cpu_max_workers
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
-        # Fast mode: the full pipeline minus the refinement basin-hop, with
-        # half the restarts. Everything else (GPU basin-hop, soft polish, the
-        # pair-swap passes, coordinate descent) is identical to full mode.
-        self.mode = str(mode)
-        if self.mode == 'fast':
-            self.num_restarts = 32
-            self.refine_basin_hop_enabled = False
-        elif self.mode != 'full':
+        # Mode preset: the active mode's dict (FULL_MODE_DEFAULTS /
+        # FAST_MODE_DEFAULTS at the top of the class) owns its knobs outright
+        # — they are not ctor parameters; tweak a constructed instance via
+        # attribute assignment instead. The key-set equality check makes a
+        # typo'd key in either hand-edited dict fail loudly.
+        if mode not in ('full', 'fast'):
             raise ValueError(f"mode must be 'full' or 'fast', got {mode!r}")
+        self.mode = str(mode)
+        if set(self.FULL_MODE_DEFAULTS) != set(self.FAST_MODE_DEFAULTS):
+            raise AttributeError(
+                "FULL_MODE_DEFAULTS and FAST_MODE_DEFAULTS key sets differ")
+        preset = (self.FAST_MODE_DEFAULTS if self.mode == 'fast'
+                  else self.FULL_MODE_DEFAULTS)
+        for _k, _v in preset.items():
+            setattr(self, _k, _v)
 
     def _log(self, msg):
         if self.verbose:
