@@ -559,9 +559,28 @@ class v60_Placer:
     def _proxy_and_overlap(self, pos: torch.Tensor, benchmark: Benchmark,
                            plc: PlacementCost) -> tuple:
         """Return (proxy_cost, total_overlap_area). Overlap is NaN on failure
-        so the caller's legality test (overlap <= 1e-9) treats it as illegal."""
+        so the caller's legality test (overlap <= 1e-9) treats it as illegal.
+
+        Scored with a one-shot IncrementalEval (bit-exact to the PLC scorer
+        to ~1e-7, sub-second after setup vs the pure-Python PLC router's
+        tens of seconds on big designs — the abdbc04/dff5616 seed-ranking
+        pattern) plus the pairwise hard AABB area from _total_overlap (the
+        same metric the engine's legal pick reads). Falls back to
+        compute_proxy_cost if the IncrementalEval setup fails."""
         nM  = int(benchmark.num_macros)
+        nH  = int(benchmark.num_hard_macros)
         sub = pos[:nM] if pos.shape[0] > nM else pos
+        try:
+            pos_np = sub.detach().cpu().numpy().astype(np.float64)
+            e = IncrementalEval(benchmark, plc=plc)
+            e.set_placement(pos_np)
+            pr = float(e.proxy(include_cong=True))
+            half = benchmark.macro_sizes.numpy().astype(np.float64) * 0.5
+            ov = float(_total_overlap(pos_np, nH, half[:nH, 0], half[:nH, 1]))
+            return pr, ov
+        except Exception as exc:
+            self._log(f"  IncrementalEval scoring failed ({exc}); "
+                      f"falling back to PLC")
         try:
             costs = compute_proxy_cost(sub.to(torch.float32), benchmark, plc)
             return (float(costs['proxy_cost']),
