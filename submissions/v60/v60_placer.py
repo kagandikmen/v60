@@ -214,6 +214,9 @@ class v60_Placer:
         self,
         # ── Restart count for the cohort ──────────────────────────────────
         num_restarts: int = 64,
+        # Pipeline mode: 'full' (default) or 'fast'. 'fast' runs the full
+        # pipeline minus the refinement basin-hop, with 32 restarts.
+        mode: str = 'full',
 
         # ── Multi-level config ─────────────────────────────────────────────
         num_clusters             = 'auto',
@@ -520,6 +523,16 @@ class v60_Placer:
         self.post_stage2_cpu_parallel = bool(post_stage2_cpu_parallel)
         self.post_stage2_cpu_max_workers = post_stage2_cpu_max_workers
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
+
+        # Fast mode: the full pipeline minus the refinement basin-hop, with
+        # half the restarts. Everything else (GPU basin-hop, soft polish, the
+        # pair-swap passes, coordinate descent) is identical to full mode.
+        self.mode = str(mode)
+        if self.mode == 'fast':
+            self.num_restarts = 32
+            self.refine_basin_hop_enabled = False
+        elif self.mode != 'full':
+            raise ValueError(f"mode must be 'full' or 'fast', got {mode!r}")
 
     def _log(self, msg):
         if self.verbose:
