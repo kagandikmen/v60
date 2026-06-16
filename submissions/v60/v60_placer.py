@@ -214,8 +214,8 @@ class v60_Placer:
     # __init__ and is the single source of truth for these values: EDIT THEM
     # HERE. They are NOT ctor parameters; for a one-off variant, construct the
     # placer and assign attributes afterwards (the refine_bench pattern), e.g.
-    # p = v60_Placer(mode='fast'); p.num_restarts = 12.
-    # All three dicts must carry the SAME key set (checked at construction).
+    # p = v60_Placer(mode='flash'); p.num_restarts = 12.
+    # Both dicts must carry the SAME key set (checked at construction).
     #
     #   num_restarts                       cohort restart count (basin lottery)
     #   refine_basin_hop_enabled           the exact-cost refinement basin-hop
@@ -244,25 +244,14 @@ class v60_Placer:
         'soft_polish_restarts':             16,
         'basin_hop_legal_cap':              3,       # legality safety net (inert on current suites)
     }
-    FAST_MODE_DEFAULTS = {
-        'num_restarts':                     32,
-        'refine_basin_hop_enabled':         False,
-        'num_steps_s1_coeff':               1.0,
-        'num_steps_s2_coeff':               1.0,
-        'cd_polish_min_sweep_improve_frac': 0.001,   # 0.1% relative
-        'swaps_enabled':                    True,
-        'basin_hop_max_hops':               2,
-        'soft_polish_restarts':             16,
-        'basin_hop_legal_cap':              3,       # legality safety net (inert on current suites)
-    }
-    # flash mode: fast mode's leaner refinement (no refinement basin-hop) PLUS
-    # 16 restarts, shorter gradient descents (Stage 2 leans on the GPU basin-hop /
-    # soft polish that re-run Stage 2 anyway), a single regular GPU basin-hop, a
-    # lighter soft polish, an earlier CD-polish stop, and no pair swaps (they barely
-    # move the proxy). With only 16 restarts the legality safety net leans on the
-    # GPU basin-hop, so its legality guard is on (cap 10) and can extend past the
-    # single regular hop when a legal placement hasn't been reached. Faster than
-    # fast, a little worse on proxy.
+    # flash mode: the fastest pipeline — full minus the refinement basin-hop and
+    # the pair swaps, with 16 restarts, shorter gradient descents (s1×0.75, s2×0.67;
+    # Stage 2 leans on the GPU basin-hop / soft polish that re-run Stage 2 anyway), a
+    # single regular GPU basin-hop, a lighter soft polish, and an earlier CD-polish
+    # stop. With only 16 restarts the legality safety net leans on the GPU basin-hop,
+    # so its legality guard cap is higher (10) and can extend past the single regular
+    # hop when a legal placement hasn't been reached. Faster than full, a little
+    # worse on proxy.
     FLASH_MODE_DEFAULTS = {
         'num_restarts':                     16,
         'refine_basin_hop_enabled':         False,
@@ -278,11 +267,11 @@ class v60_Placer:
     def __init__(
         self,
         # ── Pipeline mode ──────────────────────────────────────────────────
-        # 'full' (default): the complete pipeline. 'fast': the full pipeline
-        # minus the refinement basin-hop, with 32 restarts. 'flash': fast plus
-        # shorter Stage-1/2 descents, an earlier CD stop, and no pair swaps —
-        # the quickest, slightly worse on proxy. The mode-owned knobs live in
-        # FULL_/FAST_/FLASH_MODE_DEFAULTS above — they are not ctor parameters.
+        # 'full' (default): the complete pipeline. 'flash': the fastest pipeline —
+        # full minus the refinement basin-hop and pair swaps, with 16 restarts,
+        # shorter Stage-1/2 descents, and an earlier CD stop — slightly worse on
+        # proxy. The mode-owned knobs live in FULL_/FLASH_MODE_DEFAULTS above —
+        # they are not ctor parameters.
         mode: str = 'full',
 
         # ── Common runtime ────────────────────────────────────────────────
@@ -591,14 +580,13 @@ class v60_Placer:
         self.post_stage2_cpu_max_workers = post_stage2_cpu_max_workers
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
-        # Mode preset: the active mode's dict (FULL_/FAST_/FLASH_MODE_DEFAULTS
-        # at the top of the class) owns its knobs outright — they are not ctor
+        # Mode preset: the active mode's dict (FULL_/FLASH_MODE_DEFAULTS at the
+        # top of the class) owns its knobs outright — they are not ctor
         # parameters; tweak a constructed instance via attribute assignment
-        # instead. The key-set equality check makes a typo'd key in any
+        # instead. The key-set equality check makes a typo'd key in either
         # hand-edited dict fail loudly.
         _presets = {
             'full':  self.FULL_MODE_DEFAULTS,
-            'fast':  self.FAST_MODE_DEFAULTS,
             'flash': self.FLASH_MODE_DEFAULTS,
         }
         if mode not in _presets:
@@ -608,7 +596,7 @@ class v60_Placer:
         _keysets = [frozenset(d) for d in _presets.values()]
         if len(set(_keysets)) != 1:
             raise AttributeError(
-                "FULL_/FAST_/FLASH_MODE_DEFAULTS key sets differ")
+                "FULL_/FLASH_MODE_DEFAULTS key sets differ")
         for _k, _v in _presets[self.mode].items():
             setattr(self, _k, _v)
 
