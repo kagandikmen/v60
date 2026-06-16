@@ -971,9 +971,27 @@ class v60_Placer:
                 legal_hop_cap=self.basin_hop_legal_cap,
                 log=self._log,
             )
-            if bh['proxy'] < cur_proxy - 1e-9:
-                self._log(f"[v60 {benchmark.name}] basin-hop ({label}) improved "
-                          f"{cur_proxy:.4f} -> {bh['proxy']:.4f}")
+            # Adoption rule. Default (legality guard off, cap==0: full/fast) is
+            # the proxy-only rule, so those modes are unchanged. When the guard
+            # is active (cap>0: flash) the engine seed can be ILLEGAL (shorter
+            # Stage 2 leaves residual overlap), and the basin-hop's re-descents
+            # reach strict legality — so PREFER a legal basin-hop result over an
+            # illegal seed even at a slightly worse proxy. Otherwise the illegal
+            # hard skeleton is frozen through soft polish (which can't fix it)
+            # and reaches the final pick (the ibm02 INVALID case). When both have
+            # the same legality, fall back to the proxy comparison.
+            bh_ov     = float(bh.get('overlap_area', float('nan')))
+            cur_legal = math.isfinite(init_ov) and init_ov <= 1e-9
+            bh_legal  = math.isfinite(bh_ov)  and bh_ov  <= 1e-9
+            if self.basin_hop_legal_cap > 0 and (bh_legal != cur_legal):
+                adopt = bh_legal               # legal beats illegal, ignore proxy
+            else:
+                adopt = bh['proxy'] < cur_proxy - 1e-9
+            if adopt:
+                why = (" (legalizing)" if (self.basin_hop_legal_cap > 0
+                                           and bh_legal and not cur_legal) else "")
+                self._log(f"[v60 {benchmark.name}] basin-hop ({label}) adopted "
+                          f"{cur_proxy:.4f} -> {bh['proxy']:.4f}{why}")
                 out_t      = benchmark.macro_positions.clone()
                 out_t[:nM] = torch.tensor(bh['pos'], dtype=out_t.dtype)
                 cur_t      = out_t
