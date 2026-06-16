@@ -177,7 +177,7 @@
    END OF TERMS AND CONDITIONS
 
    Copyright 2025 Partcl, Inc. (challenge framework, baselines, evaluation harness)
-   Copyright 2026 Kagan Dikmen (v60 submission: submissions/v60/)
+   Copyright 2026 Kagan Dikmen (v60 macro placement algorithm)
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
