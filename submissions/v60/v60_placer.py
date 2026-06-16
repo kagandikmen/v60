@@ -242,7 +242,7 @@ class v60_Placer:
         'swaps_enabled':                    True,
         'basin_hop_max_hops':               2,
         'soft_polish_restarts':             16,
-        'basin_hop_legal_cap':              0,       # guard off (unchanged behaviour)
+        'basin_hop_legal_cap':              3,       # legality safety net (inert on current suites)
     }
     FAST_MODE_DEFAULTS = {
         'num_restarts':                     32,
@@ -253,7 +253,7 @@ class v60_Placer:
         'swaps_enabled':                    True,
         'basin_hop_max_hops':               2,
         'soft_polish_restarts':             16,
-        'basin_hop_legal_cap':              0,       # guard off (unchanged behaviour)
+        'basin_hop_legal_cap':              3,       # legality safety net (inert on current suites)
     }
     # flash mode: fast mode's leaner refinement (no refinement basin-hop) PLUS
     # 16 restarts, shorter gradient descents (Stage 2 leans on the GPU basin-hop /
