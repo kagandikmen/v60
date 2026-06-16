@@ -1990,6 +1990,7 @@ def _basin_hop(run_from_init, initial, movable_idx, scale, B, rng, *,
                improve_quota: int = 3,
                min_improve_frac: float = 0.008,
                stratify: bool = True,
+               legal_hop_cap: int = 0,
                log=print):
     """
     run_from_init(init[B, n_mov, 2] float32 ndarray) -> dict with keys
@@ -2021,6 +2022,12 @@ def _basin_hop(run_from_init, initial, movable_idx, scale, B, rng, *,
         counts as a non-improving hop for `improve_quota` and the PQ push
         falls back to the smallest σ. 0.0 = legacy behaviour (any reduction
         counts). Default 0.008 (0.8%).
+    legal_hop_cap: legality guard. If, after the regular hop budget (max_hops /
+        improve_quota / final_explore) no overlap-free (legal) result was found,
+        keep perturbing the incumbent and re-descending until one appears, up to
+        this many TOTAL hops. 0 (default) disables the guard — behaviour and the
+        return value are then exactly as before. A no-op whenever a legal result
+        already exists, so it never changes a run that was already legal.
 
     Returns the best legal result if any, else the best result overall.
     """
@@ -2143,6 +2150,28 @@ def _basin_hop(run_from_init, initial, movable_idx, scale, B, rng, *,
         log_sig = sig_label if sig_label is not None else f"{sigma:.3f}"
         log(f"[basin-hop final {explored}/{final_explore_n}] sigma={log_sig} "
             f"-> proxy={res['proxy']:.4f} ovlp={res.get('overlap_area', float('nan')):.4g}")
+
+    # ── Legality guard ──────────────────────────────────────────────────────
+    # The regular budget may end without a legal (overlap-free) result — e.g.
+    # with few engine restarts the seed pool is marginal. Keep perturbing the
+    # incumbent and re-descending (Stage 2's overlap penalties tend to reach
+    # strict legality even when raw seeds can't) until one appears, capped at
+    # legal_hop_cap TOTAL hops. No-op when a legal result already exists or the
+    # cap is 0.
+    while best_legal is None and legal_hop_cap and hops < legal_hop_cap:
+        sigma = sigma_set[hops % len(sigma_set)]
+        res   = _perturb_and_run(incumbent['pos'], sigma)
+        hops += 1
+        if res.get('overlap_area', 1.0) <= 1e-9:
+            best_legal = dict(res)
+        if res['proxy'] < incumbent['proxy'] - 1e-6:
+            incumbent = dict(res)
+        log(f"[basin-hop legality {hops}/{legal_hop_cap}] sigma={sigma:.3f} "
+            f"-> proxy={res['proxy']:.4f} ovlp={res.get('overlap_area', float('nan')):.4g}"
+            f"{' LEGAL' if best_legal is not None else ''}")
+    if legal_hop_cap and best_legal is None:
+        log(f"[basin-hop] legality guard exhausted {legal_hop_cap} hops "
+            f"without an overlap-free result; returning best incumbent")
 
     out = best_legal if best_legal is not None else incumbent
     log(f"[basin-hop] done: {hops} hops + {explored} final-explore;  "

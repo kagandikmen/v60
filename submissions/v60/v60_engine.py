@@ -169,6 +169,12 @@ class v60_Engine:
         stage0_target_density:  float = 0.7,
         # ── Stage 1 / Stage 2 (defaults tuned on the ibm01 best) ───────────
         num_steps_s1          = 'auto',
+        # Multipliers on the RESOLVED Stage-1 / Stage-2 step counts (after the
+        # 'auto' ramp). 1.0 = no change; the placer's mode preset drives these
+        # (e.g. flash mode shortens the gradient descents). Applied in
+        # _resolve_num_steps_s1/s2, so a fixed num_steps is scaled too.
+        num_steps_s1_coeff: float = 1.0,
+        num_steps_s2_coeff: float = 1.0,
         lr_s1                 = 'auto',     # rescaled formula, anchored 1.15 at L=23.
         gamma_s1_start: float = 2.149,
         gamma_s1_end: float   = 0.351,
@@ -265,6 +271,8 @@ class v60_Engine:
         self.stage0_target_density  = float(stage0_target_density)
         # Stage 1 / Stage 2
         self.num_steps_s1       = num_steps_s1
+        self.num_steps_s1_coeff = float(num_steps_s1_coeff)
+        self.num_steps_s2_coeff = float(num_steps_s2_coeff)
         self.lr_s1              = lr_s1
         self.gamma_s1_start     = gamma_s1_start
         self.gamma_s1_end       = gamma_s1_end
@@ -381,9 +389,15 @@ class v60_Engine:
         ch = float(benchmark.canvas_height)
         return (cw * cw + ch * ch) ** 0.5 / (2.0 ** 0.5)
 
+    def _apply_num_steps_coeff(self, ns: int, coeff: float, src: str) -> tuple:
+        if coeff == 1.0:
+            return int(ns), src
+        return max(1, int(round(ns * coeff))), f'{src}×{coeff:g}'
+
     def _resolve_num_steps_s1(self, benchmark: Benchmark) -> tuple:
         if self.num_steps_s1 != 'auto':
-            return int(self.num_steps_s1), 'fixed'
+            return self._apply_num_steps_coeff(
+                int(self.num_steps_s1), self.num_steps_s1_coeff, 'fixed')
         L = self._canvas_L(benchmark)
         # v60 (2026-05-18): previous diagonal scaling was too aggressive on
         # larger IBM canvases. Anchor ibm01 at 5000 steps and ibm18 at ~12000.
@@ -393,7 +407,8 @@ class v60_Engine:
         # near-square (L == avg_dim), so this moves no IBM result.
         # Stage-1 ramp slightly increased beyond the pre-2026-06-09 slope.
         ns = 5000 + int(round(170.0 * max(0.0, L - 23.0)))
-        return ns, f'auto(L={L:.2f})'
+        return self._apply_num_steps_coeff(
+            ns, self.num_steps_s1_coeff, f'auto(L={L:.2f})')
 
     # v60 (2026-05-15): the lr / gamma resolvers were originally calibrated
     # for a different baseline than the ibm01-tuned fixed defaults; that's
@@ -442,7 +457,8 @@ class v60_Engine:
 
     def _resolve_num_steps_s2(self, benchmark: Benchmark) -> tuple:
         if self.num_steps_s2 != 'auto':
-            return int(self.num_steps_s2), 'fixed'
+            return self._apply_num_steps_coeff(
+                int(self.num_steps_s2), self.num_steps_s2_coeff, 'fixed')
         L = self._canvas_L(benchmark)
         # num_steps_s2 increases with L linearly above ibm01 baseline.
         # Modest slope (half the s1 cap-style bump) since s2 is the
@@ -452,7 +468,8 @@ class v60_Engine:
         # Stage-2 ramp fully restored to the pre-2026-06-09 slope.
         ns = 5000 + int(round(100.0 * max(0.0, L - 23.0)))
         ns = max(5000, ns)
-        return ns, f'auto(L={L:.2f})'
+        return self._apply_num_steps_coeff(
+            ns, self.num_steps_s2_coeff, f'auto(L={L:.2f})')
 
     def _resolve_num_clusters(self, benchmark: Benchmark) -> tuple:
         nH = int(benchmark.num_hard_macros)

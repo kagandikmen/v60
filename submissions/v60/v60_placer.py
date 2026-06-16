@@ -215,24 +215,74 @@ class v60_Placer:
     # HERE. They are NOT ctor parameters; for a one-off variant, construct the
     # placer and assign attributes afterwards (the refine_bench pattern), e.g.
     # p = v60_Placer(mode='fast'); p.num_restarts = 12.
-    # Both dicts must carry the SAME key set (checked at construction).
+    # All three dicts must carry the SAME key set (checked at construction).
+    #
+    #   num_restarts                       cohort restart count (basin lottery)
+    #   refine_basin_hop_enabled           the exact-cost refinement basin-hop
+    #   num_steps_s1_coeff / _s2_coeff     multipliers on the engine's resolved
+    #                                      Stage-1 / Stage-2 step counts
+    #   cd_polish_min_sweep_improve_frac   CD-polish per-sweep early-stop threshold
+    #   swaps_enabled                      run the hard + soft pair-swap passes
+    #   basin_hop_max_hops                 GPU basin-hop regular hop budget. 24->2
+    #                                      (2026-06-07): the GPU basin-hop rarely
+    #                                      improves past hop 2 (hop 3 is typically a
+    #                                      dup-basin hop improve_quota=1 ends on)
+    #   soft_polish_restarts               soft-only polish restart count
+    #   basin_hop_legal_cap                GPU basin-hop legality guard: if no
+    #                                      overlap-free placement is found within
+    #                                      the regular hop budget, keep hopping
+    #                                      until one is, up to this TOTAL hop
+    #                                      count (0 = guard off, behaviour as before)
     FULL_MODE_DEFAULTS = {
-        'num_restarts':             64,    # cohort restart count
-        'refine_basin_hop_enabled': True,  # refinement basin-hop on/off
+        'num_restarts':                     64,
+        'refine_basin_hop_enabled':         True,
+        'num_steps_s1_coeff':               1.0,
+        'num_steps_s2_coeff':               1.0,
+        'cd_polish_min_sweep_improve_frac': 0.001,   # 0.1% relative
+        'swaps_enabled':                    True,
+        'basin_hop_max_hops':               2,
+        'soft_polish_restarts':             16,
+        'basin_hop_legal_cap':              0,       # guard off (unchanged behaviour)
     }
     FAST_MODE_DEFAULTS = {
-        'num_restarts':             32,    # cohort restart count
-        'refine_basin_hop_enabled': False, # refinement basin-hop on/off
+        'num_restarts':                     32,
+        'refine_basin_hop_enabled':         False,
+        'num_steps_s1_coeff':               1.0,
+        'num_steps_s2_coeff':               1.0,
+        'cd_polish_min_sweep_improve_frac': 0.001,   # 0.1% relative
+        'swaps_enabled':                    True,
+        'basin_hop_max_hops':               2,
+        'soft_polish_restarts':             16,
+        'basin_hop_legal_cap':              0,       # guard off (unchanged behaviour)
+    }
+    # flash mode: fast mode's leaner refinement (no refinement basin-hop) PLUS
+    # 16 restarts, shorter gradient descents (Stage 2 leans on the GPU basin-hop /
+    # soft polish that re-run Stage 2 anyway), a single regular GPU basin-hop, a
+    # lighter soft polish, an earlier CD-polish stop, and no pair swaps (they barely
+    # move the proxy). With only 16 restarts the legality safety net leans on the
+    # GPU basin-hop, so its legality guard is on (cap 10) and can extend past the
+    # single regular hop when a legal placement hasn't been reached. Faster than
+    # fast, a little worse on proxy.
+    FLASH_MODE_DEFAULTS = {
+        'num_restarts':                     16,
+        'refine_basin_hop_enabled':         False,
+        'num_steps_s1_coeff':               0.75,
+        'num_steps_s2_coeff':               0.67,
+        'cd_polish_min_sweep_improve_frac': 0.004,   # 0.4% relative — stop CD sooner
+        'swaps_enabled':                    False,
+        'basin_hop_max_hops':               1,       # one regular hop (guard may add more)
+        'soft_polish_restarts':             8,
+        'basin_hop_legal_cap':              10,      # hop until legal, up to 10 total hops
     }
 
     def __init__(
         self,
         # ── Pipeline mode ──────────────────────────────────────────────────
         # 'full' (default): the complete pipeline. 'fast': the full pipeline
-        # minus the refinement basin-hop, with 32 restarts. The mode-owned
-        # knobs (restart count, refinement basin-hop on/off) live in
-        # FULL_MODE_DEFAULTS / FAST_MODE_DEFAULTS above — they are not ctor
-        # parameters.
+        # minus the refinement basin-hop, with 32 restarts. 'flash': fast plus
+        # shorter Stage-1/2 descents, an earlier CD stop, and no pair swaps —
+        # the quickest, slightly worse on proxy. The mode-owned knobs live in
+        # FULL_/FAST_/FLASH_MODE_DEFAULTS above — they are not ctor parameters.
         mode: str = 'full',
 
         # ── Common runtime ────────────────────────────────────────────────
@@ -306,10 +356,7 @@ class v60_Placer:
         #   - B per hop is small (8) so the freed wall-time goes to more hop
         #     attempts (higher max_hops / final_explore).
         basin_hop:                  bool  = True,
-        basin_hop_max_hops:         int   = 2,    # 24->2 (2026-06-07): empirically the
-                                                  # GPU basin-hop rarely improves past hop 2
-                                                  # (hop 3 is typically a dup-basin under-
-                                                  # threshold hop that improve_quota=1 ends on)
+        # basin_hop_max_hops is mode-owned (see the *_MODE_DEFAULTS dicts).
         basin_hop_final_explore:    int   = 0,
         basin_hop_sigma_set                = (0.015, 0.025, 0.035),  # productive band only
         basin_hop_tabu_eps:         float = 0.01,                    # spatial: mean macro disp / scale
@@ -324,7 +371,7 @@ class v60_Placer:
         basin_hop_restarts:         int   = 8,                       # small B per hop + more hops
         # -- v60 soft-only polish -------------------------------------------------
         soft_polish_enabled: bool = True,
-        soft_polish_restarts: int = 16,
+        # soft_polish_restarts is mode-owned (see the *_MODE_DEFAULTS dicts).
         # The L-driven knobs default to 'auto' -> resolved per-benchmark from the
         # canvas size in _resolve_soft_polish (see the v60 Optuna sweep re-fit).
         # An explicit number/tuple still overrides 'auto' (used by the sweep).
@@ -352,9 +399,10 @@ class v60_Placer:
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
         # Early-stop a CD run once a full sweep reduces the proxy by less than
-        # this fraction of the pre-sweep proxy. Complements patience: patience
-        # catches "no moves at all", this catches "moves that barely help".
-        cd_polish_min_sweep_improve_frac: float = 0.001,   # 0.1% relative
+        # `cd_polish_min_sweep_improve_frac` of the pre-sweep proxy. Complements
+        # patience: patience catches "no moves at all", this catches "moves that
+        # barely help". This threshold is a MODE-OWNED knob (see the
+        # *_MODE_DEFAULTS dicts above), not a ctor parameter.
         cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
         cd_polish_verbose: bool = True,
         # CD per-macro candidate scoring is parallelised across a fork pool of
@@ -477,7 +525,7 @@ class v60_Placer:
         self.deterministic = deterministic
         self.seed          = seed
         self.basin_hop                = bool(basin_hop)
-        self.basin_hop_max_hops       = int(basin_hop_max_hops)
+        # self.basin_hop_max_hops is mode-owned (set by the mode preset below).
         self.basin_hop_final_explore  = int(basin_hop_final_explore)
         self.basin_hop_sigma_set      = tuple(float(s) for s in basin_hop_sigma_set)
         self.basin_hop_tabu_eps       = float(basin_hop_tabu_eps)
@@ -487,7 +535,7 @@ class v60_Placer:
         self.basin_hop_stratify       = bool(basin_hop_stratify)
         self.basin_hop_restarts       = int(basin_hop_restarts)
         self.soft_polish_enabled = bool(soft_polish_enabled)
-        self.soft_polish_restarts = int(soft_polish_restarts)
+        # self.soft_polish_restarts is mode-owned (set by the mode preset below).
         # 'auto' kept as-is; explicit values coerced. Resolved in _resolve_soft_polish.
         self.soft_polish_steps = soft_polish_steps if soft_polish_steps == 'auto' else int(soft_polish_steps)
         self.soft_polish_lr = soft_polish_lr if soft_polish_lr == 'auto' else float(soft_polish_lr)
@@ -509,7 +557,8 @@ class v60_Placer:
         self.cd_polish_num_directions = max(1, int(cd_polish_num_directions))
         self.cd_polish_min_improve = float(cd_polish_min_improve)
         self.cd_polish_patience    = int(cd_polish_patience)
-        self.cd_polish_min_sweep_improve_frac = float(cd_polish_min_sweep_improve_frac)
+        # self.cd_polish_min_sweep_improve_frac is mode-owned (set by the mode
+        # preset at the end of __init__).
         self.cd_polish_include_hard = bool(cd_polish_include_hard)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
         if cd_polish_parallel_workers == 'auto':
@@ -542,20 +591,25 @@ class v60_Placer:
         self.post_stage2_cpu_max_workers = post_stage2_cpu_max_workers
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
 
-        # Mode preset: the active mode's dict (FULL_MODE_DEFAULTS /
-        # FAST_MODE_DEFAULTS at the top of the class) owns its knobs outright
-        # — they are not ctor parameters; tweak a constructed instance via
-        # attribute assignment instead. The key-set equality check makes a
-        # typo'd key in either hand-edited dict fail loudly.
-        if mode not in ('full', 'fast'):
-            raise ValueError(f"mode must be 'full' or 'fast', got {mode!r}")
+        # Mode preset: the active mode's dict (FULL_/FAST_/FLASH_MODE_DEFAULTS
+        # at the top of the class) owns its knobs outright — they are not ctor
+        # parameters; tweak a constructed instance via attribute assignment
+        # instead. The key-set equality check makes a typo'd key in any
+        # hand-edited dict fail loudly.
+        _presets = {
+            'full':  self.FULL_MODE_DEFAULTS,
+            'fast':  self.FAST_MODE_DEFAULTS,
+            'flash': self.FLASH_MODE_DEFAULTS,
+        }
+        if mode not in _presets:
+            raise ValueError(
+                f"mode must be one of {sorted(_presets)}, got {mode!r}")
         self.mode = str(mode)
-        if set(self.FULL_MODE_DEFAULTS) != set(self.FAST_MODE_DEFAULTS):
+        _keysets = [frozenset(d) for d in _presets.values()]
+        if len(set(_keysets)) != 1:
             raise AttributeError(
-                "FULL_MODE_DEFAULTS and FAST_MODE_DEFAULTS key sets differ")
-        preset = (self.FAST_MODE_DEFAULTS if self.mode == 'fast'
-                  else self.FULL_MODE_DEFAULTS)
-        for _k, _v in preset.items():
+                "FULL_/FAST_/FLASH_MODE_DEFAULTS key sets differ")
+        for _k, _v in _presets[self.mode].items():
             setattr(self, _k, _v)
 
     def _log(self, msg):
@@ -644,6 +698,8 @@ class v60_Placer:
     def _make_cohort(self, cls, num_restarts):
         return cls(
             num_restarts              = num_restarts,
+            num_steps_s1_coeff        = self.num_steps_s1_coeff,
+            num_steps_s2_coeff        = self.num_steps_s2_coeff,
             num_clusters              = self.num_clusters,
             cluster_jitter_frac       = self.cluster_jitter_frac,
             cluster_margin_frac       = self.cluster_margin_frac,
@@ -912,6 +968,7 @@ class v60_Placer:
                 improve_quota=self.basin_hop_improve_quota,
                 min_improve_frac=self.basin_hop_min_improve_frac,
                 stratify=self.basin_hop_stratify,
+                legal_hop_cap=self.basin_hop_legal_cap,
                 log=self._log,
             )
             if bh['proxy'] < cur_proxy - 1e-9:
@@ -966,7 +1023,7 @@ class v60_Placer:
                 best_proxy = float(cd_costs['proxy_cost'])
                 best_tag   = f"{best_tag}+cd"
 
-        if (self.pair_swap_enabled and best_pos is not None
+        if (self.swaps_enabled and self.pair_swap_enabled and best_pos is not None
                 and math.isfinite(best_proxy) and plc is not None):
             ps_out, ps_costs = self._pair_swap_polish(best_pos, benchmark, plc)
             if ps_costs is not None and float(ps_costs['proxy_cost']) < best_proxy - 1e-9:
@@ -974,7 +1031,7 @@ class v60_Placer:
                 best_proxy = float(ps_costs['proxy_cost'])
                 best_tag   = f"{best_tag}+swap"
 
-        if (self.soft_pair_swap_enabled and best_pos is not None
+        if (self.swaps_enabled and self.soft_pair_swap_enabled and best_pos is not None
                 and math.isfinite(best_proxy) and plc is not None):
             sps_out, sps_costs = self._pair_swap_polish_soft(best_pos, benchmark, plc)
             if sps_costs is not None and float(sps_costs['proxy_cost']) < best_proxy - 1e-9:
@@ -1052,10 +1109,10 @@ class v60_Placer:
              '+cd', self.cd_polish_enabled, cd_workers > 1),
             ('pair-swap',
              lambda pos: self._pair_swap_polish(pos, benchmark, plc),
-             '+swap', self.pair_swap_enabled, False),
+             '+swap', self.swaps_enabled and self.pair_swap_enabled, False),
             ('soft-pair-swap',
              lambda pos: self._pair_swap_polish_soft(pos, benchmark, plc),
-             '+softswap', self.soft_pair_swap_enabled, False),
+             '+softswap', self.swaps_enabled and self.soft_pair_swap_enabled, False),
         ]
         for label, fn, suffix, enabled, inner_pool in stages:
             if enabled:
