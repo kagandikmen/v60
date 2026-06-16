@@ -12,7 +12,7 @@ v60 was originally built for the [Partcl/HRT Macro Placement Challenge 2026](htt
 
 Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which contains no macros), v60 reaches an average proxy cost of 0.8946 in full mode and 0.9379 in flash mode, with no macro overlaps on any design.
 
-| Benchmark | Full mode proxy | Flash mode proxy | SA | RePlAce | Full mode runtime | Flash mode runtime |
+| Benchmark | Full mode proxy | Flash mode proxy | SA proxy | RePlAce proxy | Full mode runtime | Flash mode runtime |
 |-----------|-----------:|-----------:|-------:|--------:|-------------:|-------------:|
 | ibm01 | 0.7354 | 0.7484 | 1.3166 | 0.9976 | 550 s | 240 s |
 | ibm02 | 0.8855 | 0.9263 | 1.9072 | 1.8370 | 1340 s | 310 s |
@@ -33,11 +33,11 @@ Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which con
 | ibm18 | 1.0358 | 1.1157 | 2.7755 | 1.7722 | 3460 s | 700 s |
 | **Average** | **0.8946** | **0.9379** | 2.1251 | 1.4578 | **3000 s** | **640 s** |
 
-*\*Run with `deterministic=True` on an NVIDIA RTX 6000 Ada (48 GB) paired with an AMD EPYC 75F3, using Python 3.11.10, PyTorch 2.10.0+cu128 (CUDA 12.8, cuDNN 9.10.02), and NVIDIA driver 550.127.05.*
+*Run with `deterministic=True` on an NVIDIA RTX 6000 Ada (48 GB) paired with an AMD EPYC 75F3, using Python 3.11.10, PyTorch 2.10.0+cu128 (CUDA 12.8, cuDNN 9.10.02), and NVIDIA driver 550.127.05.*
+
+*The SA and RePlAce baselines are the published results reported in [An Updated Assessment of Reinforcement Learning for Macro Placement](https://doi.org/10.1109/TCAD.2025.3644293).*
 
 Set `deterministic=True` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) to exactly reproduce this table, in case you are operating on the same HW/SW stack. The default (non-deterministic) setting is faster and lands within the same run-to-run noise margin. Running on different hardware should still land you within the same noise margin (at least in the final average) but be aware that runtime will most likely differ. Running without a GPU is not recommended as it drastically increases the runtime.
-
-The SA and RePlAce baselines are the published results reported in [*An Updated Assessment of Reinforcement Learning for Macro Placement*](https://doi.org/10.1109/TCAD.2025.3644293).
 
 ## Quick Start
 
@@ -112,12 +112,14 @@ After the Gaussian perturbation, the algorithm re-runs coordinate descent over t
 
 The final basin-hop is not run in flash mode due to its runtime-heavy nature.
 
-## Full mode vs. flash mode
+## Full Mode vs. Flash Mode
 
 v60 can run in two modes:
 
 - Full mode: runs the entire pipeline with the aim of achieving the lowest proxy cost. This is the default mode.
 - Flash mode: only runs the highest-ROI stages of the pipeline. This includes dropping the refinement basin-hop and both pair-swap passes, running 16 restarts instead of 64 with shorter Stage 1 and Stage 2 descents, a single GPU basin-hop instead of two, a lighter soft-only polish, and an earlier coordinate-descent stop. Trades some proxy for a significantly better runtime.
+
+Here is a table summarizing which mode runs what at any stage of the pipeline:
 
 | Stage | Full | Flash |
 |-------|:----:|:----:|
