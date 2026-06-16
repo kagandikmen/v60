@@ -233,7 +233,7 @@ class v60_Placer:
         # knobs (restart count, refinement basin-hop on/off) live in
         # FULL_MODE_DEFAULTS / FAST_MODE_DEFAULTS above — they are not ctor
         # parameters.
-        mode: str = 'fast',
+        mode: str = 'full',
 
         # ── Common runtime ────────────────────────────────────────────────
         plc_root: str = "external/MacroPlacement/Testcases/ICCAD04",
