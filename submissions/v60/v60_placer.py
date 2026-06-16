@@ -210,11 +210,101 @@ class v60_Placer:
     embedding (see v60_engine.py).
     """
 
+    # Mode-owned knobs. The active mode's dict is applied at the end of
+    # __init__ and is the single source of truth for these values: EDIT THEM
+    # HERE. They are NOT ctor parameters; for a one-off variant, construct the
+    # placer and assign attributes afterwards (the refine_bench pattern), e.g.
+    # p = v60_Placer(mode='flash'); p.num_restarts = 12.
+    # Both dicts must carry the SAME key set (checked at construction).
+    #
+    #   num_restarts                       cohort restart count (basin lottery)
+    #   refine_basin_hop_enabled           the exact-cost refinement basin-hop
+    #   num_steps_s1_coeff / _s2_coeff     multipliers on the engine's resolved
+    #                                      Stage-1 / Stage-2 step counts
+    #   cd_polish_min_sweep_improve_frac   CD-polish per-sweep early-stop threshold
+    #   swaps_enabled                      run the hard + soft pair-swap passes
+    #   basin_hop_max_hops                 GPU basin-hop regular hop budget. 24->2
+    #                                      (2026-06-07): the GPU basin-hop rarely
+    #                                      improves past hop 2 (hop 3 is typically a
+    #                                      dup-basin hop improve_quota=1 ends on)
+    #   soft_polish_restarts               soft-only polish restart count
+    #   basin_hop_legal_cap                GPU basin-hop legality guard: if no
+    #                                      overlap-free placement is found within
+    #                                      the regular hop budget, keep hopping
+    #                                      until one is, up to this TOTAL hop
+    #                                      count (0 = guard off, behaviour as before)
+    FULL_MODE_DEFAULTS = {
+        'num_restarts':                     64,
+        'refine_basin_hop_enabled':         True,
+        'num_steps_s1_coeff':               1.0,
+        'num_steps_s2_coeff':               1.0,
+        'cd_polish_min_sweep_improve_frac': 0.001,   # 0.1% relative
+        'swaps_enabled':                    True,
+        'basin_hop_max_hops':               2,
+        'soft_polish_restarts':             16,
+        'basin_hop_legal_cap':              3,       # legality safety net (inert on current suites)
+    }
+    # flash mode: the fastest pipeline — full minus the refinement basin-hop and
+    # the pair swaps, with 16 restarts, shorter gradient descents (s1×0.75, s2×0.67;
+    # Stage 2 leans on the GPU basin-hop / soft polish that re-run Stage 2 anyway), a
+    # single regular GPU basin-hop, a lighter soft polish, and an earlier CD-polish
+    # stop. With only 16 restarts the legality safety net leans on the GPU basin-hop,
+    # so its legality guard cap is higher (10) and can extend past the single regular
+    # hop when a legal placement hasn't been reached. Faster than full, a little
+    # worse on proxy.
+    FLASH_MODE_DEFAULTS = {
+        'num_restarts':                     16,
+        'refine_basin_hop_enabled':         False,
+        'num_steps_s1_coeff':               0.75,
+        'num_steps_s2_coeff':               0.67,
+        'cd_polish_min_sweep_improve_frac': 0.004,   # 0.4% relative — stop CD sooner
+        'swaps_enabled':                    False,
+        'basin_hop_max_hops':               1,       # one regular hop (guard may add more)
+        'soft_polish_restarts':             8,
+        'basin_hop_legal_cap':              10,      # hop until legal, up to 10 total hops
+    }
+
     def __init__(
         self,
-        # ── Restart count for the cohort ──────────────────────────────────
-        num_restarts: int = 64,
+        # ── Pipeline mode ──────────────────────────────────────────────────
+        # 'full' (default): the complete pipeline. 'flash': the fastest pipeline —
+        # full minus the refinement basin-hop and pair swaps, with 16 restarts,
+        # shorter Stage-1/2 descents, and an earlier CD stop — slightly worse on
+        # proxy. The mode-owned knobs live in FULL_/FLASH_MODE_DEFAULTS above —
+        # they are not ctor parameters.
+        mode: str = 'full',
 
+        # ── Common runtime ────────────────────────────────────────────────
+        plc_root: str = "external/MacroPlacement/Testcases/ICCAD04",
+        device: str   = 'auto',
+        verbose: bool = True,
+        deterministic: bool = False,   # production default: keep TF32 / fast kernels on
+        seed: int           = 0,
+
+        # -- v60 multi-candidate post-Stage-2 refinement -----------------------
+        # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
+        # winner, with separate widths for the (expensive, GPU) and (cheap,
+        # parallelizable, CPU) halves:
+        #   - post_stage2_n_gpu: how many top engine seeds get the GPU side
+        #     (basin-hop + soft polish). Each is runtime-heavy, so keep small.
+        #   - post_stage2_n_cpu: how many legal candidates from the pooled GPU
+        #     output get the CPU side (CD + pair-swap + soft-pair-swap). The
+        #     GPU stages emit their top legal candidates (soft-polish restarts +
+        #     basin-hop incumbents); the global top-n_cpu of that pool are
+        #     polished, and the best final wins. CPU side is ~independent per
+        #     candidate, so this widens cheaply (parallel) for little runtime.
+        # Defaults (1, 1) reproduce the original single-winner pipeline exactly.
+        post_stage2_n_gpu: int = 1,
+        post_stage2_n_cpu: int = 8,
+        # Run the n_cpu CPU-downstream chains in parallel processes (GIL makes
+        # threads useless for the Python-bound CD/swap loops). Falls back to a
+        # sequential loop if the pool can't be created. max_workers caps the
+        # process count ('auto' = min(n_cpu, os.cpu_count())).
+        post_stage2_cpu_parallel: bool = True,
+        post_stage2_cpu_max_workers = 'auto',
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Everything below is per-stage tuning, in pipeline order.
         # ── Multi-level config ─────────────────────────────────────────────
         num_clusters             = 'auto',
         cluster_jitter_frac: float = 0.30,
@@ -238,12 +328,6 @@ class v60_Placer:
         cong_eval_interval_tiers_s1: tuple = (1, 2, 2, 3, 4),
         cong_eval_interval_tiers_s2: tuple = (1, 2, 3, 4, 5),
 
-        # ── Common runtime ────────────────────────────────────────────────
-        plc_root: str = "external/MacroPlacement/Testcases/ICCAD04",
-        device: str   = 'auto',
-        verbose: bool = True,
-        deterministic: bool = False,   # production default: keep TF32 / fast kernels on
-        seed: int           = 0,
         # ── Basin-hopping wrapper (v60). After the cohort run, perturb
         # the running-best placement and re-run Stage 2 from it, with a
         # promising-seed priority queue + visited-basin tabu list (see
@@ -261,10 +345,7 @@ class v60_Placer:
         #   - B per hop is small (8) so the freed wall-time goes to more hop
         #     attempts (higher max_hops / final_explore).
         basin_hop:                  bool  = True,
-        basin_hop_max_hops:         int   = 2,    # 24->2 (2026-06-07): empirically the
-                                                  # GPU basin-hop rarely improves past hop 2
-                                                  # (hop 3 is typically a dup-basin under-
-                                                  # threshold hop that improve_quota=1 ends on)
+        # basin_hop_max_hops is mode-owned (see the *_MODE_DEFAULTS dicts).
         basin_hop_final_explore:    int   = 0,
         basin_hop_sigma_set                = (0.015, 0.025, 0.035),  # productive band only
         basin_hop_tabu_eps:         float = 0.01,                    # spatial: mean macro disp / scale
@@ -279,7 +360,7 @@ class v60_Placer:
         basin_hop_restarts:         int   = 8,                       # small B per hop + more hops
         # -- v60 soft-only polish -------------------------------------------------
         soft_polish_enabled: bool = True,
-        soft_polish_restarts: int = 16,
+        # soft_polish_restarts is mode-owned (see the *_MODE_DEFAULTS dicts).
         # The L-driven knobs default to 'auto' -> resolved per-benchmark from the
         # canvas size in _resolve_soft_polish (see the v60 Optuna sweep re-fit).
         # An explicit number/tuple still overrides 'auto' (used by the sweep).
@@ -307,9 +388,10 @@ class v60_Placer:
         cd_polish_min_improve: float = 1e-7,      # absolute proxy improvement to accept a move
         cd_polish_patience: int = 2,              # stop after this many consecutive zero-move sweeps
         # Early-stop a CD run once a full sweep reduces the proxy by less than
-        # this fraction of the pre-sweep proxy. Complements patience: patience
-        # catches "no moves at all", this catches "moves that barely help".
-        cd_polish_min_sweep_improve_frac: float = 0.001,   # 0.1% relative
+        # `cd_polish_min_sweep_improve_frac` of the pre-sweep proxy. Complements
+        # patience: patience catches "no moves at all", this catches "moves that
+        # barely help". This threshold is a MODE-OWNED knob (see the
+        # *_MODE_DEFAULTS dicts above), not a ctor parameter.
         cd_polish_include_hard: bool = True,      # also move hard macros (with overlap legality check)
         cd_polish_verbose: bool = True,
         # CD per-macro candidate scoring is parallelised across a fork pool of
@@ -360,7 +442,6 @@ class v60_Placer:
         # (ibm01≈0.020, ibm10≈0.024, ibm06≈0.048) — so each hop fans the σ-set out
         # in parallel (one CD re-descent per σ) and greedily keeps the best, which
         # adapts the kick to the design AND anneals coarse→fine across the descent.
-        refine_basin_hop_enabled: bool = True,
         refine_basin_hop_hops: int = 10,       # CEILING, not a fixed count (4->10 2026-06-10):
                                                # the min_improve_frac early-stop below ends the
                                                # loop per-design, so designs still descending at
@@ -397,27 +478,6 @@ class v60_Placer:
         # win is the SPREAD, not the wires per se (a 60-macro cap is the count sweet spot;
         # jiggling all soft macros overshoots and every hop is rejected).
         refine_basin_hop_kick_mode: str = 'netcause',
-        # -- v60 multi-candidate post-Stage-2 refinement -----------------------
-        # Run the post-Stage-2 pipeline for the top-N engine seeds, not just the
-        # winner, with separate widths for the (expensive, GPU) and (cheap,
-        # parallelizable, CPU) halves:
-        #   - post_stage2_n_gpu: how many top engine seeds get the GPU side
-        #     (basin-hop + soft polish). Each is runtime-heavy, so keep small.
-        #   - post_stage2_n_cpu: how many legal candidates from the pooled GPU
-        #     output get the CPU side (CD + pair-swap + soft-pair-swap). The
-        #     GPU stages emit their top legal candidates (soft-polish restarts +
-        #     basin-hop incumbents); the global top-n_cpu of that pool are
-        #     polished, and the best final wins. CPU side is ~independent per
-        #     candidate, so this widens cheaply (parallel) for little runtime.
-        # Defaults (1, 1) reproduce the original single-winner pipeline exactly.
-        post_stage2_n_gpu: int = 1,
-        post_stage2_n_cpu: int = 8,
-        # Run the n_cpu CPU-downstream chains in parallel processes (GIL makes
-        # threads useless for the Python-bound CD/swap loops). Falls back to a
-        # sequential loop if the pool can't be created. max_workers caps the
-        # process count ('auto' = min(n_cpu, os.cpu_count())).
-        post_stage2_cpu_parallel: bool = True,
-        post_stage2_cpu_max_workers = 'auto',
         # -- Stage 2 seed picker overlap tolerance ------------------------------
         # Threshold = ratio * median(hard_macro_area), floored at 1e-9.
         # ratio=0 → strict (legal-only). ratio=0.1 lets seeds with up to ~10%
@@ -426,7 +486,6 @@ class v60_Placer:
         # polish, CD) then have a chance to legalize the residual.
         stage2_overlap_tol_ratio: float = 0.5,
     ):
-        self.num_restarts = int(num_restarts)
         self.num_clusters         = num_clusters
         self.cluster_jitter_frac  = float(cluster_jitter_frac)
         self.cluster_margin_frac  = float(cluster_margin_frac)
@@ -455,7 +514,7 @@ class v60_Placer:
         self.deterministic = deterministic
         self.seed          = seed
         self.basin_hop                = bool(basin_hop)
-        self.basin_hop_max_hops       = int(basin_hop_max_hops)
+        # self.basin_hop_max_hops is mode-owned (set by the mode preset below).
         self.basin_hop_final_explore  = int(basin_hop_final_explore)
         self.basin_hop_sigma_set      = tuple(float(s) for s in basin_hop_sigma_set)
         self.basin_hop_tabu_eps       = float(basin_hop_tabu_eps)
@@ -465,7 +524,7 @@ class v60_Placer:
         self.basin_hop_stratify       = bool(basin_hop_stratify)
         self.basin_hop_restarts       = int(basin_hop_restarts)
         self.soft_polish_enabled = bool(soft_polish_enabled)
-        self.soft_polish_restarts = int(soft_polish_restarts)
+        # self.soft_polish_restarts is mode-owned (set by the mode preset below).
         # 'auto' kept as-is; explicit values coerced. Resolved in _resolve_soft_polish.
         self.soft_polish_steps = soft_polish_steps if soft_polish_steps == 'auto' else int(soft_polish_steps)
         self.soft_polish_lr = soft_polish_lr if soft_polish_lr == 'auto' else float(soft_polish_lr)
@@ -487,7 +546,8 @@ class v60_Placer:
         self.cd_polish_num_directions = max(1, int(cd_polish_num_directions))
         self.cd_polish_min_improve = float(cd_polish_min_improve)
         self.cd_polish_patience    = int(cd_polish_patience)
-        self.cd_polish_min_sweep_improve_frac = float(cd_polish_min_sweep_improve_frac)
+        # self.cd_polish_min_sweep_improve_frac is mode-owned (set by the mode
+        # preset at the end of __init__).
         self.cd_polish_include_hard = bool(cd_polish_include_hard)
         self.cd_polish_verbose    = bool(cd_polish_verbose)
         if cd_polish_parallel_workers == 'auto':
@@ -507,7 +567,6 @@ class v60_Placer:
         self.soft_pair_swap_min_improve    = float(soft_pair_swap_min_improve)
         self.soft_pair_swap_patience       = int(soft_pair_swap_patience)
         self.soft_pair_swap_verbose        = bool(soft_pair_swap_verbose)
-        self.refine_basin_hop_enabled    = bool(refine_basin_hop_enabled)
         self.refine_basin_hop_hops       = int(refine_basin_hop_hops)
         self.refine_basin_hop_min_improve_frac = float(refine_basin_hop_min_improve_frac)
         self.refine_basin_hop_sigma_set  = tuple(float(s) for s in refine_basin_hop_sigma_set)
@@ -520,6 +579,26 @@ class v60_Placer:
         self.post_stage2_cpu_parallel = bool(post_stage2_cpu_parallel)
         self.post_stage2_cpu_max_workers = post_stage2_cpu_max_workers
         self.stage2_overlap_tol_ratio = float(stage2_overlap_tol_ratio)
+
+        # Mode preset: the active mode's dict (FULL_/FLASH_MODE_DEFAULTS at the
+        # top of the class) owns its knobs outright — they are not ctor
+        # parameters; tweak a constructed instance via attribute assignment
+        # instead. The key-set equality check makes a typo'd key in either
+        # hand-edited dict fail loudly.
+        _presets = {
+            'full':  self.FULL_MODE_DEFAULTS,
+            'flash': self.FLASH_MODE_DEFAULTS,
+        }
+        if mode not in _presets:
+            raise ValueError(
+                f"mode must be one of {sorted(_presets)}, got {mode!r}")
+        self.mode = str(mode)
+        _keysets = [frozenset(d) for d in _presets.values()]
+        if len(set(_keysets)) != 1:
+            raise AttributeError(
+                "FULL_/FLASH_MODE_DEFAULTS key sets differ")
+        for _k, _v in _presets[self.mode].items():
+            setattr(self, _k, _v)
 
     def _log(self, msg):
         if self.verbose:
@@ -559,9 +638,28 @@ class v60_Placer:
     def _proxy_and_overlap(self, pos: torch.Tensor, benchmark: Benchmark,
                            plc: PlacementCost) -> tuple:
         """Return (proxy_cost, total_overlap_area). Overlap is NaN on failure
-        so the caller's legality test (overlap <= 1e-9) treats it as illegal."""
+        so the caller's legality test (overlap <= 1e-9) treats it as illegal.
+
+        Scored with a one-shot IncrementalEval (bit-exact to the PLC scorer
+        to ~1e-7, sub-second after setup vs the pure-Python PLC router's
+        tens of seconds on big designs — the abdbc04/dff5616 seed-ranking
+        pattern) plus the pairwise hard AABB area from _total_overlap (the
+        same metric the engine's legal pick reads). Falls back to
+        compute_proxy_cost if the IncrementalEval setup fails."""
         nM  = int(benchmark.num_macros)
+        nH  = int(benchmark.num_hard_macros)
         sub = pos[:nM] if pos.shape[0] > nM else pos
+        try:
+            pos_np = sub.detach().cpu().numpy().astype(np.float64)
+            e = IncrementalEval(benchmark, plc=plc)
+            e.set_placement(pos_np)
+            pr = float(e.proxy(include_cong=True))
+            half = benchmark.macro_sizes.numpy().astype(np.float64) * 0.5
+            ov = float(_total_overlap(pos_np, nH, half[:nH, 0], half[:nH, 1]))
+            return pr, ov
+        except Exception as exc:
+            self._log(f"  IncrementalEval scoring failed ({exc}); "
+                      f"falling back to PLC")
         try:
             costs = compute_proxy_cost(sub.to(torch.float32), benchmark, plc)
             return (float(costs['proxy_cost']),
@@ -588,6 +686,8 @@ class v60_Placer:
     def _make_cohort(self, cls, num_restarts):
         return cls(
             num_restarts              = num_restarts,
+            num_steps_s1_coeff        = self.num_steps_s1_coeff,
+            num_steps_s2_coeff        = self.num_steps_s2_coeff,
             num_clusters              = self.num_clusters,
             cluster_jitter_frac       = self.cluster_jitter_frac,
             cluster_margin_frac       = self.cluster_margin_frac,
@@ -856,11 +956,30 @@ class v60_Placer:
                 improve_quota=self.basin_hop_improve_quota,
                 min_improve_frac=self.basin_hop_min_improve_frac,
                 stratify=self.basin_hop_stratify,
+                legal_hop_cap=self.basin_hop_legal_cap,
                 log=self._log,
             )
-            if bh['proxy'] < cur_proxy - 1e-9:
-                self._log(f"[v60 {benchmark.name}] basin-hop ({label}) improved "
-                          f"{cur_proxy:.4f} -> {bh['proxy']:.4f}")
+            # Adoption rule. Default (legality guard off, cap==0: full/fast) is
+            # the proxy-only rule, so those modes are unchanged. When the guard
+            # is active (cap>0: flash) the engine seed can be ILLEGAL (shorter
+            # Stage 2 leaves residual overlap), and the basin-hop's re-descents
+            # reach strict legality — so PREFER a legal basin-hop result over an
+            # illegal seed even at a slightly worse proxy. Otherwise the illegal
+            # hard skeleton is frozen through soft polish (which can't fix it)
+            # and reaches the final pick (the ibm02 INVALID case). When both have
+            # the same legality, fall back to the proxy comparison.
+            bh_ov     = float(bh.get('overlap_area', float('nan')))
+            cur_legal = math.isfinite(init_ov) and init_ov <= 1e-9
+            bh_legal  = math.isfinite(bh_ov)  and bh_ov  <= 1e-9
+            if self.basin_hop_legal_cap > 0 and (bh_legal != cur_legal):
+                adopt = bh_legal               # legal beats illegal, ignore proxy
+            else:
+                adopt = bh['proxy'] < cur_proxy - 1e-9
+            if adopt:
+                why = (" (legalizing)" if (self.basin_hop_legal_cap > 0
+                                           and bh_legal and not cur_legal) else "")
+                self._log(f"[v60 {benchmark.name}] basin-hop ({label}) adopted "
+                          f"{cur_proxy:.4f} -> {bh['proxy']:.4f}{why}")
                 out_t      = benchmark.macro_positions.clone()
                 out_t[:nM] = torch.tensor(bh['pos'], dtype=out_t.dtype)
                 cur_t      = out_t
@@ -910,7 +1029,7 @@ class v60_Placer:
                 best_proxy = float(cd_costs['proxy_cost'])
                 best_tag   = f"{best_tag}+cd"
 
-        if (self.pair_swap_enabled and best_pos is not None
+        if (self.swaps_enabled and self.pair_swap_enabled and best_pos is not None
                 and math.isfinite(best_proxy) and plc is not None):
             ps_out, ps_costs = self._pair_swap_polish(best_pos, benchmark, plc)
             if ps_costs is not None and float(ps_costs['proxy_cost']) < best_proxy - 1e-9:
@@ -918,7 +1037,7 @@ class v60_Placer:
                 best_proxy = float(ps_costs['proxy_cost'])
                 best_tag   = f"{best_tag}+swap"
 
-        if (self.soft_pair_swap_enabled and best_pos is not None
+        if (self.swaps_enabled and self.soft_pair_swap_enabled and best_pos is not None
                 and math.isfinite(best_proxy) and plc is not None):
             sps_out, sps_costs = self._pair_swap_polish_soft(best_pos, benchmark, plc)
             if sps_costs is not None and float(sps_costs['proxy_cost']) < best_proxy - 1e-9:
@@ -996,10 +1115,10 @@ class v60_Placer:
              '+cd', self.cd_polish_enabled, cd_workers > 1),
             ('pair-swap',
              lambda pos: self._pair_swap_polish(pos, benchmark, plc),
-             '+swap', self.pair_swap_enabled, False),
+             '+swap', self.swaps_enabled and self.pair_swap_enabled, False),
             ('soft-pair-swap',
              lambda pos: self._pair_swap_polish_soft(pos, benchmark, plc),
-             '+softswap', self.soft_pair_swap_enabled, False),
+             '+softswap', self.swaps_enabled and self.soft_pair_swap_enabled, False),
         ]
         for label, fn, suffix, enabled, inner_pool in stages:
             if enabled:
