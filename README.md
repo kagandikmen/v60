@@ -4,36 +4,38 @@
 
 Macro placement sits at the very front of a digital VLSI design flow: before standard cells can be placed and routed, the large macros (memories, custom blocks) have to be positioned on the die. Their placement disproportionately drives the quality of everything downstream, and the search space is large, near-discrete (hard macros must not overlap), and full of local minima — so the problem has long been a target for both classical analytical placers and more recent learning-based approaches.
 
+v60 can be configured to run in one of two available modes: full mode and fast mode. In full mode, the entire pipeline is run to achieve the lowest possible proxy cost; whereas in fast mode, the final refinement pass is skipped and the number of restarts is halved, sacrificing a little proxy for a noticeably shorter runtime.
+
 v60 was originally built for the [Partcl/HRT Macro Placement Challenge 2026](https://github.com/partcleda/macro-place-challenge-2026). v60 lives in [`submissions/v60/`](submissions/v60/), whereas the rest of the repository simply mirrors the challenge repository.
 
-## Results*
+## Results
 
-Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which contains no macros and is excluded by the challenge), v60 reaches an average proxy cost of 0.8946 with no macro overlaps on any design.
+Across the 17 ICCAD04 IBM benchmarks (the 18-design suite minus ibm05, which contains no macros and is excluded by the challenge), v60 reaches an average proxy cost of 0.8946 in full mode and 0.9435 in fast mode, with no macro overlaps on any design.
 
-| Benchmark | v60 proxy | SA | RePlAce | vs SA | vs RePlAce | Overlaps | Runtime |
-|-----------|----------:|-------:|--------:|------:|-----------:|:--------:|--------:|
-| ibm01 | 0.7354 | 1.3166 | 0.9976 | +44.1% | +26.3% | 0 | 550 s |
-| ibm02 | 0.8855 | 1.9072 | 1.8370 | +53.6% | +51.8% | 0 | 1340 s |
-| ibm03 | 0.8178 | 1.7401 | 1.3222 | +53.0% | +38.1% | 0 | 1920 s |
-| ibm04 | 0.8284 | 1.5037 | 1.3024 | +44.9% | +36.4% | 0 | 1660 s |
-| ibm06 | 0.9523 | 2.5057 | 1.6187 | +62.0% | +41.2% | 0 | 1620 s |
-| ibm07 | 0.8822 | 2.0229 | 1.4633 | +56.4% | +39.7% | 0 | 2050 s |
-| ibm08 | 0.9466 | 1.9239 | 1.4285 | +50.8% | +33.7% | 0 | 2190 s |
-| ibm09 | 0.7054 | 1.3875 | 1.1194 | +49.2% | +37.0% | 0 | 2160 s |
-| ibm10 | 0.8190 | 2.1108 | 1.5009 | +61.2% | +45.4% | 0 | 4810 s |
-| ibm11 | 0.7691 | 1.7111 | 1.1774 | +55.1% | +34.7% | 0 | 3170 s |
-| ibm12 | 0.9534 | 2.8261 | 1.7261 | +66.3% | +44.8% | 0 | 4790 s |
-| ibm13 | 0.8129 | 1.9141 | 1.3355 | +57.5% | +39.1% | 0 | 2460 s |
-| ibm14 | 1.0506 | 2.2750 | 1.5436 | +53.8% | +31.9% | 0 | 4570 s |
-| ibm15 | 0.9536 | 2.3000 | 1.5159 | +58.5% | +37.1% | 0 | 3600 s |
-| ibm16 | 0.9347 | 2.2337 | 1.4780 | +58.2% | +36.8% | 0 | 5320 s |
-| ibm17 | 1.1249 | 3.6726 | 1.6446 | +69.4% | +31.6% | 0 | 5300 s |
-| ibm18 | 1.0358 | 2.7755 | 1.7722 | +62.7% | +41.6% | 0 | 3460 s |
-| **Average** | **0.8946** | 2.1251 | 1.4578 | **+57.9%** | **+38.6%** | **0** | **3000 s** |
+| Benchmark | Full proxy | Fast proxy | SA | RePlAce | Overlaps | Full runtime | Fast runtime |
+|-----------|-----------:|-----------:|-------:|--------:|:--------:|-------------:|-------------:|
+| ibm01 | 0.7354 | 0.7697 | 1.3166 | 0.9976 | 0 | 550 s | 460 s |
+| ibm02 | 0.8855 | 0.9352 | 1.9072 | 1.8370 | 0 | 1340 s | 1020 s |
+| ibm03 | 0.8178 | 0.8962 | 1.7401 | 1.3222 | 0 | 1920 s | 1070 s |
+| ibm04 | 0.8284 | 0.8414 | 1.5037 | 1.3024 | 0 | 1660 s | 1050 s |
+| ibm06 | 0.9523 | 0.9846 | 2.5057 | 1.6187 | 0 | 1620 s | 970 s |
+| ibm07 | 0.8822 | 0.9634 | 2.0229 | 1.4633 | 0 | 2050 s | 1220 s |
+| ibm08 | 0.9466 | 0.9934 | 1.9239 | 1.4285 | 0 | 2190 s | 1090 s |
+| ibm09 | 0.7054 | 0.7418 | 1.3875 | 1.1194 | 0 | 2160 s | 1080 s |
+| ibm10 | 0.8190 | 0.8573 | 2.1108 | 1.5009 | 0 | 4810 s | 2330 s |
+| ibm11 | 0.7691 | 0.8440 | 1.7111 | 1.1774 | 0 | 3170 s | 1460 s |
+| ibm12 | 0.9534 | 1.0064 | 2.8261 | 1.7261 | 0 | 4790 s | 1860 s |
+| ibm13 | 0.8129 | 0.8452 | 1.9141 | 1.3355 | 0 | 2460 s | 1640 s |
+| ibm14 | 1.0506 | 1.0838 | 2.2750 | 1.5436 | 0 | 4570 s | 2420 s |
+| ibm15 | 0.9536 | 0.9906 | 2.3000 | 1.5159 | 0 | 3600 s | 2480 s |
+| ibm16 | 0.9347 | 0.9898 | 2.2337 | 1.4780 | 0 | 5320 s | 3050 s |
+| ibm17 | 1.1249 | 1.1970 | 3.6726 | 1.6446 | 0 | 5300 s | 2680 s |
+| ibm18 | 1.0358 | 1.0990 | 2.7755 | 1.7722 | 0 | 3460 s | 2420 s |
+| **Average** | **0.8946** | **0.9435** | 2.1251 | 1.4578 | **0** | **3000 s** | **1670 s** |
 
 *\*Run with `deterministic=True` on an NVIDIA RTX 6000 Ada (48 GB) paired with an AMD EPYC 75F3.*
 
-Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) to closely reproduce this table. The default (non-deterministic) mode is faster and lands within the same run-to-run noise margin.
+Set `deterministic=True` on `v60_Placer` in [`submissions/v60/v60_placer.py`](submissions/v60/v60_placer.py) to closely reproduce this table. The default (non-deterministic) setting is faster and lands within the same run-to-run noise margin.
 
 The SA and RePlAce baselines are the published results reported in [*An Updated Assessment of Reinforcement Learning for Macro Placement*](https://doi.org/10.1109/TCAD.2025.3644293).
 
@@ -96,10 +98,27 @@ Scoring a single candidate move on the full official cost — re-routing every n
 
 **Basin-hopping on the exact cost.** Coordinate descent and the swap passes converge to a placement that no single move or pairwise exchange can improve. To escape that local minimum, v60 applies basin-hopping once more, now on the exact cost: each hop adds Gaussian noise to a small set of soft macros that are the endpoints of nets crossing the worst 5% of routing cells. The algorithm then re-runs coordinate descent over the entire placement, and keeps the result only if it scores better. Every hop tries a ladder of eight noise scales (sigma values) in parallel and keeps the best outcome, letting the perturbation strength adapt to the design and to where the descent stands. Hard macros are never perturbed, though the re-descent may still move them legally.
 
+## Full mode vs. fast mode
+
+v60 can run in two modes:
+
+- Full mode: runs the entire pipeline. 
+- Fast mode: runs the same pipeline with the final refinement basin-hop turned off and 32 restarts instead of 64, trading a little proxy for a significantly shorter runtime.
+
+| Stage | Full | Fast |
+|-------|:----:|:----:|
+| Spectral clustering + three-stage engine | yes (64 restarts) | yes (32 restarts) |
+| GPU basin-hopping | yes | yes |
+| Soft-only polish | yes | yes |
+| Coordinate descent | yes | yes |
+| Pair swaps (hard + soft) | yes | yes |
+| Refinement basin-hopping | yes | — |
+
 ## Runtime & Reproducibility
 
 - The algorithm runs on either — `device='auto'` picks CUDA when available and falls back to CPU otherwise. A GPU is strongly recommended, since the many parallel restarts are what make the wall-clock budget comfortable.
-- The algorithm is nondeterministic by default. Setting `deterministic=True` in `v60_placer.py` pins every RNG and switches to deterministic kernels wherever PyTorch provides them. The end-to-end results should then closely replicate those in the [Results](#results) table, but runtime would be higher.
+- The algorithm is nondeterministic by default. Setting `deterministic=True` in [`v60_placer.py`](submissions/v60/v60_placer.py) pins every RNG and switches to deterministic kernels wherever PyTorch provides them. The end-to-end results should then closely replicate those in the [Results](#results) table, but runtime would be higher.
+- v60 runs in full mode by default. To switch to fast mode, set `mode='fast'` in [`v60_placer.py`](submissions/v60/v60_placer.py). Refer to [Full mode vs. fast mode](#full-mode-vs-fast-mode) for what each mode runs.
 - `torch.compile` is used automatically when the environment supports it and falls back to eager execution otherwise.
 - Stage 2 uses bf16 autocast on GPU for speed. No meaningful proxy deterioration was observed.
 - The refinement passes parallelize their candidate evaluations across CPU cores, so more CPU cores shorten the refinement phase.
